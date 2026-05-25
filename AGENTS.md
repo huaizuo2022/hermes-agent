@@ -1130,3 +1130,51 @@ not the specific names.
 
 Reviewers should reject new change-detector tests; authors should convert
 them into invariants before re-requesting review.
+
+---
+
+## Remote Deployment & Service Maintenance
+
+Hermes Companion Engine is deployed to the remote server as a standalone daemon on port `8009` to serve companion chat and memory management.
+
+### Deployment Method
+
+We use the一键部署脚本 [deploy-hermes.sh](file:///Users/shang/Dev/hermes-agent/deploy-hermes.sh) in the project root:
+```bash
+./deploy-hermes.sh
+```
+This script will:
+1. Pack local code (excluding venv, .git, etc.) to a temporary archive.
+2. Upload it to remote host `146.56.229.151` (user: `root`).
+3. Extract files to `/var/www/hermes-agent`.
+4. Create/verify a Python 3.12 virtual environment at `/var/www/hermes-agent/venv`.
+5. Install python packages (`pip install -e .[web]`).
+6. Configure `systemd` service: `/etc/systemd/system/airi-love-hermes.service`.
+7. Reload systemd, enable and restart `airi-love-hermes.service` on port `8009`.
+8. Verify localhost connectivity.
+
+### Systemd Service Management
+
+To check status, view logs, or restart the service on the remote machine:
+
+```bash
+# Check status
+systemctl status airi-love-hermes.service
+
+# Restart service
+systemctl restart airi-love-hermes.service
+
+# View real-time logs
+journalctl -u airi-love-hermes.service -n 100 -f
+
+# Verify API port on remote server locally
+curl http://127.0.0.1:8009/companion/v1/chat
+```
+
+### Config & Environment
+
+- Working directory: `/var/www/hermes-agent`
+- Executable Python path: `/var/www/hermes-agent/venv/bin/python`
+- LLM Provider environment vars (e.g., `DEEPSEEK_API_KEY`, `DEEPSEEK_API_BASE`) are specified inside the systemd service file environment block.
+- Profile storage path defaults to `~/.hermes/` (root user's home).
+
