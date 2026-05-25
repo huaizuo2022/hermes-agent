@@ -102,7 +102,7 @@ async def chat_endpoint(req: ChatRequest):
         # 3. 实例化 AI 代理 (硬编码工具限制为 memory，完全封死危险操作)
         agent = AIAgent(
             provider="deepseek",
-            model="deepseek-chat",
+            model="deepseek-v4-flash",
             api_key=api_key,
             base_url=base_url,
             enabled_toolsets=["memory"],
