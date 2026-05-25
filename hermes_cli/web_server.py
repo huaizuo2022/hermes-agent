@@ -80,6 +80,10 @@ _log = logging.getLogger(__name__)
 
 app = FastAPI(title="Hermes Agent", version=__version__)
 
+from hermes_cli.companion_api import router as companion_router
+app.include_router(companion_router)
+
+
 # ---------------------------------------------------------------------------
 # Session token for protecting sensitive endpoints (reveal).
 # Generated fresh on every server start — dies when the process exits.
