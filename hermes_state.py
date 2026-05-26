@@ -308,6 +308,17 @@ END;
 """
 
 
+def _safe_executescript_trigram(cursor):
+    try:
+        cursor.executescript(FTS_TRIGRAM_SQL)
+    except sqlite3.OperationalError as e:
+        if "trigram" in str(e):
+            fallback_sql = FTS_TRIGRAM_SQL.replace("tokenize='trigram'", "tokenize='unicode61'")
+            cursor.executescript(fallback_sql)
+        else:
+            raise
+
+
 class SessionDB:
     """
     SQLite-backed session storage with FTS5 search.
@@ -613,7 +624,7 @@ class SessionDB:
                 except sqlite3.OperationalError:
                     _fts_trigram_exists = False
                 if not _fts_trigram_exists:
-                    cursor.executescript(FTS_TRIGRAM_SQL)
+                    _safe_executescript_trigram(cursor)
                     cursor.execute(
                         "INSERT INTO messages_fts_trigram(rowid, content) "
                         "SELECT id, content FROM messages WHERE content IS NOT NULL"
@@ -645,7 +656,7 @@ class SessionDB:
                 # Recreate virtual tables + triggers with the new inline-mode
                 # schema that indexes content || tool_name || tool_calls.
                 cursor.executescript(FTS_SQL)
-                cursor.executescript(FTS_TRIGRAM_SQL)
+                _safe_executescript_trigram(cursor)
                 # Backfill both indexes from every existing messages row.
                 cursor.execute(
                     "INSERT INTO messages_fts(rowid, content) "
@@ -688,7 +699,7 @@ class SessionDB:
         try:
             cursor.execute("SELECT * FROM messages_fts_trigram LIMIT 0")
         except sqlite3.OperationalError:
-            cursor.executescript(FTS_TRIGRAM_SQL)
+            _safe_executescript_trigram(cursor)
 
         self._conn.commit()
 

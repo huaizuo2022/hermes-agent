@@ -27,17 +27,49 @@ def sync_soul_file(profile_dir: str, profile_data: Dict[str, Any]) -> None:
     soul_path = os.path.join(profile_dir, "SOUL.md")
     os.makedirs(os.path.dirname(soul_path), exist_ok=True)
     
+    name = str(profile_data.get("name", "Companion"))
+    
     # 兼容处理 speaking_style 可能是 List[str] 的情况
     speaking_style = profile_data.get("speaking_style", "")
     if isinstance(speaking_style, list):
         speaking_style = ", ".join(speaking_style)
         
-    content = (
-        "# " + str(profile_data.get("name", "Companion")) + "\n\n"
-        "## Personality\n" + str(profile_data.get("personality", "")) + "\n\n"
-        "## Speaking Style\n" + str(speaking_style) + "\n\n"
-        "## Background\n" + str(profile_data.get("background", "")) + "\n"
-    )
+    personality = str(profile_data.get("personality", "")).strip()
+    background = str(profile_data.get("background", "")).strip()
+    
+    # 新增扩展字段处理
+    behavior_tags = profile_data.get("behavior_tags") or ""
+    if isinstance(behavior_tags, list):
+        behavior_tags = ", ".join(behavior_tags)
+    behavior_tags = str(behavior_tags).strip()
+    
+    appearance_details = str(profile_data.get("appearance_details") or "").strip()
+    initial_scenario = str(profile_data.get("initial_scenario") or "").strip()
+    
+    sample_dialogues = profile_data.get("sample_dialogues") or []
+    dialogue_text = ""
+    if isinstance(sample_dialogues, list):
+        dialogue_lines = []
+        for item in sample_dialogues:
+            if isinstance(item, dict) and "user_input" in item and "character_response" in item:
+                dialogue_lines.append("User: {}".format(item['user_input']))
+                dialogue_lines.append("{}: {}".format(name, item['character_response']))
+                dialogue_lines.append("")
+        dialogue_text = "\n".join(dialogue_lines).strip()
+
+    content_parts = [
+        "# {}".format(name),
+        "## Personality\n{}".format(personality) if personality else "",
+        "## Behavior Tags\n{}".format(behavior_tags) if behavior_tags else "",
+        "## Speaking Style\n{}".format(speaking_style) if speaking_style else "",
+        "## Appearance\n{}".format(appearance_details) if appearance_details else "",
+        "## Scenario\n{}".format(initial_scenario) if initial_scenario else "",
+        "## Background\n{}".format(background) if background else "",
+        "## Sample Dialogues\n{}".format(dialogue_text) if dialogue_text else "",
+    ]
+    
+    # 过滤掉空部分，并以两个换行符连接
+    content = "\n\n".join([p for p in content_parts if p]) + "\n"
     
     # 仅在内容有差异时覆写，优化缓存
     if not os.path.exists(soul_path) or open(soul_path, "r", encoding="utf-8").read() != content:
