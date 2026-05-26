@@ -18,6 +18,10 @@ class ChatRequest(BaseModel):
     user_message: str
     character_profile: Dict[str, Any]
     stream: bool = True
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    api_base: Optional[str] = None
 
 def get_profile_path(session_id: str) -> str:
     from hermes_constants import get_default_hermes_root
@@ -127,14 +131,16 @@ async def chat_endpoint(req: ChatRequest):
             except Exception:
                 pass
 
-        # 尝试从环境变量加载 DeepSeek 配置
-        api_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        base_url = os.environ.get("DEEPSEEK_API_BASE") or "https://api.deepseek.com"
+        # 动态解析模型及 API 配置
+        api_key = req.api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        base_url = req.api_base or os.environ.get("DEEPSEEK_API_BASE") or "https://api.deepseek.com"
+        provider = req.provider or "deepseek"
+        model = req.model or "deepseek-v4-flash"
 
         # 3. 实例化 AI 代理 (硬编码工具限制为 memory，完全封死危险操作)
         agent = AIAgent(
-            provider="deepseek",
-            model="deepseek-v4-flash",
+            provider=provider,
+            model=model,
             api_key=api_key,
             base_url=base_url,
             enabled_toolsets=["memory"],
