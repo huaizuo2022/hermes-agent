@@ -61,6 +61,43 @@ def sync_soul_file(profile_dir: str, profile_data: Dict[str, Any]) -> None:
                 dialogue_lines.append("")
         dialogue_text = "\n".join(dialogue_lines).strip()
 
+    # Parse relationship metrics
+    rel_data = profile_data.get("relationship") or {}
+    relationship_section = ""
+    if rel_data:
+        stage = rel_data.get("relationship_stage")
+        intimacy = rel_data.get("intimacy_score")
+        trust = rel_data.get("trust_score")
+        nickname = rel_data.get("preferred_nickname")
+        profile = rel_data.get("persona_profile")
+        constraints = rel_data.get("persona_prompt_constraints")
+        
+        stage_names = {
+            "stranger": "stranger (初次相遇，礼貌疏离)",
+            "acquaintance": "acquaintance (逐渐熟悉，互动自然)",
+            "ambiguous": "ambiguous (暧昧期，关系推拉有张力)",
+            "early_relationship": "early_relationship (热恋陪伴，甜蜜依恋)",
+            "soulmate": "soulmate (灵魂伴侣，深度信任与脆弱感)",
+            "deep_relationship": "deep_relationship (长线羁绊，生命中不可或缺)"
+        }
+        stage_desc = stage_names.get(stage, stage)
+        
+        parts = ["## Relationship with User"]
+        if stage_desc:
+            parts.append("- Current Stage: {}".format(stage_desc))
+        if intimacy is not None:
+            parts.append("- Intimacy level: {}/10".format(intimacy))
+        if trust is not None:
+            parts.append("- Trust level: {}/10".format(trust))
+        if nickname:
+            parts.append("- Preferred Nickname: {} (When referring to the user, you MUST call them by this nickname)".format(nickname))
+        if profile:
+            parts.append("- User Profile: {} (Your perception of the user's role/background in your life)".format(profile))
+        if constraints:
+            parts.append("- Prompt Constraints: {}".format(constraints))
+            
+        relationship_section = "\n".join(parts)
+
     content_parts = [
         "# {}".format(name),
         "## Personality\n{}".format(personality) if personality else "",
@@ -70,6 +107,7 @@ def sync_soul_file(profile_dir: str, profile_data: Dict[str, Any]) -> None:
         "## Scenario\n{}".format(initial_scenario) if initial_scenario else "",
         "## Background\n{}".format(background) if background else "",
         "## Sample Dialogues\n{}".format(dialogue_text) if dialogue_text else "",
+        relationship_section if relationship_section else "",
     ]
     
     # 过滤掉空部分，并以两个换行符连接
