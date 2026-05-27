@@ -39,7 +39,11 @@ def is_native_gemini_base_url(base_url: str) -> bool:
     normalized = str(base_url or "").strip().rstrip("/").lower()
     if not normalized:
         return False
-    if "generativelanguage.googleapis.com" not in normalized:
+    if (
+        "generativelanguage.googleapis.com" not in normalized
+        and "api.wenwen.ai" not in normalized
+        and "api.wenwen-ai.com" not in normalized
+    ):
         return False
     return not normalized.endswith("/openai")
 
