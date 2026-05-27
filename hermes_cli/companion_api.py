@@ -33,10 +33,12 @@ def sync_soul_file(profile_dir: str, profile_data: Dict[str, Any]) -> None:
     
     name = str(profile_data.get("name", "Companion"))
     
-    # 兼容处理 speaking_style 可能是 List[str] 的情况
+    # 兼容处理 speaking_style 可能是 List[str] 或 Dict[str, str] 的情况
     speaking_style = profile_data.get("speaking_style", "")
     if isinstance(speaking_style, list):
         speaking_style = ", ".join(speaking_style)
+    elif isinstance(speaking_style, dict):
+        speaking_style = ", ".join("{}: {}".format(k, v) for k, v in speaking_style.items())
         
     personality = str(profile_data.get("personality", "")).strip()
     background = str(profile_data.get("background", "")).strip()
@@ -55,10 +57,13 @@ def sync_soul_file(profile_dir: str, profile_data: Dict[str, Any]) -> None:
     if isinstance(sample_dialogues, list):
         dialogue_lines = []
         for item in sample_dialogues:
-            if isinstance(item, dict) and "user_input" in item and "character_response" in item:
-                dialogue_lines.append("User: {}".format(item['user_input']))
-                dialogue_lines.append("{}: {}".format(name, item['character_response']))
-                dialogue_lines.append("")
+            if isinstance(item, dict):
+                user_val = item.get("user") or item.get("user_input")
+                char_val = item.get("character") or item.get("character_response")
+                if user_val and char_val:
+                    dialogue_lines.append("User: {}".format(user_val))
+                    dialogue_lines.append("{}: {}".format(name, char_val))
+                    dialogue_lines.append("")
         dialogue_text = "\n".join(dialogue_lines).strip()
 
     # Parse relationship metrics
@@ -184,7 +189,9 @@ async def chat_endpoint(req: ChatRequest):
             enabled_toolsets=["memory"],
             quiet_mode=True,
             platform="savana",
-            session_db=session_db
+            session_db=session_db,
+            load_soul_identity=True,
+            skip_context_files=True,
         )
         agent.suppress_status_output = True
 
