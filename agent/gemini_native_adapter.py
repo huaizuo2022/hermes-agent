@@ -918,6 +918,52 @@ class GeminiNativeClient:
         return translate_gemini_response(payload, model=model)
 
     def _stream_completion(self, *, model: str, request: Dict[str, Any], timeout: Any = None) -> Iterator[_GeminiStreamChunk]:
+        # If the target is Wenwen, avoid actual SSE stream due to CDN proxy buffering blocks
+        if "wenwen" in self.base_url.lower():
+            def _wenwen_generator() -> Iterator[_GeminiStreamChunk]:
+                try:
+                    non_stream_url = f"{self.base_url}/models/{model}:generateContent"
+                    response = self._http.post(non_stream_url, json=request, headers=self._headers(), timeout=timeout)
+                    if response.status_code != 200:
+                        raise gemini_http_error(response)
+                    payload = response.json()
+                    
+                    candidates = payload.get("candidates") or []
+                    if isinstance(candidates, list) and candidates:
+                        cand = candidates[0] if isinstance(candidates[0], dict) else {}
+                        content_obj = cand.get("content") if isinstance(cand, dict) else {}
+                        parts = content_obj.get("parts") if isinstance(content_obj, dict) else []
+                        
+                        for part in parts:
+                            if not isinstance(part, dict):
+                                continue
+                            text = part.get("text", "")
+                            thought = part.get("thought", False)
+                            if thought is True and isinstance(text, str) and text:
+                                yield _make_stream_chunk(model=model, reasoning=text)
+                            elif isinstance(text, str) and text:
+                                yield _make_stream_chunk(model=model, content=text)
+                                
+                        finish_reason = cand.get("finishReason") or "STOP"
+                        finish_chunk = _make_stream_chunk(model=model, finish_reason=_map_gemini_finish_reason(finish_reason))
+                        usage_meta = payload.get("usageMetadata") or {}
+                        if usage_meta:
+                            finish_chunk.usage = SimpleNamespace(
+                                prompt_tokens=int(usage_meta.get("promptTokenCount") or 0),
+                                completion_tokens=int(usage_meta.get("candidatesTokenCount") or 0),
+                                total_tokens=int(usage_meta.get("totalTokenCount") or 0),
+                                prompt_tokens_details=SimpleNamespace(
+                                    cached_tokens=int(usage_meta.get("cachedContentTokenCount") or 0),
+                                ),
+                            )
+                        yield finish_chunk
+                except httpx.HTTPError as exc:
+                    raise GeminiAPIError(
+                        f"Gemini streaming request failed: {exc}",
+                        code="gemini_stream_error",
+                    ) from exc
+            return _wenwen_generator()
+
         url = f"{self.base_url}/models/{model}:streamGenerateContent?alt=sse"
         stream_headers = dict(self._headers())
         stream_headers["Accept"] = "text/event-stream"
