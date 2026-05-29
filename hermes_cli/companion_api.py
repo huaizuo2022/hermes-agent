@@ -23,6 +23,7 @@ class ChatRequest(BaseModel):
     api_key: Optional[str] = None
     api_base: Optional[str] = None
     directives: Optional[str] = None
+    request_overrides: Optional[Dict[str, Any]] = None
 
 def get_profile_path(session_id: str) -> str:
     from hermes_constants import get_default_hermes_root
@@ -194,6 +195,7 @@ async def chat_endpoint(req: ChatRequest):
             load_soul_identity=True,
             skip_context_files=True,
             ephemeral_system_prompt=req.directives,
+            request_overrides=req.request_overrides,
         )
         agent.suppress_status_output = True
 
