@@ -205,6 +205,15 @@ async def chat_endpoint(req: ChatRequest):
         )
         agent.suppress_status_output = True
 
+        # Debug print to trace tools loading and memory settings
+        print("[DEBUG] AIAgent initialized. model={}, provider={}, base_url={}, tools={}, skip_memory={}, memory_enabled={}, memory_store={}".format(
+            agent.model, agent.provider, agent.base_url,
+            [t["function"]["name"] for t in agent.tools] if agent.tools else [],
+            getattr(agent, "skip_memory", None),
+            getattr(agent, "_memory_enabled", None),
+            agent._memory_store is not None
+        ))
+
         if req.stream:
             q = queue.Queue()
 
