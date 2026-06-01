@@ -188,6 +188,22 @@ def interruptible_api_call(agent, api_kwargs: dict):
                         api_kwargs=api_kwargs,
                     )
                 )
+                import sys
+                try:
+                    sys.stderr.write("[DEBUG NON-STREAM PAYLOAD] Model: {}, Base URL: {}\n".format(
+                        api_kwargs.get("model"),
+                        getattr(request_client, "base_url", None)
+                    ))
+                    sys.stderr.write("[DEBUG NON-STREAM PAYLOAD] Tools: {}\n".format(
+                        json.dumps(api_kwargs.get("tools"), ensure_ascii=False) if api_kwargs.get("tools") else "None"
+                    ))
+                    sys.stderr.write("[DEBUG NON-STREAM PAYLOAD] Extra Body: {}\n".format(
+                        json.dumps(api_kwargs.get("extra_body"), ensure_ascii=False) if api_kwargs.get("extra_body") else "None"
+                    ))
+                    sys.stderr.flush()
+                except Exception as log_err:
+                    sys.stderr.write("[DEBUG NON-STREAM PAYLOAD ERROR] {}\n".format(log_err))
+                    sys.stderr.flush()
                 result["response"] = request_client.chat.completions.create(**api_kwargs)
         except Exception as e:
             result["error"] = e
@@ -1439,13 +1455,28 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Initialize per-attempt stream diagnostics so the retry block can
         # reach for them after the stream dies.  Lives on
         # ``request_client_holder["diag"]`` for closure access.
-        # Debug print the API payload on Staging stdout
-        print("[DEBUG PAYLOAD] Model: {}, Base URL: {}, Tools: {}, Extra Body: {}".format(
-            stream_kwargs.get("model"),
-            getattr(request_client, "base_url", None),
-            [t["function"]["name"] for t in stream_kwargs.get("tools", [])] if stream_kwargs.get("tools") else None,
-            stream_kwargs.get("extra_body")
-        ))
+        # Debug print the API payload on Staging stdout to stderr
+        import sys
+        try:
+            sys.stderr.write("[DEBUG PAYLOAD] Model: {}, Base URL: {}\n".format(
+                stream_kwargs.get("model"),
+                getattr(request_client, "base_url", None)
+            ))
+            sys.stderr.write("[DEBUG PAYLOAD] Tools: {}\n".format(
+                json.dumps(stream_kwargs.get("tools"), ensure_ascii=False) if stream_kwargs.get("tools") else "None"
+            ))
+            sys.stderr.write("[DEBUG PAYLOAD] Extra Body: {}\n".format(
+                json.dumps(stream_kwargs.get("extra_body"), ensure_ascii=False) if stream_kwargs.get("extra_body") else "None"
+            ))
+            # Log the system messages or instructions
+            msgs = stream_kwargs.get("messages", [])
+            sys.stderr.write("[DEBUG PAYLOAD] Last Message: {}\n".format(
+                json.dumps(msgs[-1], ensure_ascii=False) if msgs else "None"
+            ))
+            sys.stderr.flush()
+        except Exception as log_err:
+            sys.stderr.write("[DEBUG PAYLOAD ERROR] {}\n".format(log_err))
+            sys.stderr.flush()
         stream = request_client.chat.completions.create(**stream_kwargs)
 
         # Capture rate limit headers from the initial HTTP response.

@@ -24,6 +24,7 @@ class ChatRequest(BaseModel):
     api_base: Optional[str] = None
     directives: Optional[str] = None
     request_overrides: Optional[Dict[str, Any]] = None
+    reasoning_config: Optional[Dict[str, Any]] = None
 
 class MemorySyncRequest(BaseModel):
     target: str
@@ -202,6 +203,7 @@ async def chat_endpoint(req: ChatRequest):
             skip_context_files=True,
             ephemeral_system_prompt=req.directives,
             request_overrides=req.request_overrides,
+            reasoning_config=req.reasoning_config,
         )
         agent.suppress_status_output = True
 
