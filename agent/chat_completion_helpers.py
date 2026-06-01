@@ -1439,8 +1439,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Initialize per-attempt stream diagnostics so the retry block can
         # reach for them after the stream dies.  Lives on
         # ``request_client_holder["diag"]`` for closure access.
-        _diag = agent._stream_diag_init()
-        request_client_holder["diag"] = _diag
+        # Debug print the API payload on Staging stdout
+        print("[DEBUG PAYLOAD] Model: {}, Base URL: {}, Tools: {}, Extra Body: {}".format(
+            stream_kwargs.get("model"),
+            getattr(request_client, "base_url", None),
+            [t["function"]["name"] for t in stream_kwargs.get("tools", [])] if stream_kwargs.get("tools") else None,
+            stream_kwargs.get("extra_body")
+        ))
         stream = request_client.chat.completions.create(**stream_kwargs)
 
         # Capture rate limit headers from the initial HTTP response.
