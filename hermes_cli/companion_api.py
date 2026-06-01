@@ -25,6 +25,12 @@ class ChatRequest(BaseModel):
     directives: Optional[str] = None
     request_overrides: Optional[Dict[str, Any]] = None
 
+class MemorySyncRequest(BaseModel):
+    target: str
+    action: str
+    content: Optional[str] = None
+    old_text: Optional[str] = None
+
 def get_profile_path(session_id: str) -> str:
     from hermes_constants import get_default_hermes_root
     return str(get_default_hermes_root() / "profiles" / session_id)
@@ -243,7 +249,14 @@ async def chat_endpoint(req: ChatRequest):
                     yield_data = {"delta": item}
                     yield "event: token\ndata: {}\n\n".format(json.dumps(yield_data))
                 
-                metadata = {"session_id": session_id, "status": "completed"}
+                modifications = []
+                if getattr(agent, "_memory_store", None) and hasattr(agent._memory_store, "modifications"):
+                    modifications = agent._memory_store.modifications
+                metadata = {
+                    "session_id": session_id,
+                    "status": "completed",
+                    "memory_modifications": modifications
+                }
                 yield "event: metadata\ndata: {}\n\n".format(json.dumps(metadata))
 
             return StreamingResponse(sse_generator(), media_type="text/event-stream")
@@ -257,7 +270,14 @@ async def chat_endpoint(req: ChatRequest):
                 )
             except Exception:
                 pass
-            return JSONResponse({"reply": reply, "session_id": session_id})
+            modifications = []
+            if getattr(agent, "_memory_store", None) and hasattr(agent._memory_store, "modifications"):
+                modifications = agent._memory_store.modifications
+            return JSONResponse({
+                "reply": reply,
+                "session_id": session_id,
+                "memory_modifications": modifications
+            })
             
     finally:
         reset_hermes_home_override(token)
@@ -270,6 +290,36 @@ async def delete_session(session_id: str):
         shutil.rmtree(profile_dir)
         return JSONResponse({"success": True, "message": "Session directory removed"})
     raise HTTPException(status_code=404, detail="Session profile not found")
+
+@router.post("/sessions/{session_id}/memories")
+async def sync_memory(session_id: str, req: MemorySyncRequest):
+    profile_dir = get_profile_path(session_id)
+    os.makedirs(profile_dir, exist_ok=True)
+    
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    token = set_hermes_home_override(profile_dir)
+    try:
+        from tools.memory_tool import MemoryStore, memory_tool
+        store = MemoryStore()
+        store.load_from_disk()
+        
+        result_str = memory_tool(
+            action=req.action,
+            target=req.target,
+            content=req.content,
+            old_text=req.old_text,
+            store=store
+        )
+        result = json.loads(result_str)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        reset_hermes_home_override(token)
 
 @router.delete("/sessions/{session_id}/messages/{message_id}")
 async def delete_message(session_id: str, message_id: str):

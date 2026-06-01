@@ -151,6 +151,7 @@ class MemoryStore:
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.modifications: List[Dict[str, Any]] = []
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
@@ -308,6 +309,11 @@ class MemoryStore:
             entries.append(content)
             self._set_entries(target, entries)
             self.save_to_disk(target)
+            self.modifications.append({
+                "action": "add",
+                "target": target,
+                "content": content
+            })
 
         return self._success_response(target, "Entry added.")
 
@@ -368,6 +374,12 @@ class MemoryStore:
             entries[idx] = new_content
             self._set_entries(target, entries)
             self.save_to_disk(target)
+            self.modifications.append({
+                "action": "replace",
+                "target": target,
+                "old_text": old_text,
+                "content": new_content
+            })
 
         return self._success_response(target, "Entry replaced.")
 
@@ -404,6 +416,11 @@ class MemoryStore:
             entries.pop(idx)
             self._set_entries(target, entries)
             self.save_to_disk(target)
+            self.modifications.append({
+                "action": "remove",
+                "target": target,
+                "old_text": old_text
+            })
 
         return self._success_response(target, "Entry removed.")
 
