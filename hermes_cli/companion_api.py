@@ -207,6 +207,24 @@ async def chat_endpoint(req: ChatRequest):
         )
         agent.suppress_status_output = True
 
+        # Savana 伴侣场景：覆盖 memory 工具描述为角色扮演专用中文版本
+        # 原始通用描述是面向开发者的英文，DeepSeek 在角色扮演模式下无法关联到"记住用户偏好"这一触发场景
+        _SAVANA_MEMORY_DESCRIPTION = (
+            "将用户的个人信息永久写入记忆，跨会话持久保存。"
+            "触发条件（以下情况必须立即调用，不得用台词代替）：\n"
+            "- 用户说\"记住\"、\"帮我记\"、\"别忘了\"等要求记忆的话\n"
+            "- 用户提到自己的喜好、厌恶、口味、习惯、运动、食物偏好\n"
+            "- 用户透露职业、年龄、所在城市、作息规律等个人信息\n"
+            "- 用户分享宠物、兴趣爱好、重要的人或事\n"
+            "只写入 target='user'（用户档案），action='add' 新增，action='replace' 更新旧条目。"
+            "content 用简短中文写明事实，例如：'用户最喜欢的运动是攀岩'、'用户讨厌吃芹菜和胡萝卜'。"
+        )
+        if agent.tools:
+            for _tool in agent.tools:
+                if isinstance(_tool, dict) and _tool.get("function", {}).get("name") == "memory":
+                    _tool["function"]["description"] = _SAVANA_MEMORY_DESCRIPTION
+                    break
+
         # Debug print to trace tools loading and memory settings
         print("[DEBUG] AIAgent initialized. model={}, provider={}, base_url={}, tools={}, skip_memory={}, memory_enabled={}, memory_store={}, directives={}".format(
             agent.model, agent.provider, agent.base_url,
@@ -216,6 +234,7 @@ async def chat_endpoint(req: ChatRequest):
             agent._memory_store is not None,
             repr(agent.ephemeral_system_prompt)
         ))
+
 
         if req.stream:
             q = queue.Queue()
