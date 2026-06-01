@@ -53,6 +53,8 @@ mkdir -p "$REMOTE_PATH"
 
 echo "📂 解压缩代码到 $REMOTE_PATH ..."
 tar xzf /root/hermes-agent-deploy.tar.gz -C "$REMOTE_PATH"
+# 清理所有 macOS 隐藏 metadata 文件，防止 python3 加载发生 UnicodeDecodeError 崩溃
+find "$REMOTE_PATH" -name "._*" -delete
 
 # 确保有 venv
 if [ ! -d "$REMOTE_PATH/venv" ]; then
