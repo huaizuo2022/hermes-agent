@@ -1,5 +1,6 @@
 import os
 import shutil
+import asyncio
 
 from starlette.testclient import TestClient
 
@@ -95,3 +96,90 @@ def test_weixin_qr_status_returns_confirmed_payload(monkeypatch):
     payload = response.json()
     assert payload["status"] == "confirmed"
     assert payload["ilink_user_id"] == "wxid_bound_user"
+
+
+def test_relay_weixin_message_bridges_to_backend_and_sends_reply(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "success": True,
+                "data": {
+                    "reply": "微信回复测试",
+                },
+            }
+
+    class _FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, headers=None, json=None):
+            captured["url"] = url
+            captured["headers"] = dict(headers or {})
+            captured["json"] = dict(json or {})
+            return _FakeResponse()
+
+    sent_payload = {}
+
+    async def _fake_send_weixin_direct(*, extra, token, chat_id, message, media_files=None):
+        sent_payload["extra"] = dict(extra)
+        sent_payload["token"] = token
+        sent_payload["chat_id"] = chat_id
+        sent_payload["message"] = message
+        sent_payload["media_files"] = media_files
+        return {"success": True}
+
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.httpx.AsyncClient",
+        lambda *args, **kwargs: _FakeAsyncClient(),
+    )
+    monkeypatch.setattr(
+        "gateway.platforms.weixin.send_weixin_direct",
+        _fake_send_weixin_direct,
+    )
+
+    from hermes_cli.companion_api import _relay_inbound_weixin_message
+
+    reply = asyncio.run(
+        _relay_inbound_weixin_message(
+            hermes_home=str(tmp_path),
+            bridge_url="http://127.0.0.1:8005/api/v1/wechat-role-binding/bridge/inbound",
+            bridge_secret="bridge-secret",
+            account_id="bot-account",
+            account_payload={
+                "token": "bot-token",
+                "base_url": "https://ilinkai.weixin.qq.com",
+            },
+            message={
+                "from_user_id": "wxid_test_user",
+                "message_id": "msg-1",
+                "context_token": "ctx-token-1",
+                "item_list": [
+                    {
+                        "type": 1,
+                        "text_item": {
+                            "text": "你好",
+                        },
+                    },
+                ],
+            },
+        )
+    )
+
+    assert reply == "微信回复测试"
+    assert captured["url"].endswith("/api/v1/wechat-role-binding/bridge/inbound")
+    assert captured["headers"]["X-WeChat-Bridge-Secret"] == "bridge-secret"
+    assert captured["json"]["wechat_channel_user_id"] == "wxid_test_user"
+    assert captured["json"]["message_text"] == "你好"
+    assert sent_payload["chat_id"] == "wxid_test_user"
+    assert sent_payload["message"] == "微信回复测试"
+    assert sent_payload["token"] == "bot-token"
