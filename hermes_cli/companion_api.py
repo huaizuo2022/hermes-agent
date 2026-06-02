@@ -194,12 +194,59 @@ async def _relay_inbound_weixin_message(
         "wechat_channel_user_id": sender_id,
         "message_text": text,
     }
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            bridge_url,
-            headers=headers,
-            json=payload,
-        )
+    base_url = str(account_payload.get("base_url") or weixin.ILINK_BASE_URL).rstrip("/")
+    token = str(account_payload.get("token") or "")
+    typing_ticket = ""
+
+    try:
+        async with weixin.aiohttp.ClientSession(
+            trust_env=True,
+            connector=weixin._make_ssl_connector(),
+        ) as typing_session:
+            config = await weixin._get_config(
+                typing_session,
+                base_url=base_url,
+                token=token,
+                user_id=sender_id,
+                context_token=context_token or None,
+            )
+            typing_ticket = str(config.get("typing_ticket") or "")
+            if typing_ticket:
+                await weixin._send_typing(
+                    typing_session,
+                    base_url=base_url,
+                    token=token,
+                    to_user_id=sender_id,
+                    typing_ticket=typing_ticket,
+                    status=weixin.TYPING_START,
+                )
+    except Exception as exc:
+        logger.debug("weixin typing start skipped for %s: %s", sender_id, exc)
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                bridge_url,
+                headers=headers,
+                json=payload,
+            )
+    finally:
+        if typing_ticket:
+            try:
+                async with weixin.aiohttp.ClientSession(
+                    trust_env=True,
+                    connector=weixin._make_ssl_connector(),
+                ) as typing_session:
+                    await weixin._send_typing(
+                        typing_session,
+                        base_url=base_url,
+                        token=token,
+                        to_user_id=sender_id,
+                        typing_ticket=typing_ticket,
+                        status=weixin.TYPING_STOP,
+                    )
+            except Exception as exc:
+                logger.debug("weixin typing stop skipped for %s: %s", sender_id, exc)
 
     if response.status_code != 200:
         raise RuntimeError(
@@ -219,10 +266,10 @@ async def _relay_inbound_weixin_message(
     send_result = await weixin.send_weixin_direct(
         extra={
             "account_id": account_id,
-            "base_url": str(account_payload.get("base_url") or ""),
-            "token": str(account_payload.get("token") or ""),
+            "base_url": base_url,
+            "token": token,
         },
-        token=str(account_payload.get("token") or ""),
+        token=token,
         chat_id=effective_chat_id,
         message=reply,
     )
@@ -230,6 +277,13 @@ async def _relay_inbound_weixin_message(
         raise RuntimeError(
             "Weixin direct reply failed: {0}".format(send_result["error"])
         )
+
+    logger.info(
+        "weixin bridge relayed message for %s -> %s (message_id=%s)",
+        account_id,
+        sender_id,
+        isinstance(send_result, dict) and send_result.get("message_id") or "",
+    )
 
     return reply
 
@@ -272,6 +326,10 @@ class WeixinInboundBridgeWorker(object):
             known_accounts = {}
             if accounts_dir.exists():
                 for account_file in accounts_dir.glob("*.json"):
+                    if account_file.name.endswith(".context-tokens.json"):
+                        continue
+                    if account_file.name.endswith(".sync.json"):
+                        continue
                     try:
                         known_accounts[account_file.stem] = json.loads(
                             account_file.read_text(encoding="utf-8")
