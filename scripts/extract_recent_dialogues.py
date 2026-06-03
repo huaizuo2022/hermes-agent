@@ -161,11 +161,14 @@ def main():
                 "evolved_persona": extract_evolved_persona(soul_path)
             })
 
-    # Sort: Active first, then cold chats sorted by recency
-    all_profile_chats.sort(key=lambda x: x["elapsed"])
+    # Sort: Prioritize cold chats (3-5 days) first to make sure they evolve, then sort by elapsed time ascending
+    all_profile_chats.sort(key=lambda x: (not (72 * 3600 <= x["elapsed"] <= 120 * 3600), x["elapsed"]))
+
+    # Limit to top 5 profiles to prevent large context sizes and DeepSeek API timeouts
+    all_profile_chats = all_profile_chats[:5]
 
     if not all_profile_chats:
-        print("# Active Characters Report\n\nNo active or cold characters met the evaluation criteria.")
+        print("# Active & Cold Characters Evolution Report\n\nNo active or cold characters met the evaluation criteria.")
         return
 
     print("# Active & Cold Characters Evolution Report")
