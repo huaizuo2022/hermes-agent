@@ -36,8 +36,38 @@ def get_profile_path(session_id: str) -> str:
     from hermes_constants import get_default_hermes_root
     return str(get_default_hermes_root() / "profiles" / session_id)
 
+def extract_evolved_persona(soul_path: str) -> Optional[str]:
+    if not os.path.exists(soul_path):
+        return None
+    try:
+        with open(soul_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return None
+
+    lines = content.splitlines()
+    evolved_lines = []
+    in_section = False
+    
+    for line in lines:
+        if line.startswith("## Evolved Persona"):
+            in_section = True
+            continue
+        if in_section:
+            if line.startswith("#"):
+                break
+            evolved_lines.append(line)
+            
+    if not in_section:
+        return None
+        
+    return "\n".join(evolved_lines).strip()
+
 def sync_soul_file(profile_dir: str, profile_data: Dict[str, Any]) -> None:
     soul_path = os.path.join(profile_dir, "SOUL.md")
+    evolved_persona = extract_evolved_persona(soul_path)
+    if not evolved_persona or not evolved_persona.strip():
+        evolved_persona = "(暂无自主进化，人设遵循基础设定)"
     os.makedirs(os.path.dirname(soul_path), exist_ok=True)
     
     name = str(profile_data.get("name", "Companion"))
@@ -115,6 +145,7 @@ def sync_soul_file(profile_dir: str, profile_data: Dict[str, Any]) -> None:
     content_parts = [
         "# {}".format(name),
         "## Personality\n{}".format(personality) if personality else "",
+        "## Evolved Persona\n{}".format(evolved_persona),
         "## Behavior Tags\n{}".format(behavior_tags) if behavior_tags else "",
         "## Speaking Style\n{}".format(speaking_style) if speaking_style else "",
         "## Appearance\n{}".format(appearance_details) if appearance_details else "",
