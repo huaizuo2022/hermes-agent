@@ -55,6 +55,17 @@ def _make_empty_chunk(model=None, usage=None):
     return SimpleNamespace(choices=[], model=model, usage=usage)
 
 
+class _MockStream:
+    """Minimal stream object that mimics OpenAI's stream wrapper."""
+
+    def __init__(self, chunks, response=None):
+        self._chunks = list(chunks)
+        self.response = response
+
+    def __iter__(self):
+        return iter(self._chunks)
+
+
 # ── Test: Streaming Accumulator ──────────────────────────────────────────
 
 
@@ -464,6 +475,36 @@ class TestStreamingCallbacks:
         assert " more text" in deltas
         # Content is still accumulated in the response
         assert response.choices[0].message.content == "thinking... more text"
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_chat_completions_stream_does_not_crash_on_diag_capture(self, mock_close, mock_create):
+        """chat_completions streaming should initialize diagnostics before header capture."""
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(content="Hello"),
+            _make_stream_chunk(finish_reason="stop"),
+        ]
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = _MockStream(chunks, response=None)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-chat",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response.choices[0].message.content == "Hello"
 
 
 # ── Test: Streaming Fallback ────────────────────────────────────────────
