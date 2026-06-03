@@ -226,6 +226,7 @@ async def chat_endpoint(req: ChatRequest):
             model=model,
             api_key=api_key,
             base_url=base_url,
+            api_mode="chat_completions",
             enabled_toolsets=["memory"],
             quiet_mode=True,
             platform="savana",
