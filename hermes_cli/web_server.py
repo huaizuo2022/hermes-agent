@@ -80,8 +80,22 @@ _log = logging.getLogger(__name__)
 
 app = FastAPI(title="Hermes Agent", version=__version__)
 
-from hermes_cli.companion_api import router as companion_router
+from hermes_cli.companion_api import (
+    router as companion_router,
+    start_weixin_bridge_worker,
+    stop_weixin_bridge_worker,
+)
 app.include_router(companion_router)
+
+
+@app.on_event("startup")
+async def _startup_companion_workers():
+    await start_weixin_bridge_worker()
+
+
+@app.on_event("shutdown")
+async def _shutdown_companion_workers():
+    await stop_weixin_bridge_worker()
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,6 @@
 import os
 import shutil
 import asyncio
-
 import pytest
 from starlette.testclient import TestClient
 
@@ -85,8 +84,6 @@ def test_sync_soul_file_initializes_default_evolved_persona(tmp_path):
     assert "## Evolved Persona\n(暂无自主进化，人设遵循基础设定)" in content
 
 
-
-
 def test_weixin_qr_start_returns_scannable_qr_payload(monkeypatch):
     async def _fake_start(hermes_home, session_id, bot_type="3", timeout_seconds=480):
         assert session_id == "savana_user_char"
@@ -145,7 +142,6 @@ def test_weixin_qr_status_returns_confirmed_payload(monkeypatch):
     assert payload["ilink_user_id"] == "wxid_bound_user"
 
 
-@pytest.mark.skip(reason="Weixin QR features not implemented on main branch yet")
 def test_relay_weixin_message_bridges_to_backend_and_sends_reply(
     monkeypatch,
     tmp_path,
@@ -191,7 +187,7 @@ def test_relay_weixin_message_bridges_to_backend_and_sends_reply(
         lambda *args, **kwargs: _FakeAsyncClient(),
     )
     monkeypatch.setattr(
-        "hermes_cli.companion_api.send_weixin_direct",
+        "gateway.platforms.weixin.send_weixin_direct",
         _fake_send_weixin_direct,
     )
 

@@ -1,15 +1,20 @@
-import os
+import asyncio
 import json
-import shutil
+import logging
+import os
 import queue
+import shutil
 import threading
-from typing import Dict, Any, Generator, Optional
 from pathlib import Path
+from typing import Any, Dict, Generator, Optional
+
+import httpx
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/companion/v1")
+logger = logging.getLogger(__name__)
 
 class ChatRequest(BaseModel):
     user_id: str
@@ -45,6 +50,9 @@ class WeixinQrStatusRequest(BaseModel):
     qrcode: str
     base_url: Optional[str] = None
 
+
+class WeixinQrSessionRequest(BaseModel):
+    session_id: str
 def get_profile_path(session_id: str) -> str:
     from hermes_constants import get_default_hermes_root
     return str(get_default_hermes_root() / "profiles" / session_id)
@@ -158,6 +166,341 @@ def extract_evolved_persona(soul_path: str) -> Optional[str]:
         return None
         
     return "\n".join(evolved_lines).strip()
+
+
+def _get_weixin_bridge_runtime():
+    # type: () -> Dict[str, Any]
+    bridge_url = (
+        os.environ.get("SAVANA_WECHAT_BRIDGE_URL", "").strip()
+        or "http://127.0.0.1:8005/api/v1/wechat-role-binding/bridge/inbound"
+    )
+    bridge_secret = os.environ.get("SAVANA_WECHAT_BRIDGE_SECRET", "").strip()
+    enabled_raw = os.environ.get("SAVANA_WECHAT_BRIDGE_ENABLED", "").strip().lower()
+    enabled = enabled_raw in {"1", "true", "yes", "on"}
+    if not enabled and bridge_secret:
+        enabled = True
+    return {
+        "enabled": enabled,
+        "bridge_url": bridge_url,
+        "bridge_secret": bridge_secret,
+    }
+
+
+async def _relay_inbound_weixin_message(
+    hermes_home: str,
+    bridge_url: str,
+    bridge_secret: str,
+    account_id: str,
+    account_payload: Dict[str, Any],
+    message: Dict[str, Any],
+) -> Optional[str]:
+    from gateway.platforms import weixin
+
+    sender_id = str(message.get("from_user_id") or "").strip()
+    if not sender_id:
+        return None
+
+    item_list = message.get("item_list") or []
+    text = weixin._extract_text(item_list).strip()
+    if not text:
+        return None
+
+    chat_type, effective_chat_id = weixin._guess_chat_type(message, account_id)
+    if chat_type != "dm":
+        return None
+
+    token_store = weixin.ContextTokenStore(hermes_home)
+    token_store.restore(account_id)
+    context_token = str(message.get("context_token") or "").strip()
+    if context_token:
+        token_store.set(account_id, sender_id, context_token)
+
+    headers = {"X-WeChat-Bridge-Secret": bridge_secret}
+    payload = {
+        "wechat_channel_user_id": sender_id,
+        "message_text": text,
+    }
+    base_url = str(account_payload.get("base_url") or weixin.ILINK_BASE_URL).rstrip("/")
+    token = str(account_payload.get("token") or "")
+    typing_ticket = ""
+
+    try:
+        async with weixin.aiohttp.ClientSession(
+            trust_env=True,
+            connector=weixin._make_ssl_connector(),
+        ) as typing_session:
+            config = await weixin._get_config(
+                typing_session,
+                base_url=base_url,
+                token=token,
+                user_id=sender_id,
+                context_token=context_token or None,
+            )
+            typing_ticket = str(config.get("typing_ticket") or "")
+            if typing_ticket:
+                await weixin._send_typing(
+                    typing_session,
+                    base_url=base_url,
+                    token=token,
+                    to_user_id=sender_id,
+                    typing_ticket=typing_ticket,
+                    status=weixin.TYPING_START,
+                )
+    except Exception as exc:
+        logger.debug("weixin typing start skipped for %s: %s", sender_id, exc)
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                bridge_url,
+                headers=headers,
+                json=payload,
+            )
+    finally:
+        if typing_ticket:
+            try:
+                async with weixin.aiohttp.ClientSession(
+                    trust_env=True,
+                    connector=weixin._make_ssl_connector(),
+                ) as typing_session:
+                    await weixin._send_typing(
+                        typing_session,
+                        base_url=base_url,
+                        token=token,
+                        to_user_id=sender_id,
+                        typing_ticket=typing_ticket,
+                        status=weixin.TYPING_STOP,
+                    )
+            except Exception as exc:
+                logger.debug("weixin typing stop skipped for %s: %s", sender_id, exc)
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            "WeChat inbound bridge failed: HTTP {0} - {1}".format(
+                response.status_code,
+                response.text,
+            )
+        )
+
+    response_json = response.json()
+    reply = str(
+        ((response_json or {}).get("data") or {}).get("reply") or ""
+    ).strip()
+    if not reply:
+        return None
+
+    send_result = await weixin.send_weixin_direct(
+        extra={
+            "account_id": account_id,
+            "base_url": base_url,
+            "token": token,
+        },
+        token=token,
+        chat_id=effective_chat_id,
+        message=reply,
+    )
+    if isinstance(send_result, dict) and send_result.get("error"):
+        raise RuntimeError(
+            "Weixin direct reply failed: {0}".format(send_result["error"])
+        )
+
+    logger.info(
+        "weixin bridge relayed message for %s -> %s (message_id=%s)",
+        account_id,
+        sender_id,
+        isinstance(send_result, dict) and send_result.get("message_id") or "",
+    )
+
+    return reply
+
+
+class WeixinInboundBridgeWorker(object):
+    def __init__(self):
+        self._task = None
+        self._stop_event = None
+        self._poll_tasks = {}
+
+    async def start(self):
+        runtime = _get_weixin_bridge_runtime()
+        if not runtime["enabled"] or not runtime["bridge_secret"]:
+            logger.info("weixin bridge worker disabled: missing enable flag or secret")
+            return
+        if self._task is not None and not self._task.done():
+            return
+        self._stop_event = asyncio.Event()
+        self._task = asyncio.create_task(self._run(runtime))
+        logger.info("weixin bridge worker started")
+
+    async def stop(self):
+        if self._task is None:
+            return
+        self._stop_event.set()
+        for task in self._poll_tasks.values():
+            task.cancel()
+        await asyncio.gather(*self._poll_tasks.values(), return_exceptions=True)
+        self._poll_tasks = {}
+        await asyncio.gather(self._task, return_exceptions=True)
+        self._task = None
+        logger.info("weixin bridge worker stopped")
+
+    async def _run(self, runtime: Dict[str, Any]):
+        from hermes_constants import get_default_hermes_root
+
+        hermes_home = str(get_default_hermes_root())
+        accounts_dir = Path(hermes_home) / "weixin" / "accounts"
+        while not self._stop_event.is_set():
+            known_accounts = {}
+            if accounts_dir.exists():
+                for account_file in accounts_dir.glob("*.json"):
+                    if account_file.name.endswith(".context-tokens.json"):
+                        continue
+                    if account_file.name.endswith(".sync.json"):
+                        continue
+                    try:
+                        known_accounts[account_file.stem] = json.loads(
+                            account_file.read_text(encoding="utf-8")
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "failed to load weixin account file %s: %s",
+                            account_file,
+                            exc,
+                        )
+
+            for account_id, payload in known_accounts.items():
+                poll_task = self._poll_tasks.get(account_id)
+                if poll_task is None or poll_task.done():
+                    self._poll_tasks[account_id] = asyncio.create_task(
+                        self._poll_account(
+                            hermes_home=hermes_home,
+                            bridge_url=runtime["bridge_url"],
+                            bridge_secret=runtime["bridge_secret"],
+                            account_id=account_id,
+                            account_payload=payload,
+                        )
+                    )
+
+            inactive_accounts = [
+                account_id
+                for account_id in list(self._poll_tasks.keys())
+                if account_id not in known_accounts
+            ]
+            for account_id in inactive_accounts:
+                self._poll_tasks.pop(account_id).cancel()
+
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                continue
+
+    async def _poll_account(
+        self,
+        hermes_home: str,
+        bridge_url: str,
+        bridge_secret: str,
+        account_id: str,
+        account_payload: Dict[str, Any],
+    ):
+        from gateway.platforms import weixin
+        from gateway.platforms.helpers import MessageDeduplicator
+
+        token = str(account_payload.get("token") or "").strip()
+        if not token:
+            logger.warning("skip weixin bridge polling for %s: missing token", account_id)
+            return
+
+        base_url = str(
+            account_payload.get("base_url") or weixin.ILINK_BASE_URL
+        ).strip().rstrip("/")
+        sync_buf = weixin._load_sync_buf(hermes_home, account_id)
+        timeout_ms = weixin.LONG_POLL_TIMEOUT_MS
+        dedup = MessageDeduplicator(ttl_seconds=weixin.MESSAGE_DEDUP_TTL_SECONDS)
+
+        async with weixin.aiohttp.ClientSession(
+            trust_env=True,
+            connector=weixin._make_ssl_connector(),
+        ) as session:
+            while not self._stop_event.is_set():
+                try:
+                    response = await weixin._get_updates(
+                        session,
+                        base_url=base_url,
+                        token=token,
+                        sync_buf=sync_buf,
+                        timeout_ms=timeout_ms,
+                    )
+                    suggested_timeout = response.get("longpolling_timeout_ms")
+                    if isinstance(suggested_timeout, int) and suggested_timeout > 0:
+                        timeout_ms = suggested_timeout
+
+                    ret = response.get("ret", 0)
+                    errcode = response.get("errcode", 0)
+                    if ret not in {0, None} or errcode not in {0, None}:
+                        await asyncio.sleep(2)
+                        continue
+
+                    new_sync_buf = str(response.get("get_updates_buf") or "")
+                    if new_sync_buf:
+                        sync_buf = new_sync_buf
+                        weixin._save_sync_buf(hermes_home, account_id, sync_buf)
+
+                    for message in response.get("msgs") or []:
+                        message_id = str(message.get("message_id") or "").strip()
+                        if message_id and dedup.is_duplicate(message_id):
+                            continue
+                        text = weixin._extract_text(message.get("item_list") or [])
+                        sender_id = str(message.get("from_user_id") or "").strip()
+                        if text and sender_id:
+                            content_key = "content:{0}:{1}:{2}".format(
+                                account_id,
+                                sender_id,
+                                text,
+                            )
+                            if dedup.is_duplicate(content_key):
+                                continue
+                        try:
+                            reply = await _relay_inbound_weixin_message(
+                                hermes_home=hermes_home,
+                                bridge_url=bridge_url,
+                                bridge_secret=bridge_secret,
+                                account_id=account_id,
+                                account_payload=account_payload,
+                                message=message,
+                            )
+                            if reply:
+                                logger.info(
+                                    "weixin bridge relayed message for %s -> %s",
+                                    account_id,
+                                    sender_id,
+                                )
+                        except Exception as exc:
+                            logger.error(
+                                "weixin bridge relay failed for %s: %s",
+                                account_id,
+                                exc,
+                                exc_info=True,
+                            )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error(
+                        "weixin bridge poll failed for %s: %s",
+                        account_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(2)
+
+
+_WEIXIN_BRIDGE_WORKER = WeixinInboundBridgeWorker()
+
+
+async def start_weixin_bridge_worker():
+    await _WEIXIN_BRIDGE_WORKER.start()
+
+
+async def stop_weixin_bridge_worker():
+    await _WEIXIN_BRIDGE_WORKER.stop()
 
 def sync_soul_file(profile_dir: str, profile_data: Dict[str, Any]) -> None:
     soul_path = os.path.join(profile_dir, "SOUL.md")

@@ -63,9 +63,9 @@ if [ ! -d "$REMOTE_PATH/venv" ]; then
   echo "  ✅ 虚拟环境创建成功"
 fi
 
-echo "🐍 正在激活虚拟环境并安装项目 [web] 依赖..."
+echo "🐍 正在激活虚拟环境并安装项目 [web,messaging] 依赖..."
 "$REMOTE_PATH/venv/bin/pip" install --upgrade pip
-"$REMOTE_PATH/venv/bin/pip" install -e "$REMOTE_PATH[web]"
+"$REMOTE_PATH/venv/bin/pip" install -e "$REMOTE_PATH[web,messaging]"
 echo "  ✅ 依赖安装成功"
 
 echo "⚙️  正在创建 systemd 配置文件 /etc/systemd/system/airi-love-hermes.service ..."
