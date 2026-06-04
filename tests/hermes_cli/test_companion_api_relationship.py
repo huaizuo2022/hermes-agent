@@ -87,7 +87,6 @@ def test_sync_soul_file_initializes_default_evolved_persona(tmp_path):
 
 
 
-@pytest.mark.skip(reason="Weixin QR features not implemented on main branch yet")
 def test_weixin_qr_start_returns_scannable_qr_payload(monkeypatch):
     async def _fake_start(hermes_home, session_id, bot_type="3", timeout_seconds=480):
         assert session_id == "savana_user_char"
@@ -114,7 +113,6 @@ def test_weixin_qr_start_returns_scannable_qr_payload(monkeypatch):
     assert payload["qrcode_img_content"] == "https://example.com/ilink-qr"
 
 
-@pytest.mark.skip(reason="Weixin QR features not implemented on main branch yet")
 def test_weixin_qr_status_returns_confirmed_payload(monkeypatch):
     async def _fake_status(hermes_home, session_id, qrcode, base_url=None):
         assert session_id == "savana_user_char"

@@ -32,9 +32,105 @@ class MemorySyncRequest(BaseModel):
     content: Optional[str] = None
     old_text: Optional[str] = None
 
+
+class WeixinQrStartRequest(BaseModel):
+    session_id: str
+    character_profile: Optional[Dict[str, Any]] = None
+    bot_type: str = "3"
+    timeout_seconds: int = 480
+
+
+class WeixinQrStatusRequest(BaseModel):
+    session_id: str
+    qrcode: str
+    base_url: Optional[str] = None
+
 def get_profile_path(session_id: str) -> str:
     from hermes_constants import get_default_hermes_root
     return str(get_default_hermes_root() / "profiles" / session_id)
+
+
+async def _start_weixin_qr_session(
+    hermes_home: str,
+    session_id: str,
+    bot_type: str = "3",
+    timeout_seconds: int = 480,
+) -> Dict[str, Any]:
+    from gateway.platforms import weixin
+
+    if not weixin.check_weixin_requirements():
+        raise RuntimeError("Weixin QR login dependencies are missing")
+
+    async with weixin.aiohttp.ClientSession(
+        trust_env=True,
+        connector=weixin._make_ssl_connector(),
+    ) as session:
+        response = await weixin._api_get(
+            session,
+            base_url=weixin.ILINK_BASE_URL,
+            endpoint="{0}?bot_type={1}".format(weixin.EP_GET_BOT_QR, bot_type),
+            timeout_ms=weixin.QR_TIMEOUT_MS,
+        )
+
+    qrcode_value = str(response.get("qrcode") or "")
+    qrcode_url = str(response.get("qrcode_img_content") or "")
+    if not qrcode_value:
+        raise RuntimeError("Weixin QR response missing qrcode")
+
+    return {
+        "session_id": session_id,
+        "qrcode": qrcode_value,
+        "qrcode_img_content": qrcode_url,
+        "status": "wait",
+        "bot_type": bot_type,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+async def _query_weixin_qr_status(
+    hermes_home: str,
+    session_id: str,
+    qrcode: str,
+    base_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    from gateway.platforms import weixin
+
+    if not weixin.check_weixin_requirements():
+        raise RuntimeError("Weixin QR login dependencies are missing")
+
+    resolved_base_url = (base_url or weixin.ILINK_BASE_URL).rstrip("/")
+    async with weixin.aiohttp.ClientSession(
+        trust_env=True,
+        connector=weixin._make_ssl_connector(),
+    ) as session:
+        response = await weixin._api_get(
+            session,
+            base_url=resolved_base_url,
+            endpoint="{0}?qrcode={1}".format(weixin.EP_GET_QR_STATUS, qrcode),
+            timeout_ms=weixin.QR_TIMEOUT_MS,
+        )
+
+    response["session_id"] = session_id
+    return response
+
+
+def _persist_weixin_binding_account(
+    hermes_home: str,
+    *,
+    account_id: str,
+    token: str,
+    base_url: str,
+    user_id: str,
+) -> None:
+    from gateway.platforms import weixin
+
+    weixin.save_weixin_account(
+        hermes_home,
+        account_id=account_id,
+        token=token,
+        base_url=base_url,
+        user_id=user_id,
+    )
 
 def extract_evolved_persona(soul_path: str) -> Optional[str]:
     if not os.path.exists(soul_path):
@@ -383,6 +479,53 @@ async def sync_memory(session_id: str, req: MemorySyncRequest):
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         reset_hermes_home_override(token)
+
+
+@router.post("/weixin/qr/start")
+async def start_weixin_qr(req: WeixinQrStartRequest):
+    hermes_home = str(Path(get_profile_path(req.session_id)).parent.parent)
+    try:
+        if isinstance(req.character_profile, dict):
+            profile_dir = get_profile_path(req.session_id)
+            os.makedirs(profile_dir, exist_ok=True)
+            sync_soul_file(profile_dir, req.character_profile)
+        result = await _start_weixin_qr_session(
+            hermes_home=hermes_home,
+            session_id=req.session_id,
+            bot_type=req.bot_type,
+            timeout_seconds=req.timeout_seconds,
+        )
+        return JSONResponse(result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/weixin/qr/status")
+async def get_weixin_qr_status(req: WeixinQrStatusRequest):
+    hermes_home = str(Path(get_profile_path(req.session_id)).parent.parent)
+    try:
+        result = await _query_weixin_qr_status(
+            hermes_home=hermes_home,
+            session_id=req.session_id,
+            qrcode=req.qrcode,
+            base_url=req.base_url,
+        )
+        if str(result.get("status") or "") == "confirmed":
+            account_id = str(result.get("ilink_bot_id") or "")
+            token = str(result.get("bot_token") or "")
+            base_url = str(result.get("baseurl") or "")
+            user_id = str(result.get("ilink_user_id") or "")
+            if account_id and token:
+                _persist_weixin_binding_account(
+                    hermes_home,
+                    account_id=account_id,
+                    token=token,
+                    base_url=base_url,
+                    user_id=user_id,
+                )
+        return JSONResponse(result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 @router.delete("/sessions/{session_id}/messages/{message_id}")
 async def delete_message(session_id: str, message_id: str):
