@@ -8,7 +8,7 @@ echo "========================================="
 
 REMOTE_USER="root"
 REMOTE_HOST="146.56.229.151"
-REMOTE_PASSWORD="Y6Mdmgp.UkeeYh."
+REMOTE_PASSWORD="8spCTD8uFm.BZQe"
 REMOTE_PATH="/var/www/hermes-agent"
 LOCAL_TAR="/tmp/hermes-agent-deploy.tar.gz"
 
@@ -68,8 +68,25 @@ echo "🐍 正在激活虚拟环境并安装项目 [web,messaging] 依赖..."
 "$REMOTE_PATH/venv/bin/pip" install -e "$REMOTE_PATH[web,messaging]"
 echo "  ✅ 依赖安装成功"
 
+WECHAT_BRIDGE_ENV_FILE="/var/www/airi-love-backend/.env"
+WECHAT_BRIDGE_ENABLED="true"
+WECHAT_BRIDGE_URL="http://127.0.0.1:8005/api/v1/wechat-role-binding/bridge/inbound"
+WECHAT_BRIDGE_SECRET=""
+
+if [ -f "$WECHAT_BRIDGE_ENV_FILE" ]; then
+  echo "🔗 从 $WECHAT_BRIDGE_ENV_FILE 同步微信桥接配置..."
+  bridge_enabled_raw=$(grep '^WECHAT_INBOUND_BRIDGE_ENABLED=' "$WECHAT_BRIDGE_ENV_FILE" | head -n1 | cut -d= -f2- || true)
+  bridge_secret_raw=$(grep '^WECHAT_INBOUND_BRIDGE_SECRET=' "$WECHAT_BRIDGE_ENV_FILE" | head -n1 | cut -d= -f2- || true)
+
+  if [ -n "$bridge_enabled_raw" ]; then
+    WECHAT_BRIDGE_ENABLED=$(printf '%s' "$bridge_enabled_raw" | tr '[:upper:]' '[:lower:]')
+  fi
+
+  WECHAT_BRIDGE_SECRET=$(printf '%s' "$bridge_secret_raw" | sed 's/^["'\'']//; s/["'\'']$//')
+fi
+
 echo "⚙️  正在创建 systemd 配置文件 /etc/systemd/system/airi-love-hermes.service ..."
-cat << 'EOF' > /etc/systemd/system/airi-love-hermes.service
+cat <<EOF > /etc/systemd/system/airi-love-hermes.service
 [Unit]
 Description=Airi Love Hermes Companion Service
 After=network.target
@@ -79,6 +96,9 @@ User=root
 WorkingDirectory=/var/www/hermes-agent
 Environment=DEEPSEEK_API_KEY=sk-fe3ca6dcd52f4569bc013a4069879c18
 Environment=DEEPSEEK_API_BASE=https://api.deepseek.com/v1
+Environment="SAVANA_WECHAT_BRIDGE_ENABLED=${WECHAT_BRIDGE_ENABLED}"
+Environment="SAVANA_WECHAT_BRIDGE_URL=${WECHAT_BRIDGE_URL}"
+Environment="SAVANA_WECHAT_BRIDGE_SECRET=${WECHAT_BRIDGE_SECRET}"
 ExecStart=/var/www/hermes-agent/venv/bin/python -m uvicorn hermes_cli.web_server:app --port 8009 --host 127.0.0.1
 Restart=always
 RestartSec=5
