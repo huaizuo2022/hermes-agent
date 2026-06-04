@@ -1,0 +1,9 @@
+{
+  "directives": [
+    {
+      "directive": "仅对 hermes-agent 生效：任何准备交付、部署、或供 Savana/VelvetChat 消费的修改，在完成 commit 后必须立即合入 main；禁止让生产相关修复长期只存在于侧分支。部署、交接、或宣称完成前，必须确认 main 已包含实际要发布的提交。",
+      "priority": "high",
+      "context": "branch policy / deployment safety"
+    }
+  ]
+}

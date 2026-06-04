@@ -986,6 +986,21 @@ file will silently overwrite recent fixes on main when squashed. Verify
 with `git diff HEAD~1..HEAD` after merging — unexpected deletions are a
 red flag.
 
+### For this repo, do not leave deliverable fixes stranded off `main`
+This rule applies to `hermes-agent` only. If a change is intended to be
+shipped, deployed, or consumed by Savana / VelvetChat, then after the
+change is committed it must be merged back into `main` immediately. Do
+not leave production-relevant fixes living only on a side branch.
+
+Minimum workflow:
+- make the change on your working branch
+- commit it
+- merge or cherry-pick it onto `main` right away
+- verify the final deployable state from `main`
+
+Before deploying, handing off, or declaring the work ready, confirm that
+`main` already contains the exact commit being shipped.
+
 ### Don't wire in dead code without E2E validation
 Unused code that was never shipped was dead for a reason. Before wiring an
 unused module into a live code path, E2E test the real resolution chain
@@ -1177,4 +1192,3 @@ curl http://127.0.0.1:8009/companion/v1/chat
 - Executable Python path: `/var/www/hermes-agent/venv/bin/python`
 - LLM Provider environment vars (e.g., `DEEPSEEK_API_KEY`, `DEEPSEEK_API_BASE`) are specified inside the systemd service file environment block.
 - Profile storage path defaults to `~/.hermes/` (root user's home).
-
