@@ -3031,6 +3031,7 @@ def run_conversation(
                             f"error retry backoff ({retry_count}/{max_retries}), "
                             f"{int(sleep_end - time.time())}s remaining"
                         )
+                continue
         
         # If the API call was interrupted, skip response processing
         if interrupted:
