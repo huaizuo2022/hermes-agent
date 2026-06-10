@@ -670,6 +670,7 @@ async def chat_endpoint(req: ChatRequest):
             quiet_mode=True,
             platform="savana",
             session_db=session_db,
+            session_id=session_id,
             load_soul_identity=True,
             skip_context_files=True,
             ephemeral_system_prompt=req.directives,
