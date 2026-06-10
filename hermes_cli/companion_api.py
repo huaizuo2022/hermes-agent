@@ -171,8 +171,13 @@ def extract_evolved_persona(soul_path: str) -> Optional[str]:
 def _load_companion_history(session_db, session_id: str, current_message_id: str) -> List[Dict[str, Any]]:
     try:
         messages = session_db.get_messages_as_conversation(session_id)
-    except Exception:
-        return []
+    except Exception as exc:
+        logger.exception(
+            "Failed to load companion history for session %s: %s",
+            session_id,
+            exc,
+        )
+        raise
 
     history = []
     for msg in messages:
