@@ -6,7 +6,7 @@ import queue
 import shutil
 import threading
 from pathlib import Path
-from typing import Any, Dict, Generator, Optional
+from typing import Any, Dict, Generator, List, Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException
@@ -166,6 +166,25 @@ def extract_evolved_persona(soul_path: str) -> Optional[str]:
         return None
         
     return "\n".join(evolved_lines).strip()
+
+
+def _load_companion_history(session_db, session_id: str, current_message_id: str) -> List[Dict[str, Any]]:
+    try:
+        messages = session_db.get_messages_as_conversation(session_id)
+    except Exception:
+        return []
+
+    history = []
+    for msg in messages:
+        if (
+            current_message_id
+            and isinstance(msg, dict)
+            and msg.get("role") == "user"
+            and msg.get("message_id") == current_message_id
+        ):
+            continue
+        history.append(msg)
+    return history
 
 
 def _get_weixin_bridge_runtime():
@@ -627,31 +646,9 @@ async def chat_endpoint(req: ChatRequest):
             session_db.create_session(session_id, "savana")
         except Exception:
             pass
-
-        # 检查消息 ID 是否存在，若不存在则双写落库
-        msg_exists = False
-        try:
-            conn = session_db._conn
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT 1 FROM messages WHERE session_id = ? AND platform_message_id = ?",
-                (session_id, req.message_id)
-            )
-            if cursor.fetchone():
-                msg_exists = True
-        except Exception:
-            pass
-
-        if not msg_exists:
-            try:
-                session_db.append_message(
-                    session_id=session_id,
-                    role="user",
-                    content=req.user_message,
-                    platform_message_id=req.message_id
-                )
-            except Exception:
-                pass
+        conversation_history = _load_companion_history(
+            session_db, session_id, req.message_id
+        )
 
         # 动态解析模型及 API 配置
         api_key = req.api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -721,17 +718,13 @@ async def chat_endpoint(req: ChatRequest):
                         collected_chunks.append(delta)
 
                     # 触发对话生成
-                    final_reply = agent.chat(req.user_message, stream_callback=stream_callback)
-                    
-                    # 最终记录 AI 的回复落库
-                    try:
-                        session_db.append_message(
-                            session_id=session_id,
-                            role="assistant",
-                            content=final_reply
-                        )
-                    except Exception:
-                        pass
+                    result = agent.run_conversation(
+                        req.user_message,
+                        conversation_history=conversation_history,
+                        stream_callback=stream_callback,
+                        platform_message_id=req.message_id,
+                    )
+                    final_reply = result.get("final_response", "")
                 except Exception as e:
                     q.put(e)
                 finally:
@@ -764,15 +757,12 @@ async def chat_endpoint(req: ChatRequest):
 
             return StreamingResponse(sse_generator(), media_type="text/event-stream")
         else:
-            reply = agent.chat(req.user_message)
-            try:
-                session_db.append_message(
-                    session_id=session_id,
-                    role="assistant",
-                    content=reply
-                )
-            except Exception:
-                pass
+            result = agent.run_conversation(
+                req.user_message,
+                conversation_history=conversation_history,
+                platform_message_id=req.message_id,
+            )
+            reply = result.get("final_response", "")
             modifications = []
             if getattr(agent, "_memory_store", None) and hasattr(agent._memory_store, "modifications"):
                 modifications = agent._memory_store.modifications

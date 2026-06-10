@@ -164,6 +164,31 @@ class TestFlushDeduplication:
             old_rows = db.get_messages(old_session)
             assert len(old_rows) == 2
 
+    def test_flush_current_user_persists_platform_message_id(self):
+        """Current-turn user message ids must survive SQLite replay."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            db = SessionDB(db_path=db_path)
+
+            agent = self._make_agent(db)
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": "hello",
+                    "platform_message_id": "platform-msg-1",
+                },
+                {"role": "assistant", "content": "hi"},
+            ]
+
+            agent._flush_messages_to_session_db(messages, [])
+
+            replay = db.get_messages_as_conversation(agent.session_id)
+            assert replay[0]["message_id"] == "platform-msg-1"
+            assert replay[0]["content"] == "hello"
+
 
 # ---------------------------------------------------------------------------
 # Test: append_to_transcript skip_db parameter
