@@ -62,7 +62,7 @@ cp "$REMOTE_PATH/scripts/extract_recent_dialogues.py" /root/.hermes/scripts/extr
 rm -rf /root/.hermes/skills/savana-companion-evolution
 cp -R "$REMOTE_PATH/skills/savana-companion-evolution" /root/.hermes/skills/savana-companion-evolution
 chmod 700 /root/.hermes/scripts
-chmod 600 /root/.hermes/scripts/extract_recent_dialogues.py
+chmod 700 /root/.hermes/scripts/extract_recent_dialogues.py
 chmod -R go-rwx /root/.hermes/skills/savana-companion-evolution
 
 # 确保有 venv
