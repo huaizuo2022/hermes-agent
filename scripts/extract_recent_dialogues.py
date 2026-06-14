@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Python 3.6 compatible script to extract recent chat dialogues and cold sessions from Hermes profiles
+Python 3.6 compatible script to extract Savana chat dialogues from Hermes profiles
 for daily review and self-evolution.
 """
 
@@ -10,6 +10,36 @@ import sys
 import time
 import sqlite3
 from datetime import datetime
+
+DEFAULT_LOOKBACK_HOURS = 24
+DEFAULT_MESSAGE_LIMIT = 30
+
+def parse_non_negative_int_env(name, default):
+    raw_value = os.environ.get(name)
+    if raw_value is None or raw_value == "":
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return default
+    if value < 0:
+        return default
+    return value
+
+def parse_positive_int_env(name, default):
+    value = parse_non_negative_int_env(name, default)
+    if value <= 0:
+        return default
+    return value
+
+def describe_elapsed(elapsed):
+    if elapsed < 24 * 3600:
+        return "活跃状态"
+    if elapsed < 72 * 3600:
+        return "近期沉淀状态"
+    if elapsed <= 120 * 3600:
+        return "断联冷落状态"
+    return "长期沉默状态"
 
 def parse_character_name(soul_path):
     if not os.path.exists(soul_path):
@@ -56,23 +86,26 @@ def extract_evolved_persona(soul_path):
     except Exception:
         return ""
 
-def get_recent_messages(db_path, since_timestamp=0):
+def get_recent_messages(db_path, since_timestamp=0, limit=DEFAULT_MESSAGE_LIMIT):
     if not os.path.exists(db_path):
         return []
     conn = None
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        # If since_timestamp is 0, query last 30 messages overall to identify state
+        if limit <= 0:
+            limit = DEFAULT_MESSAGE_LIMIT
+
+        # If since_timestamp is 0, query recent messages overall to identify state
         if since_timestamp == 0:
             query = """
                 SELECT role, content, timestamp 
                 FROM messages 
                 WHERE role IN ('user', 'assistant')
                 ORDER BY timestamp DESC
-                LIMIT 30
+                LIMIT ?
             """
-            cursor.execute(query)
+            cursor.execute(query, (limit,))
             rows = cursor.fetchall()
             rows.reverse()  # Restore chronological order
         else:
@@ -80,10 +113,12 @@ def get_recent_messages(db_path, since_timestamp=0):
                 SELECT role, content, timestamp 
                 FROM messages 
                 WHERE timestamp >= ? AND role IN ('user', 'assistant')
-                ORDER BY timestamp ASC
+                ORDER BY timestamp DESC
+                LIMIT ?
             """
-            cursor.execute(query, (since_timestamp,))
+            cursor.execute(query, (since_timestamp, limit))
             rows = cursor.fetchall()
+            rows.reverse()  # Restore chronological order
             
         messages = []
         last_msg = None
@@ -115,6 +150,19 @@ def main():
         return
 
     now = time.time()
+    lookback_hours = parse_non_negative_int_env(
+        "SAVANA_EVOLUTION_LOOKBACK_HOURS",
+        DEFAULT_LOOKBACK_HOURS
+    )
+    message_limit = parse_positive_int_env(
+        "SAVANA_EVOLUTION_MESSAGE_LIMIT",
+        DEFAULT_MESSAGE_LIMIT
+    )
+    max_profiles = parse_non_negative_int_env("SAVANA_EVOLUTION_MAX_PROFILES", 0)
+    since_timestamp = 0
+    if lookback_hours > 0:
+        since_timestamp = now - lookback_hours * 3600
+
     all_profile_chats = []
     
     for name in os.listdir(profiles_dir):
@@ -131,49 +179,51 @@ def main():
         char_name = parse_character_name(soul_path)
         intimacy = parse_intimacy_score(soul_path)
         
-        # Fetch recent messages (chronological order)
-        messages = get_recent_messages(db_path, since_timestamp=0)
+        # Fetch recent messages (chronological order). Every Savana profile with
+        # dialogue in the review window is eligible; no cold-gap or intimacy gate.
+        messages = get_recent_messages(
+            db_path,
+            since_timestamp=since_timestamp,
+            limit=message_limit
+        )
         if not messages:
             continue
             
         last_active = messages[-1]["timestamp"]
         elapsed = now - last_active
-        
-        # Criteria:
-        # 1. Active in last 24h OR
-        # 2. Cold chat: inactive between 72h and 96h (3-4 days), with high intimacy (>= 7)
-        is_active_24h = elapsed < 24 * 3600
-        is_cold_3d = (72 * 3600 <= elapsed <= 120 * 3600) and intimacy >= 7
-        
-        if is_active_24h or is_cold_3d:
-            # For active chats, limit message history to last 24h only
-            if is_active_24h:
-                messages = [m for m in messages if m["timestamp"] >= (now - 24 * 3600)]
-                
-            all_profile_chats.append({
-                "profile_id": name,
-                "character_name": char_name,
-                "soul_path": soul_path,
-                "messages": messages,
-                "last_active": last_active,
-                "elapsed": elapsed,
-                "intimacy": intimacy,
-                "evolved_persona": extract_evolved_persona(soul_path)
-            })
+        if elapsed < 0:
+            elapsed = 0
 
-    # Sort: Prioritize active chats (< 24h) first, and put cold/neglected chats (3-5 days) last.
-    # x["elapsed"] >= 24 * 3600 will evaluate to False (0) for active chats and True (1) for cold chats.
-    all_profile_chats.sort(key=lambda x: (x["elapsed"] >= 24 * 3600, x["elapsed"]))
+        all_profile_chats.append({
+            "profile_id": name,
+            "character_name": char_name,
+            "soul_path": soul_path,
+            "messages": messages,
+            "last_active": last_active,
+            "elapsed": elapsed,
+            "intimacy": intimacy,
+            "evolved_persona": extract_evolved_persona(soul_path)
+        })
 
-    # Limit to top 5 profiles to prevent large context sizes and DeepSeek API timeouts
-    all_profile_chats = all_profile_chats[:5]
+    # Review newest activity first. Do not prioritize 3-day cold sessions over
+    # active characters, and do not apply a default top-N cap.
+    all_profile_chats.sort(key=lambda x: x["last_active"], reverse=True)
+
+    if max_profiles > 0:
+        all_profile_chats = all_profile_chats[:max_profiles]
 
     if not all_profile_chats:
-        print("# Active & Cold Characters Evolution Report\n\nNo active or cold characters met the evaluation criteria.")
+        print("# Savana Characters Evolution Report\n\nNo Savana characters had dialogue in the review window.")
         return
 
-    print("# Active & Cold Characters Evolution Report")
+    print("# Savana Characters Evolution Report")
     print("Generated at: {}\n".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    if lookback_hours > 0:
+        print("- Review Window: last {} hours".format(lookback_hours))
+    else:
+        print("- Review Window: all available dialogue history")
+    print("- Profiles Included: {}".format(len(all_profile_chats)))
+    print("- Per-Profile Message Limit: {}\n".format(message_limit))
     
     for chat in all_profile_chats:
         last_active_str = datetime.fromtimestamp(chat["last_active"]).strftime("%Y-%m-%d %H:%M:%S")
@@ -182,7 +232,7 @@ def main():
         days = int(chat["elapsed"] // (24 * 3600))
         hours = int((chat["elapsed"] % (24 * 3600)) // 3600)
         elapsed_str = "{}天 {}小时".format(days, hours)
-        status_tag = "活跃状态" if chat["elapsed"] < 24 * 3600 else "断联冷落状态"
+        status_tag = describe_elapsed(chat["elapsed"])
         
         print("## Character: {} (Profile ID: {})".format(chat["character_name"], chat["profile_id"]))
         print("- SOUL.md File Path: {}".format(chat["soul_path"]))
