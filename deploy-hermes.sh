@@ -56,6 +56,15 @@ tar xzf /root/hermes-agent-deploy.tar.gz -C "$REMOTE_PATH"
 # 清理所有 macOS 隐藏 metadata 文件，防止 python3 加载发生 UnicodeDecodeError 崩溃
 find "$REMOTE_PATH" -name "._*" -delete
 
+echo "🧬 同步 Savana 自进化脚本与技能到 Hermes 运行态目录..."
+mkdir -p /root/.hermes/scripts /root/.hermes/skills
+cp "$REMOTE_PATH/scripts/extract_recent_dialogues.py" /root/.hermes/scripts/extract_recent_dialogues.py
+rm -rf /root/.hermes/skills/savana-companion-evolution
+cp -R "$REMOTE_PATH/skills/savana-companion-evolution" /root/.hermes/skills/savana-companion-evolution
+chmod 700 /root/.hermes/scripts
+chmod 600 /root/.hermes/scripts/extract_recent_dialogues.py
+chmod -R go-rwx /root/.hermes/skills/savana-companion-evolution
+
 # 确保有 venv
 if [ ! -d "$REMOTE_PATH/venv" ]; then
   echo "🐍 正在创建 Python 3.12 虚拟环境..."
