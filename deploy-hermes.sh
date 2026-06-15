@@ -121,10 +121,19 @@ systemctl daemon-reload
 systemctl enable airi-love-hermes.service
 systemctl restart airi-love-hermes.service
 
+echo "⏰ 确保 Hermes cron tick 以 5 分钟频率运行..."
+CRON_LINE='*/5 * * * * DEEPSEEK_API_KEY=sk-fe3ca6dcd52f4569bc013a4069879c18 /var/www/hermes-agent/venv/bin/hermes cron tick >> /root/.hermes/logs/cron_tick.log 2>&1'
+TMP_CRON=$(mktemp)
+crontab -l 2>/dev/null | grep -v '/var/www/hermes-agent/venv/bin/hermes cron tick' > "$TMP_CRON" || true
+printf '%s\n' "$CRON_LINE" >> "$TMP_CRON"
+crontab "$TMP_CRON"
+rm -f "$TMP_CRON"
+
 echo "🔍 检查服务运行状态..."
 sleep 2
 systemctl is-active --quiet airi-love-hermes.service || (systemctl status airi-love-hermes.service --no-pager && exit 1)
 echo "  ✅ airi-love-hermes.service 状态正常，已启动并在 8009 端口运行"
+echo "  ✅ Hermes cron tick 已配置为每 5 分钟执行一次"
 
 echo "🩺 验证本地回显..."
 curl_out=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8009/companion/v1/chat || echo "FAILED")
