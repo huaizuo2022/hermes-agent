@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Python 3.6 compatible script to extract Savana chat dialogues from Hermes profiles
-for daily review and self-evolution.
+Python 3.6 compatible Savana evolution batch extractor.
+
+Business rule:
+- Only profiles that were actually chatted on the previous natural day
+  in Asia/Shanghai are eligible for daily self-evolution.
+- Eligible profiles are processed in batches to avoid one giant prompt.
 """
 
+import json
 import os
+import sqlite3
 import sys
 import time
-import sqlite3
 from datetime import datetime
 
-DEFAULT_LOOKBACK_HOURS = 24
+DEFAULT_BATCH_SIZE = 10
 DEFAULT_MESSAGE_LIMIT = 30
+DEFAULT_BATCH_CURSOR = 0
+STATE_DIR_NAME = os.path.join("cron", "state", "savana-self-evolution")
+RUN_DATE_FORMAT = "%Y-%m-%d"
+
 
 def parse_non_negative_int_env(name, default):
     raw_value = os.environ.get(name)
@@ -26,20 +35,54 @@ def parse_non_negative_int_env(name, default):
         return default
     return value
 
+
 def parse_positive_int_env(name, default):
     value = parse_non_negative_int_env(name, default)
     if value <= 0:
         return default
     return value
 
-def describe_elapsed(elapsed):
-    if elapsed < 24 * 3600:
-        return "活跃状态"
-    if elapsed < 72 * 3600:
-        return "近期沉淀状态"
-    if elapsed <= 120 * 3600:
-        return "断联冷落状态"
-    return "长期沉默状态"
+
+def ensure_dir(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+
+def shanghai_now():
+    old_tz = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "Asia/Shanghai"
+        if hasattr(time, "tzset"):
+            time.tzset()
+        return time.time(), datetime.fromtimestamp(time.time())
+    finally:
+        if old_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old_tz
+        if hasattr(time, "tzset"):
+            time.tzset()
+
+
+def current_business_date(now_dt):
+    override = os.environ.get("SAVANA_EVOLUTION_TARGET_DATE", "").strip()
+    if override:
+        return override
+    return now_dt.strftime(RUN_DATE_FORMAT)
+
+
+def previous_business_date(now_dt):
+    override = os.environ.get("SAVANA_EVOLUTION_SOURCE_DATE", "").strip()
+    if override:
+        return override
+    return datetime.fromtimestamp(time.mktime(now_dt.timetuple()) - 24 * 3600).strftime(RUN_DATE_FORMAT)
+
+
+def business_day_bounds(date_str):
+    start = datetime.strptime(date_str + " 00:00:00", "%Y-%m-%d %H:%M:%S")
+    end = datetime.strptime(date_str + " 23:59:59", "%Y-%m-%d %H:%M:%S")
+    return time.mktime(start.timetuple()), time.mktime(end.timetuple())
+
 
 def parse_character_name(soul_path):
     if not os.path.exists(soul_path):
@@ -53,6 +96,7 @@ def parse_character_name(soul_path):
         pass
     return "Unknown"
 
+
 def parse_intimacy_score(soul_path):
     if not os.path.exists(soul_path):
         return 0
@@ -62,11 +106,11 @@ def parse_intimacy_score(soul_path):
                 if "Intimacy level:" in line:
                     parts = line.split("Intimacy level:")
                     if len(parts) > 1:
-                        val = parts[1].strip().split("/")[0]
-                        return int(val)
+                        return int(parts[1].strip().split("/")[0])
     except Exception:
         pass
     return 0
+
 
 def extract_evolved_persona(soul_path):
     if not os.path.exists(soul_path):
@@ -74,191 +118,339 @@ def extract_evolved_persona(soul_path):
     try:
         with open(soul_path, "r", encoding="utf-8") as f:
             content = f.read()
-        header = "## Evolved Persona"
-        idx = content.find(header)
+        marker = "## Evolved Persona"
+        idx = content.find(marker)
         if idx == -1:
             return ""
-        section_content = content[idx + len(header):].strip()
-        next_header_idx = section_content.find("\n## ")
-        if next_header_idx != -1:
-            section_content = section_content[:next_header_idx].strip()
-        return section_content
+        tail = content[idx + len(marker):].strip()
+        next_header = tail.find("\n## ")
+        if next_header != -1:
+            tail = tail[:next_header].strip()
+        return tail
     except Exception:
         return ""
 
-def get_recent_messages(db_path, since_timestamp=0, limit=DEFAULT_MESSAGE_LIMIT):
+
+def dedupe_messages(rows):
+    messages = []
+    last_msg = None
+    for role, content, timestamp in rows:
+        if (
+            last_msg
+            and last_msg["role"] == role
+            and last_msg["content"] == content
+            and abs(timestamp - last_msg["timestamp"]) < 10
+        ):
+            continue
+        msg_obj = {
+            "role": role,
+            "content": content,
+            "timestamp": timestamp,
+        }
+        messages.append(msg_obj)
+        last_msg = msg_obj
+    return messages
+
+
+def get_messages_for_window(db_path, window_start, window_end, limit):
     if not os.path.exists(db_path):
         return []
     conn = None
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        if limit <= 0:
-            limit = DEFAULT_MESSAGE_LIMIT
-
-        # If since_timestamp is 0, query recent messages overall to identify state
-        if since_timestamp == 0:
-            query = """
-                SELECT role, content, timestamp 
-                FROM messages 
+        cursor.execute(
+            """
+                SELECT role, content, timestamp
+                FROM messages
                 WHERE role IN ('user', 'assistant')
+                  AND timestamp >= ?
+                  AND timestamp <= ?
                 ORDER BY timestamp DESC
                 LIMIT ?
-            """
-            cursor.execute(query, (limit,))
-            rows = cursor.fetchall()
-            rows.reverse()  # Restore chronological order
-        else:
-            query = """
-                SELECT role, content, timestamp 
-                FROM messages 
-                WHERE timestamp >= ? AND role IN ('user', 'assistant')
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """
-            cursor.execute(query, (since_timestamp, limit))
-            rows = cursor.fetchall()
-            rows.reverse()  # Restore chronological order
-            
-        messages = []
-        last_msg = None
-        for r in rows:
-            role, content, timestamp = r[0], r[1], r[2]
-            if last_msg and last_msg["role"] == role and last_msg["content"] == content and abs(timestamp - last_msg["timestamp"]) < 10:
-                continue
-            msg_obj = {
-                "role": role,
-                "content": content,
-                "timestamp": timestamp
-            }
-            messages.append(msg_obj)
-            last_msg = msg_obj
-        return messages
-    except Exception as e:
-        sys.stderr.write("Error reading DB {}: {}\n".format(db_path, str(e)))
+            """,
+            (window_start, window_end, limit),
+        )
+        rows = cursor.fetchall()
+        rows.reverse()
+        return dedupe_messages(rows)
+    except Exception as exc:
+        sys.stderr.write("Error reading DB {}: {}\n".format(db_path, str(exc)))
         return []
     finally:
         if conn:
             conn.close()
 
+
+def manifest_dir(hermes_home):
+    return os.path.join(hermes_home, STATE_DIR_NAME)
+
+
+def manifest_path(hermes_home, source_date):
+    return os.path.join(manifest_dir(hermes_home), source_date + ".json")
+
+
+def load_manifest(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_manifest(path, manifest):
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def profile_sort_key(item):
+    return (-item["last_active"], item["profile_id"])
+
+
+def discover_profiles(hermes_home, source_date, batch_size, message_limit):
+    profiles_dir = os.path.join(hermes_home, "profiles")
+    if not os.path.exists(profiles_dir):
+        return []
+
+    start_ts, end_ts = business_day_bounds(source_date)
+    discovered = []
+    for name in os.listdir(profiles_dir):
+        profile_path = os.path.join(profiles_dir, name)
+        if not os.path.isdir(profile_path) or not name.startswith("savana_"):
+            continue
+
+        db_path = os.path.join(profile_path, "state.db")
+        soul_path = os.path.join(profile_path, "SOUL.md")
+        if not os.path.exists(db_path) or not os.path.exists(soul_path):
+            continue
+
+        messages = get_messages_for_window(db_path, start_ts, end_ts, message_limit)
+        if not messages:
+            continue
+
+        last_active = messages[-1]["timestamp"]
+        discovered.append({
+            "profile_id": name,
+            "profile_path": profile_path,
+            "soul_path": soul_path,
+            "character_name": parse_character_name(soul_path),
+            "intimacy": parse_intimacy_score(soul_path),
+            "evolved_persona": extract_evolved_persona(soul_path),
+            "messages": messages,
+            "last_active": last_active,
+        })
+
+    discovered.sort(key=profile_sort_key)
+    return discovered
+
+
+def chunk_profiles(profiles, batch_size):
+    batches = []
+    current = []
+    for item in profiles:
+        current.append(item["profile_id"])
+        if len(current) >= batch_size:
+            batches.append(current)
+            current = []
+    if current:
+        batches.append(current)
+    return batches
+
+
+def build_manifest(hermes_home, source_date, batch_size, message_limit):
+    profiles = discover_profiles(hermes_home, source_date, batch_size, message_limit)
+    return {
+        "source_date": source_date,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "batch_size": batch_size,
+        "message_limit": message_limit,
+        "cursor": DEFAULT_BATCH_CURSOR,
+        "total_profiles": len(profiles),
+        "profile_ids": [item["profile_id"] for item in profiles],
+        "batches": chunk_profiles(profiles, batch_size),
+    }
+
+
+def manifest_complete(manifest):
+    return manifest.get("cursor", 0) >= len(manifest.get("batches", []))
+
+
+def load_or_create_manifest(hermes_home, source_date, batch_size, message_limit):
+    path = manifest_path(hermes_home, source_date)
+    manifest = load_manifest(path)
+    if manifest:
+        return path, manifest
+    manifest = build_manifest(hermes_home, source_date, batch_size, message_limit)
+    save_manifest(path, manifest)
+    return path, manifest
+
+
+def advance_manifest_cursor(hermes_home, source_date):
+    path = manifest_path(hermes_home, source_date)
+    manifest = load_manifest(path)
+    if not manifest:
+        return None
+    manifest["cursor"] = min(
+        manifest.get("cursor", 0) + 1,
+        len(manifest.get("batches", [])),
+    )
+    manifest["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_manifest(path, manifest)
+    return manifest
+
+
+def eligible_profiles_for_batch(hermes_home, manifest):
+    profiles_dir = os.path.join(hermes_home, "profiles")
+    profile_map = {}
+    for profile_id in manifest.get("profile_ids", []):
+        profile_path = os.path.join(profiles_dir, profile_id)
+        db_path = os.path.join(profile_path, "state.db")
+        soul_path = os.path.join(profile_path, "SOUL.md")
+        if not os.path.exists(db_path) or not os.path.exists(soul_path):
+            continue
+        profile_map[profile_id] = (profile_path, db_path, soul_path)
+    return profile_map
+
+
+def batch_profiles(hermes_home, manifest):
+    if manifest_complete(manifest):
+        return []
+    batch_ids = manifest["batches"][manifest["cursor"]]
+    start_ts, end_ts = business_day_bounds(manifest["source_date"])
+    profile_map = eligible_profiles_for_batch(hermes_home, manifest)
+    result = []
+    for profile_id in batch_ids:
+        info = profile_map.get(profile_id)
+        if not info:
+            continue
+        profile_path, db_path, soul_path = info
+        messages = get_messages_for_window(
+            db_path,
+            start_ts,
+            end_ts,
+            manifest.get("message_limit", DEFAULT_MESSAGE_LIMIT),
+        )
+        if not messages:
+            continue
+        last_active = messages[-1]["timestamp"]
+        result.append({
+            "profile_id": profile_id,
+            "profile_path": profile_path,
+            "character_name": parse_character_name(soul_path),
+            "soul_path": soul_path,
+            "intimacy": parse_intimacy_score(soul_path),
+            "evolved_persona": extract_evolved_persona(soul_path),
+            "last_active": last_active,
+            "messages": messages,
+        })
+    result.sort(key=profile_sort_key)
+    return result
+
+
+def display_time(ts):
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_message_content(content):
+    if "请以星野式沉浸表达回复用户这句话" in content:
+        parts = content.split("这句话：")
+        if len(parts) > 1:
+            raw_user_msg = parts[1].split("\n")[0]
+            return "[Injected Template Input] -> " + raw_user_msg.strip()
+    return content
+
+
+def print_manifest_header(now_dt, manifest, current_batch_count):
+    print("# Savana Characters Evolution Report")
+    print("Generated at: {}\n".format(now_dt.strftime("%Y-%m-%d %H:%M:%S")))
+    print("- Review Date: {}".format(manifest["source_date"]))
+    print("- Batch Cursor: {}/{}".format(
+        manifest.get("cursor", 0) + 1 if manifest.get("batches") else 0,
+        len(manifest.get("batches", []))
+    ))
+    print("- Batch Size: {}".format(manifest.get("batch_size", DEFAULT_BATCH_SIZE)))
+    print("- Profiles Included In Batch: {}".format(current_batch_count))
+    print("- Total Eligible Profiles Yesterday: {}".format(manifest.get("total_profiles", 0)))
+    print("- Per-Profile Message Limit: {}\n".format(
+        manifest.get("message_limit", DEFAULT_MESSAGE_LIMIT)
+    ))
+
+
+def print_profile_section(chat, now_ts):
+    last_active_str = display_time(chat["last_active"])
+    elapsed = max(0, now_ts - chat["last_active"])
+    days = int(elapsed // (24 * 3600))
+    hours = int((elapsed % (24 * 3600)) // 3600)
+    elapsed_str = "{}天 {}小时".format(days, hours)
+    print("## Character: {} (Profile ID: {})".format(
+        chat["character_name"],
+        chat["profile_id"]
+    ))
+    print("- SOUL.md File Path: {}".format(chat["soul_path"]))
+    print("- Last Active Time: {}".format(last_active_str))
+    print("- Time Elapsed Since Last Message: {}".format(elapsed_str))
+    print("- Current Intimacy Level: {}/10".format(chat["intimacy"]))
+    print("- Current Evolved Persona Section:")
+    print("  ```markdown")
+    print("  " + (chat["evolved_persona"] or "(暂无自主进化，人设遵循基础设定)"))
+    print("  ```")
+    print("\n### Dialogue History\n")
+    for msg in chat["messages"]:
+        role_display = "User" if msg["role"] == "user" else chat["character_name"]
+        print("[{} ({})]: {}".format(
+            role_display,
+            display_time(msg["timestamp"]),
+            format_message_content(msg["content"] or "")
+        ))
+        print("")
+    print("---\n")
+
+
 def main():
     hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
-    profiles_dir = os.path.join(hermes_home, "profiles")
-    
-    if not os.path.exists(profiles_dir):
-        print("No profiles directory found at: {}".format(profiles_dir))
-        return
-
-    now = time.time()
-    lookback_hours = parse_non_negative_int_env(
-        "SAVANA_EVOLUTION_LOOKBACK_HOURS",
-        DEFAULT_LOOKBACK_HOURS
+    now_ts, now_dt = shanghai_now()
+    batch_size = parse_positive_int_env(
+        "SAVANA_EVOLUTION_BATCH_SIZE",
+        DEFAULT_BATCH_SIZE
     )
     message_limit = parse_positive_int_env(
         "SAVANA_EVOLUTION_MESSAGE_LIMIT",
         DEFAULT_MESSAGE_LIMIT
     )
-    max_profiles = parse_non_negative_int_env("SAVANA_EVOLUTION_MAX_PROFILES", 0)
-    since_timestamp = 0
-    if lookback_hours > 0:
-        since_timestamp = now - lookback_hours * 3600
+    source_date = previous_business_date(now_dt)
+    manifest_path_value, manifest = load_or_create_manifest(
+        hermes_home,
+        source_date,
+        batch_size,
+        message_limit
+    )
 
-    all_profile_chats = []
-    
-    for name in os.listdir(profiles_dir):
-        profile_path = os.path.join(profiles_dir, name)
-        if not os.path.isdir(profile_path) or not name.startswith("savana_"):
-            continue
-            
-        db_path = os.path.join(profile_path, "state.db")
-        soul_path = os.path.join(profile_path, "SOUL.md")
-        
-        if not os.path.exists(db_path) or not os.path.exists(soul_path):
-            continue
-            
-        char_name = parse_character_name(soul_path)
-        intimacy = parse_intimacy_score(soul_path)
-        
-        # Fetch recent messages (chronological order). Every Savana profile with
-        # dialogue in the review window is eligible; no cold-gap or intimacy gate.
-        messages = get_recent_messages(
-            db_path,
-            since_timestamp=since_timestamp,
-            limit=message_limit
-        )
-        if not messages:
-            continue
-            
-        last_active = messages[-1]["timestamp"]
-        elapsed = now - last_active
-        if elapsed < 0:
-            elapsed = 0
-
-        all_profile_chats.append({
-            "profile_id": name,
-            "character_name": char_name,
-            "soul_path": soul_path,
-            "messages": messages,
-            "last_active": last_active,
-            "elapsed": elapsed,
-            "intimacy": intimacy,
-            "evolved_persona": extract_evolved_persona(soul_path)
-        })
-
-    # Review newest activity first. Do not prioritize 3-day cold sessions over
-    # active characters, and do not apply a default top-N cap.
-    all_profile_chats.sort(key=lambda x: x["last_active"], reverse=True)
-
-    if max_profiles > 0:
-        all_profile_chats = all_profile_chats[:max_profiles]
-
-    if not all_profile_chats:
-        print("# Savana Characters Evolution Report\n\nNo Savana characters had dialogue in the review window.")
+    if manifest_complete(manifest):
+        print("# Savana Characters Evolution Report")
+        print("Generated at: {}\n".format(now_dt.strftime("%Y-%m-%d %H:%M:%S")))
+        print("- Review Date: {}".format(manifest["source_date"]))
+        print("- Batch Cursor: {}/{}".format(
+            manifest.get("cursor", 0),
+            len(manifest.get("batches", []))
+        ))
+        print("- Manifest Path: {}".format(manifest_path_value))
+        print("\nNo pending Savana evolution batches remain for the review date.")
         return
 
-    print("# Savana Characters Evolution Report")
-    print("Generated at: {}\n".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    if lookback_hours > 0:
-        print("- Review Window: last {} hours".format(lookback_hours))
-    else:
-        print("- Review Window: all available dialogue history")
-    print("- Profiles Included: {}".format(len(all_profile_chats)))
-    print("- Per-Profile Message Limit: {}\n".format(message_limit))
-    
-    for chat in all_profile_chats:
-        last_active_str = datetime.fromtimestamp(chat["last_active"]).strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Calculate elapsed time string
-        days = int(chat["elapsed"] // (24 * 3600))
-        hours = int((chat["elapsed"] % (24 * 3600)) // 3600)
-        elapsed_str = "{}天 {}小时".format(days, hours)
-        status_tag = describe_elapsed(chat["elapsed"])
-        
-        print("## Character: {} (Profile ID: {})".format(chat["character_name"], chat["profile_id"]))
-        print("- SOUL.md File Path: {}".format(chat["soul_path"]))
-        print("- Last Active Time: {}".format(last_active_str))
-        print("- Time Elapsed: {} ({})".format(elapsed_str, status_tag))
-        print("- Current Intimacy Level: {}/10".format(chat["intimacy"]))
-        print("- Current Evolved Persona Section:")
-        print("  ```markdown")
-        print("  " + (chat["evolved_persona"] or "(暂无自主进化，人设遵循基础设定)"))
-        print("  ```")
-        print("\n### Dialogue History\n")
-        
-        for msg in chat["messages"]:
-            dt_str = datetime.fromtimestamp(msg["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
-            role_display = "User" if msg["role"] == "user" else chat["character_name"]
-            content = msg["content"] or ""
-            
-            if "请以星野式沉浸表达回复用户这句话" in content:
-                parts = content.split("这句话：")
-                if len(parts) > 1:
-                    raw_user_msg = parts[1].split("\n")[0]
-                    content = "[Injected Template Input] -> " + raw_user_msg.strip()
-                    
-            print("[{} ({})]: {}".format(role_display, dt_str, content))
-            print("")
-        print("---\n")
+    profiles = batch_profiles(hermes_home, manifest)
+    if not profiles:
+        print("# Savana Characters Evolution Report")
+        print("Generated at: {}\n".format(now_dt.strftime("%Y-%m-%d %H:%M:%S")))
+        print("- Review Date: {}".format(manifest["source_date"]))
+        print("- Manifest Path: {}".format(manifest_path_value))
+        print("\nCurrent batch resolved to zero live profiles. Advance cursor manually if needed.")
+        return
+
+    print_manifest_header(now_dt, manifest, len(profiles))
+    for chat in profiles:
+        print_profile_section(chat, now_ts)
+
 
 if __name__ == "__main__":
     main()

@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sqlite3
 from pathlib import Path
 
@@ -37,58 +38,100 @@ def _write_profile(root, profile_id, character_name, intimacy, messages):
         conn.close()
 
 
-def test_recent_dialogue_report_includes_all_recent_profiles_without_top_five_cap(
+def _read_manifest(tmp_path, source_date):
+    manifest_path = (
+        tmp_path / "cron" / "state" / "savana-self-evolution" / (source_date + ".json")
+    )
+    return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def test_manifest_uses_previous_natural_day_and_outputs_only_current_batch(
     monkeypatch, tmp_path, capsys
 ):
     module = _load_module()
-    now = 1000000
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.delenv("SAVANA_EVOLUTION_MAX_PROFILES", raising=False)
-    monkeypatch.setattr(module.time, "time", lambda: now)
+    monkeypatch.setenv("SAVANA_EVOLUTION_TARGET_DATE", "2026-06-15")
+    monkeypatch.setenv("SAVANA_EVOLUTION_SOURCE_DATE", "2026-06-14")
+    monkeypatch.setenv("SAVANA_EVOLUTION_BATCH_SIZE", "2")
 
-    for index in range(6):
+    # Two profiles chatted on 2026-06-14, one only on 2026-06-15.
+    _write_profile(
+        tmp_path,
+        "savana_user_a_character",
+        "角色A",
+        3,
+        [
+            ("user", "yesterday a", 1781402400),      # 2026-06-14 10:00:00 +0800
+            ("assistant", "reply a", 1781402460),
+        ],
+    )
+    _write_profile(
+        tmp_path,
+        "savana_user_b_character",
+        "角色B",
+        4,
+        [
+            ("user", "yesterday b", 1781420400),      # 2026-06-14 15:00:00 +0800
+            ("assistant", "reply b", 1781420460),
+        ],
+    )
+    _write_profile(
+        tmp_path,
+        "savana_user_c_character",
+        "角色C",
+        5,
+        [
+            ("user", "today c", 1781492400),          # 2026-06-15 11:00:00 +0800
+            ("assistant", "reply c", 1781492460),
+        ],
+    )
+
+    module.main()
+
+    output = capsys.readouterr().out
+    manifest = _read_manifest(tmp_path, "2026-06-14")
+
+    assert manifest["source_date"] == "2026-06-14"
+    assert manifest["total_profiles"] == 2
+    assert manifest["cursor"] == 0
+    assert manifest["batches"] == [["savana_user_b_character", "savana_user_a_character"]]
+    assert "- Review Date: 2026-06-14" in output
+    assert "- Profiles Included In Batch: 2" in output
+    assert "角色B" in output
+    assert "角色A" in output
+    assert "角色C" not in output
+
+
+def test_manifest_splits_into_batches_and_advance_moves_cursor(monkeypatch, tmp_path):
+    module = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("SAVANA_EVOLUTION_TARGET_DATE", "2026-06-15")
+    monkeypatch.setenv("SAVANA_EVOLUTION_SOURCE_DATE", "2026-06-14")
+    monkeypatch.setenv("SAVANA_EVOLUTION_BATCH_SIZE", "2")
+
+    for index in range(5):
         _write_profile(
             tmp_path,
             "savana_user_{0}_character".format(index),
             "角色{0}".format(index),
-            0,
+            2 + index,
             [
-                ("user", "hello {0}".format(index), now - 60 - index),
-                ("assistant", "reply {0}".format(index), now - 30 - index),
+                ("user", "message {0}".format(index), 1781402400 + index * 60),
+                ("assistant", "reply {0}".format(index), 1781402430 + index * 60),
             ],
         )
 
     module.main()
 
-    output = capsys.readouterr().out
-    assert "- Profiles Included: 6" in output
-    assert output.count("## Character:") == 6
-    assert "Current Intimacy Level: 0/10" in output
+    manifest = _read_manifest(tmp_path, "2026-06-14")
+    assert manifest["total_profiles"] == 5
+    assert len(manifest["batches"]) == 3
+    assert manifest["cursor"] == 0
 
-
-def test_recent_dialogue_report_uses_explicit_max_profiles_only_when_set(
-    monkeypatch, tmp_path, capsys
-):
-    module = _load_module()
-    now = 1000000
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("SAVANA_EVOLUTION_MAX_PROFILES", "2")
-    monkeypatch.setattr(module.time, "time", lambda: now)
-
-    for index in range(3):
-        _write_profile(
-            tmp_path,
-            "savana_user_{0}_character".format(index),
-            "角色{0}".format(index),
-            5,
-            [
-                ("user", "hello {0}".format(index), now - 60 - index),
-                ("assistant", "reply {0}".format(index), now - 30 - index),
-            ],
-        )
-
-    module.main()
-
-    output = capsys.readouterr().out
-    assert "- Profiles Included: 2" in output
-    assert output.count("## Character:") == 2
+    advanced = module.advance_manifest_cursor(str(tmp_path), "2026-06-14")
+    assert advanced["cursor"] == 1
+    advanced = module.advance_manifest_cursor(str(tmp_path), "2026-06-14")
+    assert advanced["cursor"] == 2
+    advanced = module.advance_manifest_cursor(str(tmp_path), "2026-06-14")
+    assert advanced["cursor"] == 3
+    assert module.manifest_complete(advanced) is True
