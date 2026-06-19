@@ -1,4 +1,5 @@
 import logging
+import json
 
 from hermes_cli import companion_api
 
@@ -38,24 +39,25 @@ def test_log_companion_prompt_diagnostics_emits_breakdown(caplog):
     matched = [
         record
         for record in caplog.records
-        if record.getMessage() == "savana_companion.prompt_diagnostics"
+        if record.getMessage().startswith("savana_companion.prompt_diagnostics ")
     ]
     assert matched, "expected savana companion diagnostics log"
 
     record = matched[-1]
-    assert record.session_id == "savana_u_c"
-    assert record.provider == "deepseek"
-    assert record.model == "deepseek-chat"
-    assert record.history_messages == 2
-    assert record.history_user_messages == 1
-    assert record.history_assistant_messages == 1
-    assert record.user_message_chars > 0
-    assert record.directives_chars > 0
-    assert record.soul_chars > 0
-    assert record.memory_chars > 0
-    assert record.user_profile_chars > 0
-    assert record.profile_sample_dialogues == 1
-    assert record.profile_has_relationship is True
-    assert record.session_message_count == 12
-    assert record.session_input_tokens == 3456
-    assert record.session_output_tokens == 789
+    payload = json.loads(record.getMessage().split(" ", 1)[1])
+    assert payload["session_id"] == "savana_u_c"
+    assert payload["provider"] == "deepseek"
+    assert payload["model"] == "deepseek-chat"
+    assert payload["history_messages"] == 2
+    assert payload["history_user_messages"] == 1
+    assert payload["history_assistant_messages"] == 1
+    assert payload["user_message_chars"] > 0
+    assert payload["directives_chars"] > 0
+    assert payload["soul_chars"] > 0
+    assert payload["memory_chars"] > 0
+    assert payload["user_profile_chars"] > 0
+    assert payload["profile_sample_dialogues"] == 1
+    assert payload["profile_has_relationship"] is True
+    assert payload["session_message_count"] == 12
+    assert payload["session_input_tokens"] == 3456
+    assert payload["session_output_tokens"] == 789
