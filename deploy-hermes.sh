@@ -56,6 +56,15 @@ tar xzf /root/hermes-agent-deploy.tar.gz -C "$REMOTE_PATH"
 # 清理所有 macOS 隐藏 metadata 文件，防止 python3 加载发生 UnicodeDecodeError 崩溃
 find "$REMOTE_PATH" -name "._*" -delete
 
+echo "🧬 同步 Savana 自进化脚本与技能到 Hermes 运行态目录..."
+mkdir -p /root/.hermes/scripts /root/.hermes/skills
+cp "$REMOTE_PATH/scripts/extract_recent_dialogues.py" /root/.hermes/scripts/extract_recent_dialogues.py
+rm -rf /root/.hermes/skills/savana-companion-evolution
+cp -R "$REMOTE_PATH/skills/savana-companion-evolution" /root/.hermes/skills/savana-companion-evolution
+chmod 700 /root/.hermes/scripts
+chmod 700 /root/.hermes/scripts/extract_recent_dialogues.py
+chmod -R go-rwx /root/.hermes/skills/savana-companion-evolution
+
 # 确保有 venv
 if [ ! -d "$REMOTE_PATH/venv" ]; then
   echo "🐍 正在创建 Python 3.12 虚拟环境..."
@@ -112,10 +121,19 @@ systemctl daemon-reload
 systemctl enable airi-love-hermes.service
 systemctl restart airi-love-hermes.service
 
+echo "⏰ 确保 Hermes cron tick 以 5 分钟频率运行..."
+CRON_LINE='*/5 * * * * DEEPSEEK_API_KEY=REDACTED_DEEPSEEK_KEY /var/www/hermes-agent/venv/bin/hermes cron tick >> /root/.hermes/logs/cron_tick.log 2>&1'
+TMP_CRON=$(mktemp)
+crontab -l 2>/dev/null | grep -v '/var/www/hermes-agent/venv/bin/hermes cron tick' > "$TMP_CRON" || true
+printf '%s\n' "$CRON_LINE" >> "$TMP_CRON"
+crontab "$TMP_CRON"
+rm -f "$TMP_CRON"
+
 echo "🔍 检查服务运行状态..."
 sleep 2
 systemctl is-active --quiet airi-love-hermes.service || (systemctl status airi-love-hermes.service --no-pager && exit 1)
 echo "  ✅ airi-love-hermes.service 状态正常，已启动并在 8009 端口运行"
+echo "  ✅ Hermes cron tick 已配置为每 5 分钟执行一次"
 
 echo "🩺 验证本地回显..."
 curl_out=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8009/companion/v1/chat || echo "FAILED")

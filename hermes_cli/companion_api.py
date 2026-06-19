@@ -53,6 +53,118 @@ class WeixinQrStatusRequest(BaseModel):
 
 class WeixinQrSessionRequest(BaseModel):
     session_id: str
+
+
+def _safe_char_len(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value)
+    try:
+        return len(json.dumps(value, ensure_ascii=False))
+    except Exception:
+        return len(str(value))
+
+
+def _read_text_if_exists(path: Path) -> str:
+    try:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    return ""
+
+
+def _load_companion_memory_snapshots(profile_dir: str) -> Dict[str, str]:
+    memories_dir = Path(profile_dir) / "memories"
+    return {
+        "memory": _read_text_if_exists(memories_dir / "MEMORY.md"),
+        "user": _read_text_if_exists(memories_dir / "USER.md"),
+    }
+
+
+def _get_latest_session_stats(session_db, session_id: str) -> Dict[str, Any]:
+    try:
+        session = session_db.get_session(session_id) or {}
+    except Exception:
+        logger.exception("Failed to load session stats for %s", session_id)
+        return {}
+
+    return {
+        "message_count": int(session.get("message_count") or 0),
+        "input_tokens": int(session.get("input_tokens") or 0),
+        "output_tokens": int(session.get("output_tokens") or 0),
+        "cache_read_tokens": int(session.get("cache_read_tokens") or 0),
+        "cache_write_tokens": int(session.get("cache_write_tokens") or 0),
+        "model": str(session.get("model") or ""),
+        "stored_system_prompt_chars": _safe_char_len(session.get("system_prompt") or ""),
+    }
+
+
+def _log_companion_prompt_diagnostics(
+    *,
+    session_id: str,
+    provider: str,
+    model: str,
+    user_message: str,
+    conversation_history: List[Dict[str, Any]],
+    character_profile: Dict[str, Any],
+    directives: Optional[str],
+    soul_text: str,
+    memory_text: str,
+    user_profile_text: str,
+    session_stats: Dict[str, Any],
+) -> None:
+    history_user_messages = 0
+    history_assistant_messages = 0
+    history_tool_messages = 0
+    history_chars = 0
+
+    for msg in conversation_history or []:
+        role = str((msg or {}).get("role") or "")
+        content = (msg or {}).get("content") or ""
+        history_chars += _safe_char_len(content)
+        if role == "user":
+            history_user_messages += 1
+        elif role == "assistant":
+            history_assistant_messages += 1
+        elif role in {"tool", "function"}:
+            history_tool_messages += 1
+
+    profile_sample_dialogues = character_profile.get("sample_dialogues") or []
+    profile_relationship = character_profile.get("relationship") or {}
+
+    logger.info(
+        "savana_companion.prompt_diagnostics",
+        extra={
+            "session_id": session_id,
+            "provider": str(provider or ""),
+            "model": str(model or ""),
+            "user_message_chars": _safe_char_len(user_message),
+            "directives_chars": _safe_char_len(directives or ""),
+            "history_messages": len(conversation_history or []),
+            "history_user_messages": history_user_messages,
+            "history_assistant_messages": history_assistant_messages,
+            "history_tool_messages": history_tool_messages,
+            "history_chars": history_chars,
+            "soul_chars": _safe_char_len(soul_text),
+            "memory_chars": _safe_char_len(memory_text),
+            "user_profile_chars": _safe_char_len(user_profile_text),
+            "profile_name": str(character_profile.get("name") or ""),
+            "profile_personality_chars": _safe_char_len(character_profile.get("personality") or ""),
+            "profile_background_chars": _safe_char_len(character_profile.get("background") or ""),
+            "profile_speaking_style_chars": _safe_char_len(character_profile.get("speaking_style") or ""),
+            "profile_sample_dialogues": len(profile_sample_dialogues) if isinstance(profile_sample_dialogues, list) else 0,
+            "profile_has_relationship": bool(profile_relationship),
+            "session_message_count": int(session_stats.get("message_count") or 0),
+            "session_input_tokens": int(session_stats.get("input_tokens") or 0),
+            "session_output_tokens": int(session_stats.get("output_tokens") or 0),
+            "session_cache_read_tokens": int(session_stats.get("cache_read_tokens") or 0),
+            "session_cache_write_tokens": int(session_stats.get("cache_write_tokens") or 0),
+            "session_stored_model": str(session_stats.get("model") or ""),
+            "session_stored_system_prompt_chars": int(session_stats.get("stored_system_prompt_chars") or 0),
+        },
+    )
 def get_profile_path(session_id: str) -> str:
     from hermes_constants import get_default_hermes_root
     return str(get_default_hermes_root() / "profiles" / session_id)
@@ -171,8 +283,13 @@ def extract_evolved_persona(soul_path: str) -> Optional[str]:
 def _load_companion_history(session_db, session_id: str, current_message_id: str) -> List[Dict[str, Any]]:
     try:
         messages = session_db.get_messages_as_conversation(session_id)
-    except Exception:
-        return []
+    except Exception as exc:
+        logger.exception(
+            "Failed to load companion history for session %s: %s",
+            session_id,
+            exc,
+        )
+        raise
 
     history = []
     for msg in messages:
@@ -649,6 +766,9 @@ async def chat_endpoint(req: ChatRequest):
         conversation_history = _load_companion_history(
             session_db, session_id, req.message_id
         )
+        soul_text = _read_text_if_exists(Path(profile_dir) / "SOUL.md")
+        memory_snapshots = _load_companion_memory_snapshots(profile_dir)
+        session_stats = _get_latest_session_stats(session_db, session_id)
 
         # 动态解析模型及 API 配置
         api_key = req.api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -703,6 +823,20 @@ async def chat_endpoint(req: ChatRequest):
             agent._memory_store is not None,
             repr(agent.ephemeral_system_prompt)
         ))
+
+        _log_companion_prompt_diagnostics(
+            session_id=session_id,
+            provider=provider,
+            model=model,
+            user_message=req.user_message,
+            conversation_history=conversation_history,
+            character_profile=req.character_profile,
+            directives=req.directives,
+            soul_text=soul_text,
+            memory_text=memory_snapshots.get("memory", ""),
+            user_profile_text=memory_snapshots.get("user", ""),
+            session_stats=session_stats,
+        )
 
 
         if req.stream:

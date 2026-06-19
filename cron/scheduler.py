@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 from contextlib import contextmanager
+from datetime import timedelta
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -130,6 +131,8 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+_SAVANA_EVOLUTION_JOB_NAME = "Savana-Self-Evolution"
+_SAVANA_EVOLUTION_CONTINUE_MINUTES = 5
 
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
@@ -232,6 +235,72 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     if platform and chat_id:
         return origin
     return None
+
+
+def _is_savana_evolution_job(job: dict) -> bool:
+    skills = job.get("skills") or []
+    if isinstance(skills, str):
+        skills = [skills]
+    return (
+        job.get("name") == _SAVANA_EVOLUTION_JOB_NAME
+        or job.get("skill") == "savana-companion-evolution"
+        or "savana-companion-evolution" in skills
+    )
+
+
+def _extract_savana_review_date(output: str) -> Optional[str]:
+    for line in (output or "").splitlines():
+        if line.startswith("- Review Date: "):
+            return line.split(": ", 1)[1].strip()
+    return None
+
+
+def _advance_savana_evolution_batch(job: dict, output: str) -> None:
+    """Move the Savana self-evolution manifest cursor forward after one batch.
+
+    If more batches remain, keep the same cron job alive but schedule the next
+    batch a few minutes later. Once all batches are consumed, restore the job to
+    the next 03:00 daily run via its normal cron schedule.
+    """
+    if not _is_savana_evolution_job(job):
+        return
+
+    try:
+        from scripts import extract_recent_dialogues as savana_extract
+    except Exception as exc:
+        logger.warning("Savana batch advance skipped: cannot import extractor: %s", exc)
+        return
+
+    hermes_home = str(_get_hermes_home())
+    source_date = _extract_savana_review_date(output)
+    if not source_date:
+        logger.warning("Savana batch advance skipped: missing review date in output")
+        return
+    manifest = savana_extract.advance_manifest_cursor(hermes_home, source_date)
+    if not manifest:
+        logger.warning("Savana batch advance skipped: manifest not found for %s", source_date)
+        return
+
+    from cron.jobs import update_job, compute_next_run
+
+    if savana_extract.manifest_complete(manifest):
+        next_run_at = compute_next_run(job["schedule"])
+        update_job(job["id"], {"next_run_at": next_run_at})
+        logger.info(
+            "Savana evolution batches complete for %s; next daily run reset to %s",
+            source_date,
+            next_run_at,
+        )
+        return
+
+    next_batch_at = (_hermes_now() + timedelta(minutes=_SAVANA_EVOLUTION_CONTINUE_MINUTES)).isoformat()
+    update_job(job["id"], {"next_run_at": next_batch_at})
+    logger.info(
+        "Savana evolution batch advanced to cursor %s/%s; next continuation at %s",
+        manifest.get("cursor", 0),
+        len(manifest.get("batches", [])),
+        next_batch_at,
+    )
 
 
 def _plugin_cron_env_var(platform_name: str) -> str:
@@ -1898,6 +1967,8 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                if success:
+                    _advance_savana_evolution_batch(job, output)
                 return True
 
             except Exception as e:
