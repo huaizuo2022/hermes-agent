@@ -134,36 +134,42 @@ def _log_companion_prompt_diagnostics(
     profile_sample_dialogues = character_profile.get("sample_dialogues") or []
     profile_relationship = character_profile.get("relationship") or {}
 
+    payload = {
+        "session_id": session_id,
+        "provider": str(provider or ""),
+        "model": str(model or ""),
+        "user_message_chars": _safe_char_len(user_message),
+        "directives_chars": _safe_char_len(directives or ""),
+        "history_messages": len(conversation_history or []),
+        "history_user_messages": history_user_messages,
+        "history_assistant_messages": history_assistant_messages,
+        "history_tool_messages": history_tool_messages,
+        "history_chars": history_chars,
+        "soul_chars": _safe_char_len(soul_text),
+        "memory_chars": _safe_char_len(memory_text),
+        "user_profile_chars": _safe_char_len(user_profile_text),
+        "profile_name": str(character_profile.get("name") or ""),
+        "profile_personality_chars": _safe_char_len(character_profile.get("personality") or ""),
+        "profile_background_chars": _safe_char_len(character_profile.get("background") or ""),
+        "profile_speaking_style_chars": _safe_char_len(character_profile.get("speaking_style") or ""),
+        "profile_sample_dialogues": len(profile_sample_dialogues) if isinstance(profile_sample_dialogues, list) else 0,
+        "profile_has_relationship": bool(profile_relationship),
+        "session_message_count": int(session_stats.get("message_count") or 0),
+        "session_input_tokens": int(session_stats.get("input_tokens") or 0),
+        "session_output_tokens": int(session_stats.get("output_tokens") or 0),
+        "session_cache_read_tokens": int(session_stats.get("cache_read_tokens") or 0),
+        "session_cache_write_tokens": int(session_stats.get("cache_write_tokens") or 0),
+        "session_stored_model": str(session_stats.get("model") or ""),
+        "session_stored_system_prompt_chars": int(session_stats.get("stored_system_prompt_chars") or 0),
+    }
     logger.info(
-        "savana_companion.prompt_diagnostics",
-        extra={
-            "session_id": session_id,
-            "provider": str(provider or ""),
-            "model": str(model or ""),
-            "user_message_chars": _safe_char_len(user_message),
-            "directives_chars": _safe_char_len(directives or ""),
-            "history_messages": len(conversation_history or []),
-            "history_user_messages": history_user_messages,
-            "history_assistant_messages": history_assistant_messages,
-            "history_tool_messages": history_tool_messages,
-            "history_chars": history_chars,
-            "soul_chars": _safe_char_len(soul_text),
-            "memory_chars": _safe_char_len(memory_text),
-            "user_profile_chars": _safe_char_len(user_profile_text),
-            "profile_name": str(character_profile.get("name") or ""),
-            "profile_personality_chars": _safe_char_len(character_profile.get("personality") or ""),
-            "profile_background_chars": _safe_char_len(character_profile.get("background") or ""),
-            "profile_speaking_style_chars": _safe_char_len(character_profile.get("speaking_style") or ""),
-            "profile_sample_dialogues": len(profile_sample_dialogues) if isinstance(profile_sample_dialogues, list) else 0,
-            "profile_has_relationship": bool(profile_relationship),
-            "session_message_count": int(session_stats.get("message_count") or 0),
-            "session_input_tokens": int(session_stats.get("input_tokens") or 0),
-            "session_output_tokens": int(session_stats.get("output_tokens") or 0),
-            "session_cache_read_tokens": int(session_stats.get("cache_read_tokens") or 0),
-            "session_cache_write_tokens": int(session_stats.get("cache_write_tokens") or 0),
-            "session_stored_model": str(session_stats.get("model") or ""),
-            "session_stored_system_prompt_chars": int(session_stats.get("stored_system_prompt_chars") or 0),
-        },
+        "savana_companion.prompt_diagnostics %s",
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+    )
+    print(
+        "[SAVANA PROMPT DIAGNOSTICS] {}".format(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        )
     )
 def get_profile_path(session_id: str) -> str:
     from hermes_constants import get_default_hermes_root
