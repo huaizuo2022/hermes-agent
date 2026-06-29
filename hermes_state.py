@@ -1456,6 +1456,22 @@ class SessionDB:
                 return content
         return content
 
+    def update_message_content(self, session_id: str, platform_message_id: str, content: str) -> bool:
+        """Update the content of a specific message by its platform message ID.
+        
+        Returns True if a row was updated, False otherwise.
+        """
+        stored_content = self._encode_content(content)
+        
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET content = ? WHERE session_id = ? AND platform_message_id = ?",
+                (stored_content, session_id, platform_message_id)
+            )
+            return cursor.rowcount
+            
+        return self._execute_write(_do) > 0
+
     def append_message(
         self,
         session_id: str,
