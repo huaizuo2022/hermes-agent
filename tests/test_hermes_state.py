@@ -2922,6 +2922,37 @@ class TestFTS5ToolCallIndexing:
         assert db.search_messages("ORIGINALTOOL") == []
         assert len(db.search_messages("RENAMEDTOOL")) == 1
 
+    def test_update_message_content_helper(self, db):
+        """Test the public update_message_content method of SessionDB."""
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(
+            "s1", role="user", content="Original content",
+            platform_message_id="p1",
+        )
+        
+        # Verify it exists
+        results = db.search_messages("Original")
+        assert len(results) == 1
+        
+        # Update content
+        updated = db.update_message_content(
+            session_id="s1",
+            platform_message_id="p1",
+            content="Updated content",
+        )
+        assert updated is True
+        
+        # Verify it was updated and re-indexed
+        assert db.search_messages("Original") == []
+        assert len(db.search_messages("Updated")) == 1
+        
+        # Non-existent message returns False
+        assert db.update_message_content(
+            session_id="s1",
+            platform_message_id="p2-nonexistent",
+            content="some content",
+        ) is False
+
 
 class TestFTS5ToolCallMigration:
     """v11 migration: pre-existing state.db with old external-content FTS tables

@@ -1042,3 +1042,45 @@ async def delete_message(session_id: str, message_id: str):
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         reset_hermes_home_override(token)
+
+
+class MessageUpdateRequest(BaseModel):
+    content: str
+
+
+@router.put("/sessions/{session_id}/messages/{message_id}")
+async def update_message_endpoint(session_id: str, message_id: str, req: MessageUpdateRequest):
+    profile_dir = get_profile_path(session_id)
+    
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    token = set_hermes_home_override(profile_dir)
+    
+    session_db = None
+    try:
+        from hermes_state import SessionDB
+        db_path = Path(profile_dir) / "state.db"
+        session_db = SessionDB(db_path=db_path)
+        
+        updated = session_db.update_message_content(
+            session_id=session_id,
+            platform_message_id=message_id,
+            content=req.content
+        )
+        
+        if not updated:
+            raise HTTPException(status_code=404, detail="Message not found in local db")
+            
+        return JSONResponse({"success": True, "message": "Message content updated in local db"})
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        if session_db is not None:
+            try:
+                session_db.close()
+            except Exception:
+                pass
+        reset_hermes_home_override(token)
+
