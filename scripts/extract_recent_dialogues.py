@@ -131,20 +131,30 @@ def extract_evolved_persona(soul_path):
         return ""
 
 
+def strip_invisible_chars(text):
+    if not text:
+        return text
+    # Strip invisible/zero-width chars that might trigger cron threat scanners
+    for char in ['\u200b', '\u200c', '\u200d', '\u2060', '\ufeff', '\u202a', '\u202b', '\u202c', '\u202d', '\u202e']:
+        text = text.replace(char, '')
+    return text
+
+
 def dedupe_messages(rows):
     messages = []
     last_msg = None
     for role, content, timestamp in rows:
+        cleaned_content = strip_invisible_chars(content)
         if (
             last_msg
             and last_msg["role"] == role
-            and last_msg["content"] == content
+            and last_msg["content"] == cleaned_content
             and abs(timestamp - last_msg["timestamp"]) < 10
         ):
             continue
         msg_obj = {
             "role": role,
-            "content": content,
+            "content": cleaned_content,
             "timestamp": timestamp,
         }
         messages.append(msg_obj)
