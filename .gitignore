@@ -75,3 +75,16 @@ models-dev-upstream/
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
+
+# Runtime state (never in git) — Savana companion session data, plans, omx
+profiles/
+.plans/
+.omx/
+.loop-state/
+*.bak
+*.bak.*
+*.bak-*
+test_debug.py
+
+# Deploy secrets (see .env.deploy.example)
+.env.deploy

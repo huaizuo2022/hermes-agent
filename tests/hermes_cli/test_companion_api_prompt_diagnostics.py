@@ -24,7 +24,7 @@ def test_log_companion_prompt_diagnostics_emits_breakdown(caplog):
             "relationship": {"relationship_stage": "ambiguous"},
         },
         directives="额外指令",
-        soul_text="# role\nhello",
+        soul_text="# Identity\nhello\n## Evolved Persona\n更克制，也更警惕。\n## Notes\nkeep distance",
         memory_text="memory block",
         user_profile_text="user block",
         session_stats={
@@ -58,6 +58,14 @@ def test_log_companion_prompt_diagnostics_emits_breakdown(caplog):
     assert payload["user_profile_chars"] > 0
     assert payload["profile_sample_dialogues"] == 1
     assert payload["profile_has_relationship"] is True
+    assert payload["relationship_stage"] == "ambiguous"
+    assert payload["directives_preview"] == "额外指令"
+    assert payload["history_preview"] == [
+        {"role": "user", "content_preview": "上一轮用户消息"},
+        {"role": "assistant", "content_preview": "上一轮助手回复"},
+    ]
+    assert payload["soul_sections"]["total_sections"] >= 1
+    assert payload["soul_sections"]["evolved_persona_chars"] > 0
     assert payload["session_message_count"] == 12
     assert payload["session_input_tokens"] == 3456
     assert payload["session_output_tokens"] == 789

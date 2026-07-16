@@ -101,6 +101,52 @@ def _get_latest_session_stats(session_db, session_id: str) -> Dict[str, Any]:
     }
 
 
+def _build_history_preview(conversation_history: List[Dict[str, Any]], limit: int = 4, preview_chars: int = 80) -> List[Dict[str, str]]:
+    preview: List[Dict[str, str]] = []
+    for msg in (conversation_history or [])[-limit:]:
+        role = str((msg or {}).get("role") or "")
+        content = str((msg or {}).get("content") or "")
+        preview.append(
+            {
+                "role": role,
+                "content_preview": content[:preview_chars],
+            }
+        )
+    return preview
+
+
+def extract_evolved_persona_from_text(content: str) -> Optional[str]:
+    if not content:
+        return None
+    lines = content.splitlines()
+    evolved_lines = []
+    in_section = False
+
+    for line in lines:
+        if line.startswith("## Evolved Persona"):
+            in_section = True
+            continue
+        if in_section:
+            if line.startswith("#"):
+                break
+            evolved_lines.append(line)
+
+    if not in_section:
+        return None
+
+    return "\n".join(evolved_lines).strip()
+
+
+def _build_soul_section_stats(soul_text: str) -> Dict[str, int]:
+    text = str(soul_text or "")
+    sections = [line for line in text.splitlines() if line.startswith("## ")]
+    evolved_persona = extract_evolved_persona_from_text(text)
+    return {
+        "total_sections": len(sections),
+        "evolved_persona_chars": _safe_char_len(evolved_persona or ""),
+    }
+
+
 def _log_companion_prompt_diagnostics(
     *,
     session_id: str,
@@ -133,19 +179,24 @@ def _log_companion_prompt_diagnostics(
 
     profile_sample_dialogues = character_profile.get("sample_dialogues") or []
     profile_relationship = character_profile.get("relationship") or {}
+    relationship_stage = str(profile_relationship.get("relationship_stage") or "")
+    directives_text = str(directives or "")
 
     payload = {
         "session_id": session_id,
         "provider": str(provider or ""),
         "model": str(model or ""),
         "user_message_chars": _safe_char_len(user_message),
-        "directives_chars": _safe_char_len(directives or ""),
+        "directives_chars": _safe_char_len(directives_text),
+        "directives_preview": directives_text[:200],
         "history_messages": len(conversation_history or []),
         "history_user_messages": history_user_messages,
         "history_assistant_messages": history_assistant_messages,
         "history_tool_messages": history_tool_messages,
         "history_chars": history_chars,
+        "history_preview": _build_history_preview(conversation_history),
         "soul_chars": _safe_char_len(soul_text),
+        "soul_sections": _build_soul_section_stats(soul_text),
         "memory_chars": _safe_char_len(memory_text),
         "user_profile_chars": _safe_char_len(user_profile_text),
         "profile_name": str(character_profile.get("name") or ""),
@@ -154,6 +205,7 @@ def _log_companion_prompt_diagnostics(
         "profile_speaking_style_chars": _safe_char_len(character_profile.get("speaking_style") or ""),
         "profile_sample_dialogues": len(profile_sample_dialogues) if isinstance(profile_sample_dialogues, list) else 0,
         "profile_has_relationship": bool(profile_relationship),
+        "relationship_stage": relationship_stage,
         "session_message_count": int(session_stats.get("message_count") or 0),
         "session_input_tokens": int(session_stats.get("input_tokens") or 0),
         "session_output_tokens": int(session_stats.get("output_tokens") or 0),
@@ -171,6 +223,8 @@ def _log_companion_prompt_diagnostics(
             json.dumps(payload, ensure_ascii=False, sort_keys=True)
         )
     )
+
+
 def get_profile_path(session_id: str) -> str:
     from hermes_constants import get_default_hermes_root
     return str(get_default_hermes_root() / "profiles" / session_id)
