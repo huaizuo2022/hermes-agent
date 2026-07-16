@@ -1,0 +1,37 @@
+#!/bin/bash
+# Hermes pre-push 守卫：禁止任何 agent（codex / claude / 等）将 hermes-agent push 到远端
+# 理由：Hermes 仓库含部署脚本与敏感配置，曾因 agent 误推导致 DeepSeek key 泄露。
+# 如需紧急推送，临时改名本文件或设置 BYPASS_HERMES_PUSH=1（仅人工操作，agent 不应使用）。
+
+set -euo pipefail
+
+if [[ "${BYPASS_HERMES_PUSH:-}" == "1" ]]; then
+  echo "⚠️  BYPASS_HERMES_PUSH=1：跳过 hermes push 守卫（仅限人工紧急操作）" >&2
+  exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+repo_name="$(basename "$repo_root" 2>/dev/null || echo unknown)"
+
+# 读取 stdin 的 pre-push 输入（refLists），不消费也会被 git 接受
+while read -r local_ref local_sha remote_ref remote_sha; do
+  : # 仅用于消费 stdin
+done
+
+{
+  echo "================================================================"
+  echo "🚫 拒绝 push：Hermes 仓库禁止推送到远端"
+  echo "----------------------------------------------------------------"
+  echo "仓库    : $repo_name ($repo_root)"
+  echo "触发者  : ${USER:-unknown} | agent: ${CLAUDECODE:-${CODEX:-no}} "
+  echo "时间    : $(date '+%Y-%m-%d %H:%M:%S%z' 2>/dev/null || echo unknown)"
+  echo "原因    : Hermes 含部署脚本/敏感配置，曾因 agent 误推导致 DeepSeek key 泄露。"
+  echo "          为防止再次误推密钥/部署脚本，本仓库已全局禁止 push。"
+  echo "----------------------------------------------------------------"
+  echo "如确需推送（人工操作，agent 请勿执行）："
+  echo "  1) 临时放行：BYPASS_HERMES_PUSH=1 git push ..."
+  echo "  2) 或临时移除钩子后再操作，完成后务必恢复。"
+  echo "================================================================"
+} >&2
+
+exit 1
