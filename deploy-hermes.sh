@@ -222,6 +222,12 @@ rsync -a --delete \
   "$EXTRACT_ROOT/" "$REMOTE_PATH/"
 echo "  ✅ 代码同步完成"
 
+# === 3g-fix: 在持久目录重装 editable，确保 editable finder 的 MAPPING 指向 REMOTE_PATH
+# 而非临时 EXTRACT_ROOT（部署后会被删除，导致 cron tick 的 hermes_cli 找不到模块）===
+echo "🐍 在生产目录重装 editable（修正 editable finder 映射）..."
+"$REMOTE_PATH/venv/bin/pip" install -e "$REMOTE_PATH[web,messaging]" --no-deps -q
+echo "  ✅ editable 映射已指向 $REMOTE_PATH"
+
 # === 3h: 同步 Savana 自进化脚本与技能到 Hermes 运行态目录 ===
 echo "🧬 同步 Savana 自进化脚本与技能..."
 mkdir -p /root/.hermes/scripts /root/.hermes/skills
