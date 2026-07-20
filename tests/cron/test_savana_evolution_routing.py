@@ -69,3 +69,28 @@ def test_legacy_output_never_invokes_guarded_writer(monkeypatch, tmp_path):
     )
 
     assert result == []
+
+
+def test_missing_guarded_profile_result_is_recorded_invalid(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "hermes_cli.savana_evolution_guard.apply_guarded_results",
+        lambda home, output, model: [],
+    )
+    prompt = (
+        "- Evolution Batch Policy: guarded_v1\n"
+        "## Character: 沈越 (Profile ID: savana_user_shenyue)\n"
+    )
+
+    result = scheduler._apply_savana_evolution_output(
+        _savana_job(),
+        prompt,
+        "model response without marker",
+        "test-model",
+        tmp_path,
+    )
+
+    assert result == [{
+        "profile_id": "savana_user_shenyue",
+        "status": "invalid",
+        "error": "missing structured result",
+    }]

@@ -260,6 +260,17 @@ def _select_savana_evolution_skills(job: dict, skills, script_output: str):
     return skills
 
 
+def _extract_savana_profile_ids(value: str) -> List[str]:
+    profile_ids = []
+    for line in str(value or "").splitlines():
+        if not line.startswith("## Character: ") or "(Profile ID: " not in line:
+            continue
+        profile_id = line.rsplit("(Profile ID: ", 1)[1].rstrip(")").strip()
+        if profile_id:
+            profile_ids.append(profile_id)
+    return profile_ids
+
+
 def _apply_savana_evolution_output(
     job: dict,
     prompt: str,
@@ -272,13 +283,30 @@ def _apply_savana_evolution_output(
     from hermes_cli.savana_evolution_guard import apply_guarded_results
 
     results = apply_guarded_results(hermes_home, final_response, model)
+    expected_profile_ids = _extract_savana_profile_ids(prompt)
+    observed_profile_ids = {
+        result.get("profile_id") for result in results if result.get("profile_id")
+    }
+    for profile_id in expected_profile_ids:
+        if profile_id not in observed_profile_ids:
+            results.append({
+                "profile_id": profile_id,
+                "status": "invalid",
+                "error": "missing structured result",
+            })
     counts = {}
     for result in results:
         status = result.get("status", "invalid")
         counts[status] = counts.get(status, 0) + 1
     logger.info("Savana guarded evolution results: %s", counts)
-    if not results:
-        logger.warning("Savana guarded evolution returned no structured results")
+    missing_count = sum(
+        1 for result in results if result.get("error") == "missing structured result"
+    )
+    if missing_count:
+        logger.warning(
+            "Savana guarded evolution missed %d profile result(s)",
+            missing_count,
+        )
     return results
 
 
