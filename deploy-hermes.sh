@@ -236,11 +236,13 @@ if [ -f "$REMOTE_PATH/scripts/extract_recent_dialogues.py" ]; then
   chmod 700 /root/.hermes/scripts
   chmod 700 /root/.hermes/scripts/extract_recent_dialogues.py
 fi
-if [ -d "$REMOTE_PATH/skills/savana-companion-evolution" ]; then
-  rm -rf /root/.hermes/skills/savana-companion-evolution
-  cp -R "$REMOTE_PATH/skills/savana-companion-evolution" /root/.hermes/skills/savana-companion-evolution
-  chmod -R go-rwx /root/.hermes/skills/savana-companion-evolution
-fi
+for skill_name in savana-companion-evolution savana-companion-evolution-guarded; do
+  if [ -d "$REMOTE_PATH/skills/$skill_name" ]; then
+    rm -rf "/root/.hermes/skills/$skill_name"
+    cp -R "$REMOTE_PATH/skills/$skill_name" "/root/.hermes/skills/$skill_name"
+    chmod -R go-rwx "/root/.hermes/skills/$skill_name"
+  fi
+done
 
 # === 3i: 微信桥接配置（从 airi-love-backend/.env 读取，保留原逻辑） ===
 WECHAT_BRIDGE_ENV_FILE="/var/www/airi-love-backend/.env"

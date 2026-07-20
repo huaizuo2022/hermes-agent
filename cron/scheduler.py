@@ -133,6 +133,8 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 SILENT_MARKER = "[SILENT]"
 _SAVANA_EVOLUTION_JOB_NAME = "Savana-Self-Evolution"
 _SAVANA_EVOLUTION_CONTINUE_MINUTES = 5
+_SAVANA_GUARDED_SKILL = "savana-companion-evolution-guarded"
+_SAVANA_GUARDED_REPORT_MARKER = "- Evolution Batch Policy: guarded_v1"
 
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
@@ -246,6 +248,38 @@ def _is_savana_evolution_job(job: dict) -> bool:
         or job.get("skill") == "savana-companion-evolution"
         or "savana-companion-evolution" in skills
     )
+
+
+def _is_guarded_savana_report(value: str) -> bool:
+    return _SAVANA_GUARDED_REPORT_MARKER in str(value or "")
+
+
+def _select_savana_evolution_skills(job: dict, skills, script_output: str):
+    if _is_savana_evolution_job(job) and _is_guarded_savana_report(script_output):
+        return [_SAVANA_GUARDED_SKILL]
+    return skills
+
+
+def _apply_savana_evolution_output(
+    job: dict,
+    prompt: str,
+    final_response: str,
+    model: str,
+    hermes_home: Path,
+):
+    if not (_is_savana_evolution_job(job) and _is_guarded_savana_report(prompt)):
+        return []
+    from hermes_cli.savana_evolution_guard import apply_guarded_results
+
+    results = apply_guarded_results(hermes_home, final_response, model)
+    counts = {}
+    for result in results:
+        status = result.get("status", "invalid")
+        counts[status] = counts.get(status, 0) + 1
+    logger.info("Savana guarded evolution results: %s", counts)
+    if not results:
+        logger.warning("Savana guarded evolution returned no structured results")
+    return results
 
 
 def _extract_savana_review_date(output: str) -> Optional[str]:
@@ -1036,6 +1070,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """
     prompt = str(job.get("prompt") or "")
     skills = job.get("skills")
+    script_output = ""
 
     # Run data-collection script if configured, inject output as context.
     script_path = job.get("script")
@@ -1063,6 +1098,8 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 f"```\n{script_output}\n```\n\n"
                 f"{prompt}"
             )
+
+    skills = _select_savana_evolution_skills(job, skills, script_output)
 
     # Inject output from referenced cron jobs as context.
     context_from = job.get("context_from")
@@ -1767,6 +1804,13 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             raise RuntimeError(_err_text)
 
         final_response = result.get("final_response", "") or ""
+        _apply_savana_evolution_output(
+            job,
+            prompt,
+            final_response,
+            getattr(agent, "model", model),
+            _get_hermes_home(),
+        )
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
