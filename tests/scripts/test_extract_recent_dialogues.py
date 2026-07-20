@@ -15,7 +15,7 @@ def _load_module():
     return module
 
 
-def _write_profile(root, profile_id, character_name, intimacy, messages):
+def _write_profile(root, profile_id, character_name, intimacy, messages, policy=None):
     profile_dir = root / "profiles" / profile_id
     profile_dir.mkdir(parents=True)
     (profile_dir / "SOUL.md").write_text(
@@ -23,6 +23,11 @@ def _write_profile(root, profile_id, character_name, intimacy, messages):
         "- Intimacy level: {1}/10\n".format(character_name, intimacy),
         encoding="utf-8",
     )
+    if policy:
+        (profile_dir / "profile.yaml").write_text(
+            "evolution_policy: {0}\n".format(policy),
+            encoding="utf-8",
+        )
 
     conn = sqlite3.connect(str(profile_dir / "state.db"))
     try:
@@ -135,3 +140,90 @@ def test_manifest_splits_into_batches_and_advance_moves_cursor(monkeypatch, tmp_
     advanced = module.advance_manifest_cursor(str(tmp_path), "2026-06-14")
     assert advanced["cursor"] == 3
     assert module.manifest_complete(advanced) is True
+
+
+def test_manifest_separates_legacy_and_guarded_profiles(tmp_path):
+    module = _load_module()
+    messages = [
+        ("user", "yesterday", 1781402400),
+        ("assistant", "reply", 1781402460),
+    ]
+    _write_profile(
+        tmp_path,
+        "savana_legacy_character",
+        "旧角色",
+        3,
+        messages,
+    )
+    _write_profile(
+        tmp_path,
+        "savana_guarded_character",
+        "新角色",
+        3,
+        messages,
+        policy="guarded_v1",
+    )
+
+    manifest = module.build_manifest(str(tmp_path), "2026-06-14", 10, 30)
+
+    assert manifest["batches"] == [
+        ["savana_legacy_character"],
+        ["savana_guarded_character"],
+    ]
+    assert manifest["batch_policies"] == ["legacy", "guarded_v1"]
+
+
+def test_legacy_report_does_not_include_guarded_fields(monkeypatch, tmp_path, capsys):
+    module = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("SAVANA_EVOLUTION_TARGET_DATE", "2026-06-15")
+    monkeypatch.setenv("SAVANA_EVOLUTION_SOURCE_DATE", "2026-06-14")
+    _write_profile(
+        tmp_path,
+        "savana_legacy_character",
+        "旧角色",
+        3,
+        [
+            ("user", "yesterday", 1781402400),
+            ("assistant", "reply", 1781402460),
+        ],
+    )
+
+    module.main()
+    output = capsys.readouterr().out
+
+    assert "Evolution Batch Policy" not in output
+    assert "SOUL.md SHA-256" not in output
+    assert "Base Persona Snapshot" not in output
+
+
+def test_guarded_report_contains_policy_base_and_hash(monkeypatch, tmp_path, capsys):
+    module = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("SAVANA_EVOLUTION_TARGET_DATE", "2026-06-15")
+    monkeypatch.setenv("SAVANA_EVOLUTION_SOURCE_DATE", "2026-06-14")
+    _write_profile(
+        tmp_path,
+        "savana_guarded_character",
+        "新角色",
+        3,
+        [
+            ("user", "yesterday", 1781402400),
+            ("assistant", "reply", 1781402460),
+        ],
+        policy="guarded_v1",
+    )
+
+    module.main()
+    output = capsys.readouterr().out
+
+    assert "- Evolution Batch Policy: guarded_v1" in output
+    assert "- SOUL.md SHA-256:" in output
+    assert "### Base Persona Snapshot" in output
+    base_snapshot = output.split("### Base Persona Snapshot", 1)[1].split(
+        "### Dialogue History",
+        1,
+    )[0]
+    assert "# 新角色" in base_snapshot
+    assert "## Relationship with User" in base_snapshot
+    assert "## Evolved Persona" not in base_snapshot

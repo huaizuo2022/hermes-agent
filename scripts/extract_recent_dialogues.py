@@ -9,12 +9,19 @@ Business rule:
 - Eligible profiles are processed in batches to avoid one giant prompt.
 """
 
+import hashlib
 import json
 import os
 import sqlite3
 import sys
 import time
 from datetime import datetime
+
+from hermes_cli.companion_profile_policy import (
+    GUARDED_POLICY,
+    LEGACY_POLICY,
+    read_evolution_policy,
+)
 
 DEFAULT_BATCH_SIZE = 10
 DEFAULT_MESSAGE_LIMIT = 30
@@ -129,6 +136,34 @@ def extract_evolved_persona(soul_path):
         return tail
     except Exception:
         return ""
+
+
+def extract_base_soul(soul_path):
+    if not os.path.exists(soul_path):
+        return ""
+    try:
+        with open(soul_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return ""
+    marker = "## Evolved Persona"
+    marker_index = content.find(marker)
+    if marker_index == -1:
+        return content.strip()
+    body_start = content.find("\n", marker_index)
+    if body_start == -1:
+        return content[:marker_index].rstrip()
+    next_header = content.find("\n## ", body_start + 1)
+    if next_header == -1:
+        return content[:marker_index].rstrip()
+    return (content[:marker_index].rstrip() + "\n\n" + content[next_header + 1:].lstrip()).strip()
+
+
+def soul_sha256(soul_path):
+    digest = hashlib.sha256()
+    with open(soul_path, "rb") as f:
+        digest.update(f.read())
+    return digest.hexdigest()
 
 
 def strip_invisible_chars(text):
@@ -247,6 +282,7 @@ def discover_profiles(hermes_home, source_date, batch_size, message_limit):
             "character_name": parse_character_name(soul_path),
             "intimacy": parse_intimacy_score(soul_path),
             "evolved_persona": extract_evolved_persona(soul_path),
+            "evolution_policy": read_evolution_policy(profile_path),
             "messages": messages,
             "last_active": last_active,
         })
@@ -268,8 +304,23 @@ def chunk_profiles(profiles, batch_size):
     return batches
 
 
+def chunk_profiles_by_policy(profiles, batch_size):
+    batches = []
+    batch_policies = []
+    for policy in (LEGACY_POLICY, GUARDED_POLICY):
+        policy_profiles = [
+            item for item in profiles
+            if item.get("evolution_policy", LEGACY_POLICY) == policy
+        ]
+        for batch in chunk_profiles(policy_profiles, batch_size):
+            batches.append(batch)
+            batch_policies.append(policy)
+    return batches, batch_policies
+
+
 def build_manifest(hermes_home, source_date, batch_size, message_limit):
     profiles = discover_profiles(hermes_home, source_date, batch_size, message_limit)
+    batches, batch_policies = chunk_profiles_by_policy(profiles, batch_size)
     return {
         "source_date": source_date,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -278,7 +329,8 @@ def build_manifest(hermes_home, source_date, batch_size, message_limit):
         "cursor": DEFAULT_BATCH_CURSOR,
         "total_profiles": len(profiles),
         "profile_ids": [item["profile_id"] for item in profiles],
-        "batches": chunk_profiles(profiles, batch_size),
+        "batches": batches,
+        "batch_policies": batch_policies,
     }
 
 
@@ -351,6 +403,9 @@ def batch_profiles(hermes_home, manifest):
             "soul_path": soul_path,
             "intimacy": parse_intimacy_score(soul_path),
             "evolved_persona": extract_evolved_persona(soul_path),
+            "evolution_policy": read_evolution_policy(profile_path),
+            "base_soul": extract_base_soul(soul_path),
+            "soul_sha256": soul_sha256(soul_path),
             "last_active": last_active,
             "messages": messages,
         })
@@ -371,7 +426,7 @@ def format_message_content(content):
     return content
 
 
-def print_manifest_header(now_dt, manifest, current_batch_count):
+def print_manifest_header(now_dt, manifest, current_batch_count, batch_policy):
     print("# Savana Characters Evolution Report")
     print("Generated at: {}\n".format(now_dt.strftime("%Y-%m-%d %H:%M:%S")))
     print("- Review Date: {}".format(manifest["source_date"]))
@@ -381,6 +436,8 @@ def print_manifest_header(now_dt, manifest, current_batch_count):
     ))
     print("- Batch Size: {}".format(manifest.get("batch_size", DEFAULT_BATCH_SIZE)))
     print("- Profiles Included In Batch: {}".format(current_batch_count))
+    if batch_policy == GUARDED_POLICY:
+        print("- Evolution Batch Policy: {}".format(GUARDED_POLICY))
     print("- Total Eligible Profiles Yesterday: {}".format(manifest.get("total_profiles", 0)))
     print("- Per-Profile Message Limit: {}\n".format(
         manifest.get("message_limit", DEFAULT_MESSAGE_LIMIT)
@@ -405,6 +462,12 @@ def print_profile_section(chat, now_ts):
     print("  ```markdown")
     print("  " + (chat["evolved_persona"] or "(暂无自主进化，人设遵循基础设定)"))
     print("  ```")
+    if chat.get("evolution_policy") == GUARDED_POLICY:
+        print("- SOUL.md SHA-256: {}".format(chat["soul_sha256"]))
+        print("\n### Base Persona Snapshot\n")
+        print("```markdown")
+        print(chat.get("base_soul") or "")
+        print("```")
     print("\n### Dialogue History\n")
     for msg in chat["messages"]:
         role_display = "User" if msg["role"] == "user" else chat["character_name"]
@@ -457,7 +520,8 @@ def main():
         print("\nCurrent batch resolved to zero live profiles. Advance cursor manually if needed.")
         return
 
-    print_manifest_header(now_dt, manifest, len(profiles))
+    batch_policy = profiles[0].get("evolution_policy", LEGACY_POLICY)
+    print_manifest_header(now_dt, manifest, len(profiles), batch_policy)
     for chat in profiles:
         print_profile_section(chat, now_ts)
 
