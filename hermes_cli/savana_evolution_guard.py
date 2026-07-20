@@ -23,6 +23,7 @@ REQUIRED_REVIEW_KEYS = (
     "no_base_override",
 )
 _PROFILE_ID_RE = re.compile(r"^savana_[A-Za-z0-9_.-]+$")
+_AUDIT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _RESULT_RE = re.compile(
     re.escape(RESULT_START) + r"(.*?)" + re.escape(RESULT_END),
     re.DOTALL,
@@ -248,3 +249,46 @@ def apply_guarded_results(hermes_home, output, model):
         except InvalidEvolutionResult as exc:
             responses.append({"profile_id": profile_id, "status": "invalid", "error": str(exc)})
     return responses
+
+
+def rollback_guarded_evolution(hermes_home, profile_id, audit_id):
+    profile_dir = _resolve_profile_dir(hermes_home, profile_id)
+    if read_evolution_policy(profile_dir) != GUARDED_POLICY:
+        raise EvolutionPolicyError("profile is not guarded_v1")
+    if not _AUDIT_ID_RE.match(str(audit_id or "")):
+        raise InvalidEvolutionResult("invalid audit_id")
+    audit_path = profile_dir / "evolution_audit" / (audit_id + ".json")
+    with profile_lock(profile_dir, "soul"):
+        with open(str(audit_path), "r", encoding="utf-8") as handle:
+            source_audit = json.load(handle)
+        if source_audit.get("status") != "committed":
+            raise InvalidEvolutionResult("audit is not committed")
+        soul_path = profile_dir / "SOUL.md"
+        original = soul_path.read_text(encoding="utf-8")
+        if extract_evolved_persona(original) != source_audit.get("after"):
+            raise StaleEvolutionError("current persona differs from audit version")
+        updated = replace_evolved_persona(original, source_audit.get("before"))
+        rollback_result = {
+            "reason": "operator rollback to audit {0}".format(audit_id),
+            "self_review": {},
+        }
+        rollback_audit_path = _write_pending_audit(
+            profile_dir,
+            original,
+            updated,
+            rollback_result,
+            "operator",
+            action="rollback",
+            source_audit_id=audit_id,
+        )
+        try:
+            _atomic_write_text(soul_path, updated)
+            _mark_audit_committed(rollback_audit_path)
+        except Exception:
+            _atomic_write_text(soul_path, original)
+            raise
+        return {
+            "profile_id": profile_id,
+            "status": "committed",
+            "audit_id": rollback_audit_path.stem,
+        }
