@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from hermes_cli.companion_profile_policy import ensure_companion_profile
+from hermes_cli.companion_profile_policy import ensure_companion_profile, profile_lock
 
 router = APIRouter(prefix="/companion/v1")
 logger = logging.getLogger(__name__)
@@ -701,6 +701,11 @@ async def stop_weixin_bridge_worker():
     await _WEIXIN_BRIDGE_WORKER.stop()
 
 def sync_soul_file(profile_dir: str, profile_data: Dict[str, Any]) -> None:
+    with profile_lock(Path(profile_dir), "soul"):
+        _sync_soul_file_unlocked(profile_dir, profile_data)
+
+
+def _sync_soul_file_unlocked(profile_dir: str, profile_data: Dict[str, Any]) -> None:
     soul_path = os.path.join(profile_dir, "SOUL.md")
     evolved_persona = extract_evolved_persona(soul_path)
     if not evolved_persona or not evolved_persona.strip():

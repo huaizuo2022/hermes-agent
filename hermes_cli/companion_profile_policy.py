@@ -76,6 +76,30 @@ def _profile_init_lock(profile_dir):
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+@contextmanager
+def profile_lock(profile_dir, purpose):
+    profile_dir = Path(profile_dir)
+    lock_dir = profile_dir.parent / ".profile-locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_key = "{0}:{1}".format(str(profile_dir), str(purpose))
+    lock_name = hashlib.sha256(lock_key.encode("utf-8")).hexdigest() + ".lock"
+    lock_path = lock_dir / lock_name
+    with open(str(lock_path), "a+b") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        elif msvcrt is not None:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def ensure_companion_profile(profile_dir):
     profile_dir = Path(profile_dir)
     profile_dir.parent.mkdir(parents=True, exist_ok=True)
