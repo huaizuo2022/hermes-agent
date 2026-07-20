@@ -13,6 +13,8 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from hermes_cli.companion_profile_policy import ensure_companion_profile
+
 router = APIRouter(prefix="/companion/v1")
 logger = logging.getLogger(__name__)
 
@@ -802,6 +804,7 @@ def sync_soul_file(profile_dir: str, profile_data: Dict[str, Any]) -> None:
 async def chat_endpoint(req: ChatRequest):
     session_id = "savana_{}_{}".format(req.user_id.lower(), req.character_id.lower())
     profile_dir = get_profile_path(session_id)
+    ensure_companion_profile(Path(profile_dir))
     
     # 1. 动态物理隔离 Profile 目录 (使用线程安全的 ContextVar 覆盖)
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
@@ -981,7 +984,7 @@ async def delete_session(session_id: str):
 @router.post("/sessions/{session_id}/memories")
 async def sync_memory(session_id: str, req: MemorySyncRequest):
     profile_dir = get_profile_path(session_id)
-    os.makedirs(profile_dir, exist_ok=True)
+    ensure_companion_profile(Path(profile_dir))
     
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     token = set_hermes_home_override(profile_dir)
@@ -1015,7 +1018,7 @@ async def start_weixin_qr(req: WeixinQrStartRequest):
     try:
         if isinstance(req.character_profile, dict):
             profile_dir = get_profile_path(req.session_id)
-            os.makedirs(profile_dir, exist_ok=True)
+            ensure_companion_profile(Path(profile_dir))
             sync_soul_file(profile_dir, req.character_profile)
         result = await _start_weixin_qr_session(
             hermes_home=hermes_home,
@@ -1137,4 +1140,3 @@ async def update_message_endpoint(session_id: str, message_id: str, req: Message
             except Exception:
                 pass
         reset_hermes_home_override(token)
-

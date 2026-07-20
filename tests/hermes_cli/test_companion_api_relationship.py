@@ -5,7 +5,89 @@ import pytest
 from starlette.testclient import TestClient
 
 from hermes_cli.companion_api import sync_soul_file
+from hermes_cli.companion_profile_policy import GUARDED_POLICY, read_evolution_policy
 from hermes_cli.web_server import app
+
+
+def test_chat_initializes_guarded_policy_before_soul(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "profiles" / "savana_user_char"
+    observed = []
+
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.get_profile_path",
+        lambda session_id: str(profile_dir),
+    )
+
+    def fake_sync(path, profile):
+        observed.append(read_evolution_policy(path))
+        raise RuntimeError("stop after initialization")
+
+    monkeypatch.setattr("hermes_cli.companion_api.sync_soul_file", fake_sync)
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/companion/v1/chat",
+        json={
+            "user_id": "user",
+            "character_id": "char",
+            "message_id": "message-1",
+            "user_message": "你好",
+            "character_profile": {"name": "角色", "personality": "克制"},
+            "stream": False,
+        },
+    )
+
+    assert response.status_code == 500
+    assert observed == [GUARDED_POLICY]
+
+
+def test_memory_sync_initializes_guarded_policy(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "profiles" / "savana_user_char"
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.get_profile_path",
+        lambda session_id: str(profile_dir),
+    )
+
+    response = TestClient(app).post(
+        "/companion/v1/sessions/savana_user_char/memories",
+        json={"action": "add", "target": "user", "content": "测试记忆"},
+    )
+
+    assert response.status_code == 200
+    assert read_evolution_policy(profile_dir) == GUARDED_POLICY
+
+
+def test_weixin_start_initializes_guarded_policy_before_soul(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "profiles" / "savana_user_char"
+    observed = []
+
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.get_profile_path",
+        lambda session_id: str(profile_dir),
+    )
+
+    def fake_sync(path, profile):
+        observed.append(read_evolution_policy(path))
+
+    async def fake_start(hermes_home, session_id, bot_type="3", timeout_seconds=480):
+        return {
+            "qrcode": "qr-token-1",
+            "qrcode_img_content": "https://example.com/ilink-qr",
+            "status": "wait",
+        }
+
+    monkeypatch.setattr("hermes_cli.companion_api.sync_soul_file", fake_sync)
+    monkeypatch.setattr("hermes_cli.companion_api._start_weixin_qr_session", fake_start)
+
+    response = TestClient(app).post(
+        "/companion/v1/weixin/qr/start",
+        json={
+            "session_id": "savana_user_char",
+            "character_profile": {"name": "角色", "personality": "克制"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert observed == [GUARDED_POLICY]
 
 def test_sync_soul_file_appends_relationship(tmp_path):
     profile_dir = tmp_path / "profile_test"
