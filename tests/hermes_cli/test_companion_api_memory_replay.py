@@ -78,6 +78,7 @@ def test_companion_chat_replays_prior_turns_via_run_agent_patch_only(monkeypatch
             return result["final_response"]
 
     profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
     monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
 
     import run_agent
@@ -141,6 +142,7 @@ def test_companion_chat_does_not_double_write_current_user(monkeypatch, tmp_path
             return result["final_response"]
 
     profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
     monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
 
     import run_agent

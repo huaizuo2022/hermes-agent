@@ -13,7 +13,14 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from hermes_cli.companion_profile_policy import ensure_companion_profile, profile_lock
+from hermes_cli.companion_profile_policy import (
+    STYLE_GUARD_V1_POLICY,
+    ensure_companion_profile,
+    profile_lock,
+    read_conversation_policy,
+)
+from hermes_cli.companion_prompt import build_companion_system_prompt
+from hermes_cli.companion_turn_guard import TurnReviewStore, build_guarded_history, review_turn
 
 router = APIRouter(prefix="/companion/v1")
 logger = logging.getLogger(__name__)
@@ -30,6 +37,7 @@ class ChatRequest(BaseModel):
     api_key: Optional[str] = None
     api_base: Optional[str] = None
     directives: Optional[str] = None
+    companion_directives: Optional[str] = None
     request_overrides: Optional[Dict[str, Any]] = None
     reasoning_config: Optional[Dict[str, Any]] = None
 
@@ -364,6 +372,58 @@ def _load_companion_history(session_db, session_id: str, current_message_id: str
             continue
         history.append(msg)
     return history
+
+
+def _fallback_review_metadata(turn_id: str, error: Exception) -> Dict[str, Any]:
+    logger.exception("Companion style review failed for turn %s", turn_id)
+    return {
+        "turn_id": str(turn_id or ""),
+        "review_status": "pending",
+        "memory_status": "pending",
+        "memory_modifications": [],
+        "error": str(error),
+    }
+
+
+def _review_companion_turn(
+    *,
+    style_guard_enabled: bool,
+    profile_dir: str,
+    turn_id: str,
+    assistant_text: str,
+    user_message: str,
+    raw_history: List[Dict[str, Any]],
+    provider: str,
+    model: str,
+    base_url: Optional[str],
+    api_key: Optional[str],
+    memory_store: Any,
+) -> Dict[str, Any]:
+    if not style_guard_enabled:
+        modifications = []
+        if memory_store is not None and hasattr(memory_store, "modifications"):
+            modifications = memory_store.modifications
+        return {
+            "turn_id": str(turn_id or ""),
+            "review_status": None,
+            "memory_status": None,
+            "memory_modifications": modifications,
+        }
+    try:
+        return review_turn(
+            profile_dir=profile_dir,
+            turn_id=turn_id,
+            assistant_text=assistant_text,
+            user_message=user_message,
+            messages=raw_history,
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            memory_store=memory_store,
+        )
+    except Exception as exc:
+        return _fallback_review_metadata(turn_id, exc)
 
 
 def _get_weixin_bridge_runtime():
@@ -810,6 +870,8 @@ async def chat_endpoint(req: ChatRequest):
     session_id = "savana_{}_{}".format(req.user_id.lower(), req.character_id.lower())
     profile_dir = get_profile_path(session_id)
     ensure_companion_profile(Path(profile_dir))
+    conversation_policy = read_conversation_policy(profile_dir)
+    style_guard_enabled = conversation_policy == STYLE_GUARD_V1_POLICY
     
     # 1. 动态物理隔离 Profile 目录 (使用线程安全的 ContextVar 覆盖)
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
@@ -831,18 +893,26 @@ async def chat_endpoint(req: ChatRequest):
             session_db.create_session(session_id, "savana")
         except Exception:
             pass
-        conversation_history = _load_companion_history(
+        raw_history = _load_companion_history(
             session_db, session_id, req.message_id
         )
         soul_text = _read_text_if_exists(Path(profile_dir) / "SOUL.md")
         memory_snapshots = _load_companion_memory_snapshots(profile_dir)
         session_stats = _get_latest_session_stats(session_db, session_id)
+        conversation_history = raw_history
+        if style_guard_enabled:
+            conversation_history = build_guarded_history(raw_history, TurnReviewStore(profile_dir))
 
         # 动态解析模型及 API 配置
         api_key = req.api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
         base_url = req.api_base or os.environ.get("DEEPSEEK_API_BASE") or "https://api.deepseek.com"
         provider = req.provider or "deepseek"
         model = req.model or "deepseek-v4-flash"
+        effective_directives = req.companion_directives or ""
+        enabled_toolsets = []
+        if not style_guard_enabled:
+            effective_directives = req.directives
+            enabled_toolsets = ["memory"]
 
         # 3. 实例化 AI 代理 (硬编码工具限制为 memory，完全封死危险操作)
         agent = AIAgent(
@@ -851,18 +921,24 @@ async def chat_endpoint(req: ChatRequest):
             api_key=api_key,
             base_url=base_url,
             api_mode="chat_completions",
-            enabled_toolsets=["memory"],
+            enabled_toolsets=enabled_toolsets,
             quiet_mode=True,
             platform="savana",
             session_db=session_db,
             session_id=session_id,
             load_soul_identity=True,
             skip_context_files=True,
-            ephemeral_system_prompt=req.directives,
+            ephemeral_system_prompt=effective_directives,
             request_overrides=req.request_overrides,
             reasoning_config=req.reasoning_config,
         )
         agent.suppress_status_output = True
+        if style_guard_enabled:
+            agent._system_prompt_override = build_companion_system_prompt(
+                soul_text,
+                memory_snapshots.get("memory", ""),
+                memory_snapshots.get("user", ""),
+            )
 
         # Savana 伴侣场景：覆盖 memory 工具描述为角色扮演专用中文版本
         # 原始通用描述是面向开发者的英文，DeepSeek 在角色扮演模式下无法关联到"记住用户偏好"这一触发场景
@@ -876,7 +952,7 @@ async def chat_endpoint(req: ChatRequest):
             "只写入 target='user'（用户档案），action='add' 新增，action='replace' 更新旧条目。"
             "content 用简短中文写明事实，例如：'用户最喜欢的运动是攀岩'、'用户讨厌吃芹菜和胡萝卜'。"
         )
-        if agent.tools:
+        if not style_guard_enabled and agent.tools:
             for _tool in agent.tools:
                 if isinstance(_tool, dict) and _tool.get("function", {}).get("name") == "memory":
                     _tool["function"]["description"] = _SAVANA_MEMORY_DESCRIPTION
@@ -899,7 +975,7 @@ async def chat_endpoint(req: ChatRequest):
             user_message=req.user_message,
             conversation_history=conversation_history,
             character_profile=req.character_profile,
-            directives=req.directives,
+            directives=effective_directives,
             soul_text=soul_text,
             memory_text=memory_snapshots.get("memory", ""),
             user_profile_text=memory_snapshots.get("user", ""),
@@ -909,15 +985,17 @@ async def chat_endpoint(req: ChatRequest):
 
         if req.stream:
             q = queue.Queue()
+            review_metadata = {
+                "review_status": None,
+                "memory_status": None,
+                "memory_modifications": [],
+            }
 
             def run_chat_thread():
                 token_thread = set_hermes_home_override(profile_dir)
                 try:
-                    collected_chunks = []
-                    
                     def stream_callback(delta: str) -> None:
                         q.put(delta)
-                        collected_chunks.append(delta)
 
                     # 触发对话生成
                     result = agent.run_conversation(
@@ -927,6 +1005,21 @@ async def chat_endpoint(req: ChatRequest):
                         platform_message_id=req.message_id,
                     )
                     final_reply = result.get("final_response", "")
+                    review_metadata.update(
+                        _review_companion_turn(
+                            style_guard_enabled=style_guard_enabled,
+                            profile_dir=profile_dir,
+                            turn_id=req.message_id,
+                            assistant_text=final_reply,
+                            user_message=req.user_message,
+                            raw_history=raw_history,
+                            provider=provider,
+                            model=model,
+                            base_url=base_url,
+                            api_key=api_key,
+                            memory_store=getattr(agent, "_memory_store", None),
+                        )
+                    )
                 except Exception as e:
                     q.put(e)
                 finally:
@@ -947,13 +1040,12 @@ async def chat_endpoint(req: ChatRequest):
                     yield_data = {"delta": item}
                     yield "event: token\ndata: {}\n\n".format(json.dumps(yield_data))
                 
-                modifications = []
-                if getattr(agent, "_memory_store", None) and hasattr(agent._memory_store, "modifications"):
-                    modifications = agent._memory_store.modifications
                 metadata = {
                     "session_id": session_id,
                     "status": "completed",
-                    "memory_modifications": modifications
+                    "review_status": review_metadata.get("review_status"),
+                    "memory_status": review_metadata.get("memory_status"),
+                    "memory_modifications": review_metadata.get("memory_modifications", []),
                 }
                 yield "event: metadata\ndata: {}\n\n".format(json.dumps(metadata))
 
@@ -965,13 +1057,24 @@ async def chat_endpoint(req: ChatRequest):
                 platform_message_id=req.message_id,
             )
             reply = result.get("final_response", "")
-            modifications = []
-            if getattr(agent, "_memory_store", None) and hasattr(agent._memory_store, "modifications"):
-                modifications = agent._memory_store.modifications
+            review_metadata = _review_companion_turn(
+                style_guard_enabled=style_guard_enabled,
+                profile_dir=profile_dir,
+                turn_id=req.message_id,
+                assistant_text=reply,
+                user_message=req.user_message,
+                raw_history=raw_history,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                memory_store=getattr(agent, "_memory_store", None),
+            )
             return JSONResponse({
                 "reply": reply,
                 "session_id": session_id,
-                "memory_modifications": modifications
+                "review_status": review_metadata.get("review_status"),
+                "memory_modifications": review_metadata.get("memory_modifications", []),
             })
             
     finally:
@@ -1122,12 +1225,27 @@ async def update_message_endpoint(session_id: str, message_id: str, req: Message
         from hermes_state import SessionDB
         db_path = Path(profile_dir) / "state.db"
         session_db = SessionDB(db_path=db_path)
-        
-        updated = session_db.update_message_content(
-            session_id=session_id,
-            platform_message_id=message_id,
-            content=req.content
-        )
+
+        updated = False
+        if hasattr(session_db, "update_message_content"):
+            updated = session_db.update_message_content(
+                session_id=session_id,
+                platform_message_id=message_id,
+                content=req.content
+            )
+        else:
+            conn = session_db._conn
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE messages
+                   SET content = ?
+                 WHERE session_id = ? AND platform_message_id = ?
+                """,
+                (req.content, session_id, message_id),
+            )
+            conn.commit()
+            updated = cursor.rowcount > 0
         
         if not updated:
             raise HTTPException(status_code=404, detail="Message not found in local db")
