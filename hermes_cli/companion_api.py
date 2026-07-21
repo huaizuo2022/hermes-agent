@@ -46,7 +46,7 @@ def _style_guard_new_profiles_enabled() -> bool:
         config = load_config()
     except Exception:
         logger.exception("Failed to load companion profile feature flags")
-        return True
+        return False
     companion_config = config.get("companion") or {}
     return bool(companion_config.get("style_guard_new_profiles_enabled", True))
 

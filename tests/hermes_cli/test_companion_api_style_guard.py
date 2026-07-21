@@ -504,6 +504,25 @@ def test_new_profile_gate_returns_retryable_without_creating_profile(monkeypatch
     assert not profile_dir.exists()
 
 
+def test_new_profile_gate_fails_closed_when_config_load_fails(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "config-failure-profile"
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+
+    def failing_load_config():
+        raise RuntimeError("config unavailable")
+
+    monkeypatch.setattr("hermes_cli.companion_api.load_config", failing_load_config)
+
+    response = TestClient(app).post(
+        "/companion/v1/chat",
+        json=_payload("msg-1", "第一句", stream=False),
+    )
+
+    assert response.status_code == 503
+    assert response.headers.get("retry-after") == "5"
+    assert not profile_dir.exists()
+
+
 def test_existing_profile_ignores_new_profile_gate(monkeypatch, tmp_path):
     profile_dir = tmp_path / "existing-profile"
     profile_dir.mkdir()

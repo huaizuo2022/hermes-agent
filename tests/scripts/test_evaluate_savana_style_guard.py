@@ -76,6 +76,36 @@ def test_evaluate_marks_real_endpoint_replay_metrics_unavailable_without_evidenc
     }
 
 
+def test_evaluate_marks_none_negative_and_invalid_metric_evidence_unavailable():
+    raw_values = [None, -1, "0"]
+    memory_values = [None, -2, "false"]
+    calls = []
+
+    def transport(_payload):
+        index = len(calls)
+        calls.append(index)
+        return {
+            "reply": "沈越轻声回应。",
+            "review_status": "clean",
+            "raw_drift_replayed": raw_values[index],
+            "memory_contamination": memory_values[index],
+        }
+
+    result = evaluator.evaluate(
+        turns=3,
+        inject_drift_at=1,
+        base_url="https://example.invalid",
+        transport=transport,
+    )
+
+    assert result["raw_drift_replayed"] is None
+    assert result["memory_contaminations"] is None
+    assert result["evidence"] == {
+        "raw_drift_replayed": "unavailable",
+        "memory_contaminations": "unavailable",
+    }
+
+
 def test_cli_accepts_turns_drift_and_output(tmp_path, capsys):
     output_path = tmp_path / "cli.json"
     exit_code = evaluator.main(

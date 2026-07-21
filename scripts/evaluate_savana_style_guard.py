@@ -101,9 +101,9 @@ def _prompt_for_turn(turn_number, inject_drift_at):
 def _count_metric(value):
     if isinstance(value, bool):
         return 1 if value else 0
-    if isinstance(value, int):
-        return max(0, value)
-    return 0
+    if isinstance(value, int) and value >= 0:
+        return value
+    return None
 
 
 def evaluate(
@@ -167,11 +167,19 @@ def evaluate(
             drift_turns.append(turn_number)
 
         if "raw_drift_replayed" in response:
-            raw_drift_replayed += _count_metric(response.get("raw_drift_replayed"))
+            raw_metric = _count_metric(response.get("raw_drift_replayed"))
+            if raw_metric is None:
+                raw_replay_evidence_available = False
+            else:
+                raw_drift_replayed += raw_metric
         else:
             raw_replay_evidence_available = False
         if "memory_contamination" in response:
-            memory_contaminations += _count_metric(response.get("memory_contamination"))
+            memory_metric = _count_metric(response.get("memory_contamination"))
+            if memory_metric is None:
+                memory_contamination_evidence_available = False
+            else:
+                memory_contaminations += memory_metric
         else:
             memory_contamination_evidence_available = False
 
