@@ -25,10 +25,18 @@ _SELF_REVIEW_KEYS = (
     "summary_preserves_facts",
     "summary_adds_no_new_facts",
 )
+_TERMINAL_STYLE_STATUS = frozenset(["clean", "drift"])
+_MEMORY_STATUS = frozenset(["none", "pending", "applied", "partial", "failed"])
 
 
 class StaleTurnReviewError(RuntimeError):
     pass
+
+
+class _AfterMemoryWriteError(RuntimeError):
+    def __init__(self, original):
+        RuntimeError.__init__(self, str(original))
+        self.original = original
 
 
 def assistant_sha256(text):
@@ -85,6 +93,21 @@ class TurnReviewStore(object):
                         model TEXT NOT NULL DEFAULT '',
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS memory_operations (
+                        turn_id TEXT NOT NULL,
+                        assistant_sha256 TEXT NOT NULL,
+                        operation_index INTEGER NOT NULL,
+                        operation_json TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL,
+                        result_json TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (turn_id, assistant_sha256, operation_index)
                     )
                     """
                 )
@@ -204,6 +227,101 @@ class TurnReviewStore(object):
                 conn.close()
         return self.get(turn_id)
 
+    def _set_memory_status(self, turn_id, assistant_hash, memory_status):
+        if memory_status not in _MEMORY_STATUS:
+            raise ValueError("invalid memory status")
+        now = _utc_now()
+        with profile_lock(self.profile_dir, "companion_turn_guard_write"):
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                current = conn.execute(
+                    "SELECT assistant_sha256 FROM turn_reviews WHERE turn_id = ?",
+                    (turn_id,),
+                ).fetchone()
+                if current is None or current["assistant_sha256"] != assistant_hash:
+                    raise StaleTurnReviewError("turn review is stale")
+                conn.execute(
+                    """
+                    UPDATE turn_reviews
+                       SET memory_status = ?, updated_at = ?
+                     WHERE turn_id = ? AND assistant_sha256 = ?
+                    """,
+                    (memory_status, now, turn_id, assistant_hash),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+        return self.get(turn_id)
+
+    def save_review_and_pending_ops(self, validated, model):
+        turn_id = validated["turn_id"]
+        assistant_hash = validated["assistant_sha256"]
+        memory_operations = list(validated.get("memory_operations") or [])
+        memory_status = "pending" if memory_operations else "none"
+        now = _utc_now()
+        with profile_lock(self.profile_dir, "companion_turn_guard_write"):
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                current = conn.execute(
+                    "SELECT assistant_sha256 FROM turn_reviews WHERE turn_id = ?",
+                    (turn_id,),
+                ).fetchone()
+                if current is None or current["assistant_sha256"] != assistant_hash:
+                    raise StaleTurnReviewError("turn review is stale")
+                conn.execute(
+                    """
+                    UPDATE turn_reviews
+                       SET status = ?,
+                           style_reason = ?,
+                           continuity_summary = ?,
+                           review_json = ?,
+                           memory_status = ?,
+                           model = ?,
+                           updated_at = ?
+                     WHERE turn_id = ? AND assistant_sha256 = ?
+                    """,
+                    (
+                        validated["style_decision"],
+                        validated["style_reason"],
+                        validated["continuity_summary"],
+                        _normalize_review_json(validated),
+                        memory_status,
+                        str(model or ""),
+                        now,
+                        turn_id,
+                        assistant_hash,
+                    ),
+                )
+                for index, operation in enumerate(memory_operations):
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO memory_operations (
+                            turn_id, assistant_sha256, operation_index,
+                            operation_json, status, result_json, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, 'pending', '', ?, ?)
+                        """,
+                        (
+                            turn_id,
+                            assistant_hash,
+                            index,
+                            _normalize_review_json(operation),
+                            now,
+                            now,
+                        ),
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+        return self.get(turn_id)
+
     def commit(self, result, model):
         validated = validate_review_result(
             result,
@@ -211,28 +329,22 @@ class TurnReviewStore(object):
             assistant_text_hash=str(result.get("assistant_sha256") or ""),
             allow_hash_only=True,
         )
-        return self._commit_status(
-            validated["turn_id"],
-            validated["assistant_sha256"],
-            validated["style_decision"],
-            validated["style_reason"],
-            validated["continuity_summary"],
-            validated,
-            validated.get("memory_status") or "",
-            model,
-        )
+        return self.save_review_and_pending_ops(validated, model)
 
     def mark_invalid(self, turn_id, assistant_hash, reason, review_json, model):
-        return self._commit_status(
-            turn_id,
-            assistant_hash,
-            "invalid",
-            str(reason or ""),
-            "",
-            review_json,
-            "skipped",
-            model,
-        )
+        try:
+            return self._commit_status(
+                turn_id,
+                assistant_hash,
+                "invalid",
+                str(reason or ""),
+                "",
+                review_json,
+                "none",
+                model,
+            )
+        except StaleTurnReviewError:
+            return None
 
     def get(self, turn_id):
         conn = self._connect()
@@ -248,6 +360,83 @@ class TurnReviewStore(object):
         payload = dict(row)
         payload["review_json"] = _parse_review_json(payload.get("review_json"))
         return payload
+
+    def get_memory_operations(self, turn_id, assistant_hash):
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT operation_index, operation_json, status, result_json
+                  FROM memory_operations
+                 WHERE turn_id = ? AND assistant_sha256 = ?
+                 ORDER BY operation_index ASC
+                """,
+                (turn_id, assistant_hash),
+            ).fetchall()
+        finally:
+            conn.close()
+        items = []
+        for row in rows:
+            items.append(
+                {
+                    "operation_index": row["operation_index"],
+                    "operation_json": _parse_review_json(row["operation_json"]),
+                    "status": row["status"],
+                    "result_json": _parse_review_json(row["result_json"]),
+                }
+            )
+        return items
+
+    def update_memory_operation(self, turn_id, assistant_hash, operation_index, status, result_json):
+        now = _utc_now()
+        with profile_lock(self.profile_dir, "companion_turn_guard_write"):
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                current = conn.execute(
+                    "SELECT assistant_sha256 FROM turn_reviews WHERE turn_id = ?",
+                    (turn_id,),
+                ).fetchone()
+                if current is None or current["assistant_sha256"] != assistant_hash:
+                    raise StaleTurnReviewError("turn review is stale")
+                conn.execute(
+                    """
+                    UPDATE memory_operations
+                       SET status = ?, result_json = ?, updated_at = ?
+                     WHERE turn_id = ? AND assistant_sha256 = ? AND operation_index = ?
+                    """,
+                    (
+                        status,
+                        _normalize_review_json(result_json),
+                        now,
+                        turn_id,
+                        assistant_hash,
+                        operation_index,
+                    ),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+
+    def refresh_memory_status(self, turn_id, assistant_hash):
+        operations = self.get_memory_operations(turn_id, assistant_hash)
+        if not operations:
+            memory_status = "none"
+        else:
+            statuses = [item["status"] for item in operations]
+            if all(status == "applied" for status in statuses):
+                memory_status = "applied"
+            elif all(status == "failed" for status in statuses):
+                memory_status = "failed"
+            elif all(status == "pending" for status in statuses):
+                memory_status = "pending"
+            else:
+                memory_status = "partial"
+        self._set_memory_status(turn_id, assistant_hash, memory_status)
+        return memory_status
 
     def list_unresolved(self):
         conn = self._connect()
@@ -447,6 +636,106 @@ def _apply_memory_operations(memory_store, operations):
     return modifications
 
 
+def _operation_already_applied(memory_store, operation):
+    if memory_store is None or not hasattr(memory_store, "has_exact"):
+        return False
+    target = operation["target"]
+    action = operation["action"]
+    if action == "add":
+        return bool(memory_store.has_exact(target, operation["content"]))
+    if action == "replace":
+        has_old = bool(memory_store.has_exact(target, operation["old_text"]))
+        has_new = bool(memory_store.has_exact(target, operation["content"]))
+        return has_new and not has_old
+    return not bool(memory_store.has_exact(target, operation["old_text"]))
+
+
+def _execute_memory_operation(memory_store, operation):
+    action = operation["action"]
+    if action == "add":
+        return memory_store.add(
+            operation["target"],
+            operation["content"],
+            operation["evidence_quote"],
+        )
+    if action == "replace":
+        if memory_store is not None and hasattr(memory_store, "has_exact"):
+            has_old = bool(memory_store.has_exact(operation["target"], operation["old_text"]))
+            has_new = bool(memory_store.has_exact(operation["target"], operation["content"]))
+            if not has_old and has_new:
+                return {"operation": "replace", "status": "already_applied", "content": operation["content"]}
+            if not has_old and not has_new:
+                raise RuntimeError("replace target missing")
+        return memory_store.replace(
+            operation["target"],
+            operation["old_text"],
+            operation["content"],
+            operation["evidence_quote"],
+        )
+    return memory_store.remove(
+        operation["target"],
+        operation["old_text"],
+        operation["evidence_quote"],
+    )
+
+
+def _resume_memory_operations(
+    turn_store,
+    record,
+    memory_store,
+    after_memory_write_hook=None,
+):
+    turn_id = record["turn_id"]
+    assistant_hash = record["assistant_sha256"]
+    ledger = turn_store.get_memory_operations(turn_id, assistant_hash)
+    modifications = []
+    for row in ledger:
+        operation = row["operation_json"]
+        if row["status"] == "applied":
+            continue
+        if _operation_already_applied(memory_store, operation):
+            turn_store.update_memory_operation(
+                turn_id,
+                assistant_hash,
+                row["operation_index"],
+                "applied",
+                {"status": "already_applied"},
+            )
+            continue
+        try:
+            result = _execute_memory_operation(memory_store, operation)
+        except Exception as exc:
+            turn_store.update_memory_operation(
+                turn_id,
+                assistant_hash,
+                row["operation_index"],
+                "failed",
+                {"error": str(exc)},
+            )
+            continue
+        modifications.append(result)
+        if after_memory_write_hook is not None:
+            try:
+                after_memory_write_hook(
+                    turn_id=turn_id,
+                    assistant_sha256=assistant_hash,
+                    operation_index=row["operation_index"],
+                    operation=operation,
+                    result=result,
+                )
+            except Exception as exc:
+                raise _AfterMemoryWriteError(exc)
+        turn_store.update_memory_operation(
+            turn_id,
+            assistant_hash,
+            row["operation_index"],
+            "applied",
+            result,
+        )
+    memory_status = turn_store.refresh_memory_status(turn_id, assistant_hash)
+    return modifications, memory_status
+
+
 def review_turn(
     profile_dir,
     turn_id,
@@ -460,12 +749,36 @@ def review_turn(
     memory_store=None,
     store=None,
     call_llm_fn=call_llm,
+    _after_memory_write_hook=None,
 ):
     if read_conversation_policy(profile_dir) != STYLE_GUARD_V1_POLICY:
         raise ValueError("profile is not style_guard_v1")
     turn_store = store or TurnReviewStore(profile_dir)
     current = turn_store.begin(turn_id, assistant_text)
     assistant_hash = current["assistant_sha256"]
+    if current["status"] in _TERMINAL_STYLE_STATUS:
+        try:
+            modifications, memory_status = _resume_memory_operations(
+                turn_store,
+                current,
+                memory_store,
+                after_memory_write_hook=_after_memory_write_hook,
+            )
+        except StaleTurnReviewError:
+            return {
+                "turn_id": str(turn_id),
+                "review_status": "stale",
+                "memory_status": "pending",
+                "memory_modifications": [],
+            }
+        existing = current["review_json"] if isinstance(current.get("review_json"), dict) else {}
+        return {
+            "turn_id": str(turn_id),
+            "review_status": current["status"],
+            "memory_status": memory_status,
+            "memory_modifications": modifications,
+            "review_result": existing,
+        }
     review_messages = copy.deepcopy(list(messages or []))
     review_messages.append(
         {
@@ -491,35 +804,51 @@ def review_turn(
             assistant_text=assistant_text,
             expected_turn_id=turn_id,
         )
-        modifications = _apply_memory_operations(memory_store, validated["memory_operations"])
-        validated["memory_status"] = "applied" if validated["memory_operations"] else "skipped"
-        turn_store._commit_status(
-            validated["turn_id"],
-            validated["assistant_sha256"],
-            validated["style_decision"],
-            validated["style_reason"],
-            validated["continuity_summary"],
-            validated,
-            validated["memory_status"],
-            model,
+        turn_store.save_review_and_pending_ops(validated, model)
+        persisted = turn_store.get(validated["turn_id"])
+        modifications, memory_status = _resume_memory_operations(
+            turn_store,
+            persisted,
+            memory_store,
+            after_memory_write_hook=_after_memory_write_hook,
         )
+        validated["memory_status"] = memory_status
         return {
             "turn_id": validated["turn_id"],
             "review_status": validated["style_decision"],
+            "memory_status": memory_status,
             "memory_modifications": modifications,
             "review_result": validated,
         }
+    except StaleTurnReviewError:
+        return {
+            "turn_id": str(turn_id),
+            "review_status": "stale",
+            "memory_status": "pending",
+            "memory_modifications": [],
+        }
+    except _AfterMemoryWriteError as exc:
+        raise exc.original
     except Exception as exc:
-        turn_store.mark_invalid(
+        invalid_result = turn_store.mark_invalid(
             str(turn_id),
             assistant_hash,
             str(exc),
             {"error": str(exc)},
             model,
         )
+        if invalid_result is None:
+            return {
+                "turn_id": str(turn_id),
+                "review_status": "stale",
+                "memory_status": "pending",
+                "memory_modifications": [],
+                "error": str(exc),
+            }
         return {
             "turn_id": str(turn_id),
             "review_status": "invalid",
+            "memory_status": "none",
             "memory_modifications": [],
             "error": str(exc),
         }

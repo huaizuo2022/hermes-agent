@@ -73,6 +73,69 @@ class DummyMemoryStore(object):
         }
 
 
+class LedgerMemoryStore(object):
+    def __init__(self, existing=None, fail_on_call=None, callback=None):
+        self.calls = []
+        self.entries = set(existing or [])
+        self.fail_on_call = fail_on_call
+        self.callback = callback
+        self.call_count = 0
+
+    def _record(self, action, payload):
+        self.call_count += 1
+        self.calls.append((action, payload))
+        if self.callback is not None:
+            self.callback(self.call_count, action, payload, self)
+        if self.fail_on_call == self.call_count:
+            raise RuntimeError("memory write failed")
+
+    def add(self, target, content, evidence_quote):
+        payload = {"target": target, "content": content, "evidence_quote": evidence_quote}
+        self._record("add", payload)
+        self.entries.add(content)
+        return {"operation": "add", "target": target, "content": content}
+
+    def replace(self, target, old_text, content, evidence_quote):
+        payload = {
+            "target": target,
+            "old_text": old_text,
+            "content": content,
+            "evidence_quote": evidence_quote,
+        }
+        self._record("replace", payload)
+        self.entries.discard(old_text)
+        self.entries.add(content)
+        return {
+            "operation": "replace",
+            "target": target,
+            "old_text": old_text,
+            "content": content,
+        }
+
+    def remove(self, target, old_text, evidence_quote):
+        payload = {"target": target, "old_text": old_text, "evidence_quote": evidence_quote}
+        self._record("remove", payload)
+        self.entries.discard(old_text)
+        return {"operation": "remove", "target": target, "old_text": old_text}
+
+    def has_exact(self, target, text):
+        return text in self.entries
+
+
+def _ledger_rows(profile_dir):
+    conn = sqlite3.connect(str(profile_dir / "companion_guard.db"))
+    try:
+        return conn.execute(
+            """
+            SELECT operation_index, status, operation_json, result_json
+              FROM memory_operations
+             ORDER BY operation_index ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+
 def _marked(result):
     return RESULT_START + json.dumps(result, ensure_ascii=False) + RESULT_END
 
@@ -437,3 +500,184 @@ def test_sidecar_does_not_store_raw_assistant_text(tmp_path):
         conn.close()
 
     assert raw_text not in payload
+
+
+def test_review_turn_reuses_terminal_review_without_recalling_llm_or_memory(tmp_path):
+    profile_dir = _profile_dir(tmp_path)
+    store = TurnReviewStore(profile_dir)
+    memory_store = LedgerMemoryStore()
+    assistant_text = "她说今晚陪你一起深夜调试。"
+    result = _valid_result(summary="", assistant_text=assistant_text)
+    result["style_decision"] = "clean"
+    result["memory_operations"] = [
+        {"target": "user", "action": "add", "content": "喜欢深夜调试。", "evidence_quote": "深夜调试"},
+    ]
+    llm_calls = []
+
+    first = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text=assistant_text,
+        user_message="我最喜欢和你一起深夜调试。",
+        messages=[{"role": "user", "content": "我最喜欢和你一起深夜调试。"}],
+        provider="openai",
+        model="gpt-test",
+        memory_store=memory_store,
+        store=store,
+        call_llm_fn=lambda **kwargs: llm_calls.append(kwargs) or _marked(result),
+    )
+
+    second = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text=assistant_text,
+        user_message="我最喜欢和你一起深夜调试。",
+        messages=[{"role": "user", "content": "我最喜欢和你一起深夜调试。"}],
+        provider="openai",
+        model="gpt-test",
+        memory_store=memory_store,
+        store=store,
+        call_llm_fn=lambda **kwargs: (_ for _ in ()).throw(AssertionError("llm should be skipped")),
+    )
+
+    assert first["review_status"] == "clean"
+    assert second["review_status"] == "clean"
+    assert len(llm_calls) == 1
+    assert len(memory_store.calls) == 1
+
+
+def test_review_turn_persists_review_before_memory_and_stale_during_memory_does_not_corrupt_new_hash(tmp_path):
+    profile_dir = _profile_dir(tmp_path)
+    store = TurnReviewStore(profile_dir)
+    assistant_text = "她说今晚陪你一起深夜调试。"
+    new_text = "她改口说要先去整理思绪。"
+    result = _valid_result(summary="", assistant_text=assistant_text)
+    result["style_decision"] = "clean"
+    result["memory_operations"] = [
+        {"target": "user", "action": "add", "content": "喜欢深夜调试。", "evidence_quote": "深夜调试"},
+    ]
+
+    def callback(call_count, action, payload, mem):
+        if call_count == 1:
+            current = store.get("turn-1")
+            assert current["status"] == "clean"
+            assert current["memory_status"] in ("pending", "partial")
+            store.begin("turn-1", new_text)
+
+    memory_store = LedgerMemoryStore(callback=callback)
+    review = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text=assistant_text,
+        user_message="我最喜欢和你一起深夜调试。",
+        messages=[{"role": "user", "content": "我最喜欢和你一起深夜调试。"}],
+        provider="openai",
+        model="gpt-test",
+        memory_store=memory_store,
+        store=store,
+        call_llm_fn=lambda **kwargs: _marked(result),
+    )
+
+    current = store.get("turn-1")
+    assert review["review_status"] in ("stale", "clean")
+    assert current["assistant_sha256"] == assistant_sha256(new_text)
+    assert current["status"] == "pending"
+    assert current["memory_status"] in ("", "none", "pending")
+
+
+def test_review_turn_tracks_partial_memory_failures_and_retries_only_remaining_ops(tmp_path):
+    profile_dir = _profile_dir(tmp_path)
+    store = TurnReviewStore(profile_dir)
+    assistant_text = "她说今晚陪你一起深夜调试。"
+    result = _valid_result(summary="", assistant_text=assistant_text)
+    result["style_decision"] = "clean"
+    result["memory_operations"] = [
+        {"target": "user", "action": "add", "content": "喜欢深夜调试。", "evidence_quote": "深夜调试"},
+        {"target": "user", "action": "add", "content": "也喜欢你。", "evidence_quote": "喜欢"},
+    ]
+    memory_store = LedgerMemoryStore(fail_on_call=2)
+
+    first = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text=assistant_text,
+        user_message="我最喜欢和你一起深夜调试，也喜欢你。",
+        messages=[{"role": "user", "content": "我最喜欢和你一起深夜调试，也喜欢你。"}],
+        provider="openai",
+        model="gpt-test",
+        memory_store=memory_store,
+        store=store,
+        call_llm_fn=lambda **kwargs: _marked(result),
+    )
+
+    rows_after_first = _ledger_rows(profile_dir)
+    retry_store = LedgerMemoryStore(existing=memory_store.entries)
+    second = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text=assistant_text,
+        user_message="我最喜欢和你一起深夜调试，也喜欢你。",
+        messages=[{"role": "user", "content": "我最喜欢和你一起深夜调试，也喜欢你。"}],
+        provider="openai",
+        model="gpt-test",
+        memory_store=retry_store,
+        store=store,
+        call_llm_fn=lambda **kwargs: (_ for _ in ()).throw(AssertionError("llm should be skipped")),
+    )
+
+    rows_after_second = _ledger_rows(profile_dir)
+    assert first["review_status"] == "clean"
+    assert first["memory_status"] == "partial"
+    assert [row[1] for row in rows_after_first] == ["applied", "failed"]
+    assert second["review_status"] == "clean"
+    assert second["memory_status"] == "applied"
+    assert len(retry_store.calls) == 1
+    assert [row[1] for row in rows_after_second] == ["applied", "applied"]
+
+
+def test_review_turn_retry_avoids_duplicate_memory_write_after_post_write_crash(tmp_path):
+    profile_dir = _profile_dir(tmp_path)
+    store = TurnReviewStore(profile_dir)
+    assistant_text = "她说今晚陪你一起深夜调试。"
+    result = _valid_result(summary="", assistant_text=assistant_text)
+    result["style_decision"] = "clean"
+    result["memory_operations"] = [
+        {"target": "user", "action": "add", "content": "喜欢深夜调试。", "evidence_quote": "深夜调试"},
+    ]
+    memory_store = LedgerMemoryStore()
+
+    def crash_after_write(*args, **kwargs):
+        raise RuntimeError("sidecar apply crash")
+
+    with pytest.raises(RuntimeError):
+        review_turn(
+            profile_dir=profile_dir,
+            turn_id="turn-1",
+            assistant_text=assistant_text,
+            user_message="我最喜欢和你一起深夜调试。",
+            messages=[{"role": "user", "content": "我最喜欢和你一起深夜调试。"}],
+            provider="openai",
+            model="gpt-test",
+            memory_store=memory_store,
+            store=store,
+            call_llm_fn=lambda **kwargs: _marked(result),
+            _after_memory_write_hook=crash_after_write,
+        )
+
+    retry_store = LedgerMemoryStore(existing=memory_store.entries)
+    retried = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text=assistant_text,
+        user_message="我最喜欢和你一起深夜调试。",
+        messages=[{"role": "user", "content": "我最喜欢和你一起深夜调试。"}],
+        provider="openai",
+        model="gpt-test",
+        memory_store=retry_store,
+        store=store,
+        call_llm_fn=lambda **kwargs: (_ for _ in ()).throw(AssertionError("llm should be skipped")),
+    )
+
+    assert len(memory_store.calls) == 1
+    assert retry_store.calls == []
+    assert retried["memory_status"] == "applied"
