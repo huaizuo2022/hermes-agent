@@ -326,13 +326,20 @@ def _extract_savana_expected_profile_ids(value: str) -> List[str]:
     return profile_ids
 
 
+def _require_savana_expected_profile_ids(value: str) -> List[str]:
+    profile_ids = _extract_savana_expected_profile_ids(value)
+    if not profile_ids:
+        raise RuntimeError("guarded Savana report header is missing profile JSON metadata")
+    return profile_ids
+
+
 def _validate_savana_evolution_results(report_text: str, results) -> None:
     policy = _extract_savana_guarded_policy(report_text)
     if policy is None:
         if _savana_header_is_malformed(report_text):
             raise RuntimeError("guarded Savana report header is malformed")
         return
-    expected_profile_ids = _extract_savana_expected_profile_ids(report_text)
+    expected_profile_ids = _require_savana_expected_profile_ids(report_text)
     issues = []
     observed_profile_ids = set()
     for result in list(results or []):
@@ -401,7 +408,7 @@ def _apply_savana_evolution_output(
     if not (_is_savana_evolution_job(job) and policy):
         return []
     from hermes_cli.savana_evolution_guard import apply_guarded_results
-    expected_profile_ids = _extract_savana_expected_profile_ids(report_text)
+    expected_profile_ids = _require_savana_expected_profile_ids(report_text)
 
     if policy == "guarded_v2":
         results = apply_guarded_results(

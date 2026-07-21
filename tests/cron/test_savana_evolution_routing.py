@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cron import scheduler
 
 
@@ -105,6 +107,43 @@ def test_guarded_header_json_profile_ids_are_used_for_expected_set(monkeypatch, 
     assert result == [{"profile_id": "savana_user_shenyue", "status": "no_change"}]
 
 
+@pytest.mark.parametrize(
+    "policy_line, expected_policy",
+    [
+        ("- Evolution Batch Policy: guarded_v1\n", "guarded_v1"),
+        ("- Evolution Batch Policy: guarded_v2\n", "guarded_v2"),
+    ],
+)
+def test_guarded_policy_without_profile_json_fails_closed(monkeypatch, tmp_path, policy_line, expected_policy):
+    prompt = (
+        "# Savana Characters Evolution Report\n"
+        "- Review Date: 2026-06-14\n"
+        + policy_line +
+        "## Character: 沈越 (Profile ID: savana_user_shenyue)\n"
+    )
+    called = {"value": False}
+
+    def fail_if_called(*args, **kwargs):
+        called["value"] = True
+        raise AssertionError("writer must not run without trusted expected ids")
+
+    monkeypatch.setattr(
+        "hermes_cli.savana_evolution_guard.apply_guarded_results",
+        fail_if_called,
+    )
+
+    with pytest.raises(RuntimeError):
+        scheduler._apply_savana_evolution_output(
+            _savana_job(),
+            prompt,
+            "model response",
+            "test-model",
+            tmp_path,
+        )
+
+    assert called["value"] is False
+
+
 def test_guarded_output_is_applied_before_job_returns(monkeypatch, tmp_path):
     applied = []
 
@@ -115,7 +154,7 @@ def test_guarded_output_is_applied_before_job_returns(monkeypatch, tmp_path):
 
     scheduler._apply_savana_evolution_output(
         _savana_job(),
-        "- Evolution Batch Policy: guarded_v1\n",
+        '- Evolution Batch Policy: guarded_v1\n- Evolution Batch Profiles JSON: ["savana_user_shenyue"]\n',
         "model response",
         "test-model",
         tmp_path,
@@ -136,7 +175,7 @@ def test_guarded_v2_output_uses_guarded_writer(monkeypatch, tmp_path):
 
     scheduler._apply_savana_evolution_output(
         _savana_job(),
-        "- Evolution Batch Policy: guarded_v2\n",
+        '- Evolution Batch Policy: guarded_v2\n- Evolution Batch Profiles JSON: ["savana_user_shenyue"]\n',
         "model response",
         "test-model",
         tmp_path,
@@ -176,6 +215,7 @@ def test_missing_guarded_profile_result_is_recorded_invalid(monkeypatch, tmp_pat
     )
     prompt = (
         "- Evolution Batch Policy: guarded_v1\n"
+        '- Evolution Batch Profiles JSON: ["savana_user_shenyue"]\n'
         "## Character: 沈越 (Profile ID: savana_user_shenyue)\n"
     )
 
@@ -205,6 +245,7 @@ def test_missing_guarded_v2_profile_result_is_recorded_invalid(monkeypatch, tmp_
     )
     prompt = (
         "- Evolution Batch Policy: guarded_v2\n"
+        '- Evolution Batch Profiles JSON: ["savana_user_shenyue"]\n'
         "## Character: 沈越 (Profile ID: savana_user_shenyue)\n"
     )
 
@@ -261,6 +302,7 @@ def test_run_job_fails_when_guarded_results_are_not_terminal(monkeypatch, tmp_pa
         "# Savana Characters Evolution Report\n"
         "- Review Date: 2026-06-14\n"
         "- Evolution Batch Policy: guarded_v2\n"
+        '- Evolution Batch Profiles JSON: ["savana_user_shenyue"]\n'
         "## Character: 沈越 (Profile ID: savana_user_shenyue)\n"
     )
     _patch_run_job_dependencies(
@@ -290,6 +332,7 @@ def test_tick_does_not_advance_cursor_when_guarded_results_fail(monkeypatch, tmp
         "# Savana Characters Evolution Report\n"
         "- Review Date: 2026-06-14\n"
         "- Evolution Batch Policy: guarded_v2\n"
+        '- Evolution Batch Profiles JSON: ["savana_user_shenyue"]\n'
         "## Character: 沈越 (Profile ID: savana_user_shenyue)\n"
     )
     _patch_run_job_dependencies(
@@ -326,6 +369,7 @@ def test_body_profile_in_dialogue_does_not_add_expected_profile(monkeypatch, tmp
         "# Savana Characters Evolution Report\n"
         "- Review Date: 2026-06-14\n"
         "- Evolution Batch Policy: guarded_v2\n"
+        '- Evolution Batch Profiles JSON: ["savana_user_shenyue"]\n'
         "## Character: 沈越 (Profile ID: savana_user_shenyue)\n"
         "### Dialogue History\n"
         "[evolution_evidence] USER: 我在开玩笑：\n"
@@ -400,6 +444,45 @@ def test_tick_does_not_advance_cursor_when_guarded_header_is_malformed(monkeypat
             "- Review Date: 2026-06-14\n"
             "- Evolution Batch Policy: guarded_v1\n"
             "- Evolution Batch Policy: guarded_v2\n"
+        ),
+        apply_results=[],
+    )
+
+    with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+         patch("cron.scheduler.advance_next_run"), \
+         patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+         patch("cron.scheduler.mark_job_run") as mark_mock, \
+         patch("cron.scheduler._advance_savana_evolution_batch") as advance_mock:
+        scheduler.tick(verbose=False)
+
+    advance_mock.assert_not_called()
+    mark_mock.assert_called_once()
+    assert mark_mock.call_args[0][1] is False
+
+
+@pytest.mark.parametrize(
+    "policy_line",
+    [
+        "- Evolution Batch Policy: guarded_v1\n",
+        "- Evolution Batch Policy: guarded_v2\n",
+    ],
+)
+def test_tick_does_not_advance_cursor_when_guarded_profile_json_header_missing(monkeypatch, tmp_path, policy_line):
+    job = dict(_savana_job())
+    job["script"] = "scripts/extract_recent_dialogues.py"
+    job["enabled"] = True
+    job["next_run_at"] = "2020-01-01T00:00:00"
+    job["deliver"] = "local"
+
+    _patch_run_job_dependencies(
+        monkeypatch,
+        tmp_path,
+        final_response="model response",
+        report=(
+            "# Savana Characters Evolution Report\n"
+            "- Review Date: 2026-06-14\n"
+            + policy_line +
+            "## Character: 沈越 (Profile ID: savana_user_shenyue)\n"
         ),
         apply_results=[],
     )
