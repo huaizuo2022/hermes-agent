@@ -262,6 +262,11 @@ def _extract_savana_report_header_lines(value: str) -> List[str]:
     return header
 
 
+def _is_savana_report(value: str) -> bool:
+    lines = str(value or "").splitlines()
+    return bool(lines) and lines[0].strip() == "# Savana Characters Evolution Report"
+
+
 def _extract_savana_guarded_policy(value: str) -> Optional[str]:
     markers = []
     for line in _extract_savana_report_header_lines(value):
@@ -275,11 +280,44 @@ def _extract_savana_guarded_policy(value: str) -> Optional[str]:
     return markers[0]
 
 
+def _savana_header_is_malformed(value: str) -> bool:
+    if not _is_savana_report(value):
+        return False
+    markers = []
+    for line in _extract_savana_report_header_lines(value):
+        stripped = line.strip()
+        if stripped in (_SAVANA_GUARDED_REPORT_MARKER, _SAVANA_GUARDED_V2_REPORT_MARKER):
+            markers.append(stripped)
+    return len(markers) > 1
+
+
+def _extract_savana_expected_profile_ids(value: str) -> List[str]:
+    profile_ids = []
+    trust_profile_header = True
+    for line in str(value or "").splitlines():
+        stripped = line.strip()
+        if line.startswith("## Character: "):
+            if trust_profile_header and "(Profile ID: " in line:
+                profile_id = line.rsplit("(Profile ID: ", 1)[1].rstrip(")").strip()
+                if profile_id:
+                    profile_ids.append(profile_id)
+            continue
+        if stripped.startswith("### "):
+            trust_profile_header = False
+            continue
+        if stripped == "---":
+            trust_profile_header = True
+            continue
+    return profile_ids
+
+
 def _validate_savana_evolution_results(report_text: str, results) -> None:
     policy = _extract_savana_guarded_policy(report_text)
     if policy is None:
+        if _savana_header_is_malformed(report_text):
+            raise RuntimeError("guarded Savana report header is malformed")
         return
-    expected_profile_ids = _extract_savana_profile_ids(report_text)
+    expected_profile_ids = _extract_savana_expected_profile_ids(report_text)
     if not expected_profile_ids:
         raise RuntimeError("guarded Savana report is missing profile sections")
     issues = []
@@ -335,17 +373,6 @@ def _select_savana_evolution_skills(job: dict, skills, script_output: str):
     return skills
 
 
-def _extract_savana_profile_ids(value: str) -> List[str]:
-    profile_ids = []
-    for line in str(value or "").splitlines():
-        if not line.startswith("## Character: ") or "(Profile ID: " not in line:
-            continue
-        profile_id = line.rsplit("(Profile ID: ", 1)[1].rstrip(")").strip()
-        if profile_id:
-            profile_ids.append(profile_id)
-    return profile_ids
-
-
 def _apply_savana_evolution_output(
     job: dict,
     report_text: str,
@@ -354,25 +381,30 @@ def _apply_savana_evolution_output(
     hermes_home: Path,
 ):
     policy = _extract_savana_guarded_policy(report_text)
+    if policy is None:
+        if _savana_header_is_malformed(report_text):
+            raise RuntimeError("guarded Savana report header is malformed")
+        return []
     if not (_is_savana_evolution_job(job) and policy):
         return []
     from hermes_cli.savana_evolution_guard import apply_guarded_results
+    expected_profile_ids = _extract_savana_expected_profile_ids(report_text)
 
     if policy == "guarded_v2":
-        results = apply_guarded_results(hermes_home, final_response, model, policy=policy)
+        results = apply_guarded_results(
+            hermes_home,
+            final_response,
+            model,
+            policy=policy,
+            expected_profile_ids=expected_profile_ids,
+        )
     else:
-        results = apply_guarded_results(hermes_home, final_response, model)
-    expected_profile_ids = _extract_savana_profile_ids(report_text)
-    observed_profile_ids = {
-        result.get("profile_id") for result in results if result.get("profile_id")
-    }
-    for profile_id in expected_profile_ids:
-        if profile_id not in observed_profile_ids:
-            results.append({
-                "profile_id": profile_id,
-                "status": "invalid",
-                "error": "missing structured result",
-            })
+        results = apply_guarded_results(
+            hermes_home,
+            final_response,
+            model,
+            expected_profile_ids=expected_profile_ids,
+        )
     counts = {}
     for result in results:
         status = result.get("status", "invalid")

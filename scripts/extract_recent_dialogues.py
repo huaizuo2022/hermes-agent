@@ -16,6 +16,7 @@ import re
 import sqlite3
 import sys
 import time
+from difflib import SequenceMatcher
 from datetime import datetime
 
 from hermes_cli.companion_profile_policy import (
@@ -432,6 +433,12 @@ def batch_profiles(hermes_home, manifest):
             "messages": messages,
         })
     result.sort(key=profile_sort_key)
+    if expected_policy in (GUARDED_POLICY, GUARDED_V2_POLICY) and len(result) != len(batch_ids):
+        live_ids = set(item["profile_id"] for item in result)
+        missing_ids = [profile_id for profile_id in batch_ids if profile_id not in live_ids]
+        raise RuntimeError(
+            "live profiles missing from guarded batch: " + ", ".join(missing_ids)
+        )
     return result
 
 
@@ -503,10 +510,16 @@ def _summary_leaks_raw(summary, raw_text):
     normalized_raw = _normalize_summary_text(raw_text)
     if len(normalized_summary) < 8 or len(normalized_raw) < 8:
         return False
-    return (
-        normalized_raw in normalized_summary
-        or normalized_summary in normalized_raw
+    if normalized_raw in normalized_summary or normalized_summary in normalized_raw:
+        return True
+    match = SequenceMatcher(None, normalized_summary, normalized_raw).find_longest_match(
+        0,
+        len(normalized_summary),
+        0,
+        len(normalized_raw),
     )
+    leaked = normalized_summary[match.a:match.a + match.size].strip()
+    return len(leaked) >= 8
 
 
 def _print_guarded_v2_dialogue(chat):
@@ -639,7 +652,11 @@ def main():
         print("\nNo pending Savana evolution batches remain for the review date.")
         return
 
-    profiles = batch_profiles(hermes_home, manifest)
+    try:
+        profiles = batch_profiles(hermes_home, manifest)
+    except RuntimeError as exc:
+        sys.stderr.write(str(exc) + "\n")
+        raise
     if not profiles:
         print("# Savana Characters Evolution Report")
         print("Generated at: {}\n".format(now_dt.strftime("%Y-%m-%d %H:%M:%S")))

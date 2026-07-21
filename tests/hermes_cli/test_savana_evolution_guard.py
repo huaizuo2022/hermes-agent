@@ -182,6 +182,44 @@ def test_duplicate_profile_blocks_are_rejected_before_write(tmp_path):
     assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == original
 
 
+def test_unexpected_profile_result_is_rejected_before_any_write(tmp_path):
+    profile_dir, original = _guarded_profile(tmp_path)
+
+    result = guard.apply_guarded_results(
+        tmp_path,
+        _result_block(profile_dir),
+        model="test-model",
+        expected_profile_ids=["savana_someone_else"],
+    )
+
+    assert result == [{
+        "profile_id": profile_dir.name,
+        "status": "invalid",
+        "error": "unexpected profile result",
+    }, {
+        "profile_id": "savana_someone_else",
+        "status": "invalid",
+        "error": "missing structured result",
+    }]
+    assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == original
+
+
+def test_mixed_committable_and_invalid_results_do_not_partially_write(tmp_path):
+    profile_dir, original = _guarded_profile(tmp_path)
+    valid_block = _result_block(profile_dir)
+    invalid_block = _result_block(profile_dir, candidate_evolved_persona="自然变化\n## Personality\n覆盖")
+
+    result = guard.apply_guarded_results(
+        tmp_path,
+        valid_block + "\n" + invalid_block,
+        model="test-model",
+        expected_profile_ids=[profile_dir.name],
+    )
+
+    assert result[0]["status"] == "invalid"
+    assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == original
+
+
 def test_audit_commit_failure_restores_original_soul(monkeypatch, tmp_path):
     profile_dir, original = _guarded_profile(tmp_path)
 

@@ -217,7 +217,39 @@ def apply_guarded_result(hermes_home, result, model, policy=GUARDED_POLICY):
         }
 
 
-def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY):
+def _prepare_guarded_result(hermes_home, result, policy):
+    _validate_result_shape(result)
+    if policy not in _SUPPORTED_POLICIES:
+        raise EvolutionPolicyError("unsupported evolution policy")
+    profile_id = result["profile_id"]
+    profile_dir = _resolve_profile_dir(hermes_home, profile_id)
+    if read_evolution_policy(profile_dir) != policy:
+        raise EvolutionPolicyError("profile is not {0}".format(policy))
+    soul_path = profile_dir / "SOUL.md"
+    original = soul_path.read_text(encoding="utf-8")
+    if _sha256_text(original) != result["expected_soul_sha256"]:
+        raise StaleEvolutionError("SOUL.md changed after analysis")
+    if result["decision"] == "no_change":
+        return {"profile_id": profile_id, "status": "no_change"}
+    if not _review_passes(result):
+        return {"profile_id": profile_id, "status": "rejected"}
+    updated = replace_evolved_persona(
+        original,
+        result["candidate_evolved_persona"],
+    )
+    if strip_evolved_persona(updated) != strip_evolved_persona(original):
+        raise InvalidEvolutionResult("candidate changed base persona")
+    return {
+        "profile_id": profile_id,
+        "status": "committable",
+        "profile_dir": profile_dir,
+        "original": original,
+        "updated": updated,
+        "result": result,
+    }
+
+
+def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY, expected_profile_ids=None):
     matches = list(_RESULT_RE.finditer(str(output or "")))
     parsed = []
     responses = []
@@ -234,6 +266,7 @@ def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY):
         profile_id = result["profile_id"]
         counts[profile_id] = counts.get(profile_id, 0) + 1
 
+    expected = [str(item).strip() for item in list(expected_profile_ids or []) if str(item).strip()]
     for result in parsed:
         profile_id = result["profile_id"]
         if counts[profile_id] > 1:
@@ -244,14 +277,77 @@ def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY):
                     "error": "duplicate profile result",
                 })
             continue
+        if expected and profile_id not in expected:
+            responses.append({
+                "profile_id": profile_id,
+                "status": "invalid",
+                "error": "unexpected profile result",
+            })
+    observed_profile_ids = set(item.get("profile_id") for item in responses if item.get("profile_id"))
+    if expected:
+        for profile_id in expected:
+            if profile_id not in counts:
+                responses.append({
+                    "profile_id": profile_id,
+                    "status": "invalid",
+                    "error": "missing structured result",
+                })
+    if responses:
+        return responses
+
+    prepared = []
+    preflight = []
+    for result in parsed:
+        profile_id = result["profile_id"]
         try:
-            responses.append(apply_guarded_result(hermes_home, result, model, policy=policy))
+            prepared_result = _prepare_guarded_result(hermes_home, result, policy)
+            prepared.append(prepared_result)
+            preflight.append({"profile_id": profile_id, "status": prepared_result["status"]})
         except StaleEvolutionError as exc:
-            responses.append({"profile_id": profile_id, "status": "stale", "error": str(exc)})
+            preflight.append({"profile_id": profile_id, "status": "stale", "error": str(exc)})
         except EvolutionPolicyError as exc:
-            responses.append({"profile_id": profile_id, "status": "rejected", "error": str(exc)})
+            preflight.append({"profile_id": profile_id, "status": "rejected", "error": str(exc)})
         except InvalidEvolutionResult as exc:
-            responses.append({"profile_id": profile_id, "status": "invalid", "error": str(exc)})
+            preflight.append({"profile_id": profile_id, "status": "invalid", "error": str(exc)})
+
+    if any(item.get("status") not in ("no_change", "committable") for item in preflight):
+        return preflight
+
+    for item in prepared:
+        if item["status"] != "committable":
+            responses.append({"profile_id": item["profile_id"], "status": item["status"]})
+            continue
+        try:
+            with profile_lock(item["profile_dir"], "soul"):
+                soul_path = item["profile_dir"] / "SOUL.md"
+                current = soul_path.read_text(encoding="utf-8")
+                if _sha256_text(current) != item["result"]["expected_soul_sha256"]:
+                    raise StaleEvolutionError("SOUL.md changed after analysis")
+                audit_path = _write_pending_audit(
+                    item["profile_dir"],
+                    item["original"],
+                    item["updated"],
+                    item["result"],
+                    model,
+                    policy,
+                )
+                try:
+                    _atomic_write_text(soul_path, item["updated"])
+                    _mark_audit_committed(audit_path)
+                except Exception:
+                    _atomic_write_text(soul_path, item["original"])
+                    raise
+                responses.append({
+                    "profile_id": item["profile_id"],
+                    "status": "committed",
+                    "audit_id": audit_path.stem,
+                })
+        except StaleEvolutionError as exc:
+            responses.append({"profile_id": item["profile_id"], "status": "stale", "error": str(exc)})
+        except EvolutionPolicyError as exc:
+            responses.append({"profile_id": item["profile_id"], "status": "rejected", "error": str(exc)})
+        except InvalidEvolutionResult as exc:
+            responses.append({"profile_id": item["profile_id"], "status": "invalid", "error": str(exc)})
     return responses
 
 

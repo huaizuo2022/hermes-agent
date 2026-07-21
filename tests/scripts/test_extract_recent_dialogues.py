@@ -566,3 +566,103 @@ def test_guarded_batch_policy_drift_raises_before_wrong_header(monkeypatch, tmp_
 
     with pytest.raises(RuntimeError):
         module.main()
+
+
+def test_guarded_batch_missing_live_profile_fails_closed(monkeypatch, tmp_path, capsys):
+    module = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("SAVANA_EVOLUTION_TARGET_DATE", "2026-06-15")
+    monkeypatch.setenv("SAVANA_EVOLUTION_SOURCE_DATE", "2026-06-14")
+    monkeypatch.setenv("SAVANA_EVOLUTION_BATCH_SIZE", "10")
+    _write_profile(
+        tmp_path,
+        "savana_guarded_v2_live",
+        "在线角色",
+        3,
+        [
+            {"id": 1, "role": "user", "content": "昨晚你是不是在吃醋？", "timestamp": 1781402400, "platform_message_id": "turn-live"},
+            {"id": 2, "role": "assistant", "content": "我会把占有欲说得更直白。", "timestamp": 1781402460},
+        ],
+        policy="guarded_v2",
+    )
+    missing_profile = _write_profile(
+        tmp_path,
+        "savana_guarded_v2_missing",
+        "缺失角色",
+        3,
+        [
+            {"id": 11, "role": "user", "content": "今晚陪我。", "timestamp": 1781402520, "platform_message_id": "turn-missing"},
+            {"id": 12, "role": "assistant", "content": "先闭眼，我会一直陪着你。", "timestamp": 1781402580},
+        ],
+        policy="guarded_v2",
+    )
+    manifest = _read_manifest(tmp_path, "2026-06-14") if (tmp_path / "cron" / "state" / "savana-self-evolution" / "2026-06-14.json").exists() else None
+    if manifest is None:
+        module.main()
+        capsys.readouterr()
+    (missing_profile / "state.db").unlink()
+
+    with pytest.raises(RuntimeError):
+        module.main()
+
+    captured = capsys.readouterr()
+    assert "live profiles missing from guarded batch" in captured.err
+
+
+def test_guarded_v2_summary_long_substring_leak_falls_back_to_unavailable(monkeypatch, tmp_path, capsys):
+    module = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("SAVANA_EVOLUTION_TARGET_DATE", "2026-06-15")
+    monkeypatch.setenv("SAVANA_EVOLUTION_SOURCE_DATE", "2026-06-14")
+    profile_dir = _write_profile(
+        tmp_path,
+        "savana_guarded_v2_character",
+        "二代角色",
+        3,
+        [
+            {"id": 1, "role": "user", "content": "昨晚你是不是在吃醋？", "timestamp": 1781402400, "platform_message_id": "turn-lcs"},
+            {"id": 2, "role": "assistant", "content": "我会在你靠近时更直白地承认自己的占有欲。", "timestamp": 1781402460},
+        ],
+        policy="guarded_v2",
+    )
+    _write_raw_turn_review_db(
+        profile_dir,
+        [
+            ("turn-lcs", assistant_sha256("我会在你靠近时更直白地承认自己的占有欲。"), "drift", "摘要：更直白地承认自己的占有欲，但保持克制。"),
+        ],
+    )
+
+    module.main()
+    output = capsys.readouterr().out
+
+    assert "[context_only] ASSISTANT SUMMARY:" not in output
+    assert "[context_only] ASSISTANT: [review unavailable]" in output
+
+
+def test_guarded_v2_summary_short_overlap_is_allowed(monkeypatch, tmp_path, capsys):
+    module = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("SAVANA_EVOLUTION_TARGET_DATE", "2026-06-15")
+    monkeypatch.setenv("SAVANA_EVOLUTION_SOURCE_DATE", "2026-06-14")
+    profile_dir = _write_profile(
+        tmp_path,
+        "savana_guarded_v2_character",
+        "二代角色",
+        3,
+        [
+            {"id": 1, "role": "user", "content": "昨晚你是不是在吃醋？", "timestamp": 1781402400, "platform_message_id": "turn-short"},
+            {"id": 2, "role": "assistant", "content": "沈越会抱紧你。", "timestamp": 1781402460},
+        ],
+        policy="guarded_v2",
+    )
+    _write_raw_turn_review_db(
+        profile_dir,
+        [
+            ("turn-short", assistant_sha256("沈越会抱紧你。"), "drift", "沈越更主动安抚你。"),
+        ],
+    )
+
+    module.main()
+    output = capsys.readouterr().out
+
+    assert "[context_only] ASSISTANT SUMMARY: 沈越更主动安抚你。" in output
