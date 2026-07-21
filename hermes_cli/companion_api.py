@@ -1226,26 +1226,11 @@ async def update_message_endpoint(session_id: str, message_id: str, req: Message
         db_path = Path(profile_dir) / "state.db"
         session_db = SessionDB(db_path=db_path)
 
-        updated = False
-        if hasattr(session_db, "update_message_content"):
-            updated = session_db.update_message_content(
-                session_id=session_id,
-                platform_message_id=message_id,
-                content=req.content
-            )
-        else:
-            conn = session_db._conn
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                UPDATE messages
-                   SET content = ?
-                 WHERE session_id = ? AND platform_message_id = ?
-                """,
-                (req.content, session_id, message_id),
-            )
-            conn.commit()
-            updated = cursor.rowcount > 0
+        updated = session_db.update_message_content(
+            session_id=session_id,
+            platform_message_id=message_id,
+            content=req.content
+        )
         
         if not updated:
             raise HTTPException(status_code=404, detail="Message not found in local db")
