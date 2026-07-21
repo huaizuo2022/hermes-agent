@@ -12,6 +12,7 @@ Business rule:
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -23,7 +24,7 @@ from hermes_cli.companion_profile_policy import (
     LEGACY_POLICY,
     read_evolution_policy,
 )
-from hermes_cli.companion_turn_guard import TurnReviewStore, assistant_sha256
+from hermes_cli.companion_turn_guard import assistant_sha256
 
 DEFAULT_BATCH_SIZE = 10
 DEFAULT_MESSAGE_LIMIT = 30
@@ -180,7 +181,7 @@ def strip_invisible_chars(text):
 def dedupe_messages(rows):
     messages = []
     last_msg = None
-    for message_id, role, content, timestamp in rows:
+    for platform_message_id, role, content, timestamp in rows:
         cleaned_content = strip_invisible_chars(content)
         if (
             last_msg
@@ -190,7 +191,7 @@ def dedupe_messages(rows):
         ):
             continue
         msg_obj = {
-            "message_id": "" if message_id is None else str(message_id),
+            "message_id": "" if platform_message_id is None else str(platform_message_id),
             "role": role,
             "content": cleaned_content,
             "timestamp": timestamp,
@@ -209,7 +210,7 @@ def get_messages_for_window(db_path, window_start, window_end, limit):
         cursor = conn.cursor()
         cursor.execute(
             """
-                SELECT id, role, content, timestamp
+                SELECT platform_message_id, role, content, timestamp
                 FROM messages
                 WHERE role IN ('user', 'assistant')
                   AND timestamp >= ?
@@ -378,10 +379,19 @@ def eligible_profiles_for_batch(hermes_home, manifest):
     return profile_map
 
 
+def current_batch_policy(manifest):
+    cursor = manifest.get("cursor", 0)
+    batch_policies = manifest.get("batch_policies", [])
+    if cursor < 0 or cursor >= len(batch_policies):
+        return LEGACY_POLICY
+    return batch_policies[cursor]
+
+
 def batch_profiles(hermes_home, manifest):
     if manifest_complete(manifest):
         return []
     batch_ids = manifest["batches"][manifest["cursor"]]
+    expected_policy = current_batch_policy(manifest)
     start_ts, end_ts = business_day_bounds(manifest["source_date"])
     profile_map = eligible_profiles_for_batch(hermes_home, manifest)
     result = []
@@ -399,6 +409,15 @@ def batch_profiles(hermes_home, manifest):
         if not messages:
             continue
         last_active = messages[-1]["timestamp"]
+        current_policy = read_evolution_policy(profile_path)
+        if current_policy != expected_policy:
+            raise RuntimeError(
+                "batch policy drift for {0}: expected {1}, got {2}".format(
+                    profile_id,
+                    expected_policy,
+                    current_policy,
+                )
+            )
         result.append({
             "profile_id": profile_id,
             "profile_path": profile_path,
@@ -406,7 +425,7 @@ def batch_profiles(hermes_home, manifest):
             "soul_path": soul_path,
             "intimacy": parse_intimacy_score(soul_path),
             "evolved_persona": extract_evolved_persona(soul_path),
-            "evolution_policy": read_evolution_policy(profile_path),
+            "evolution_policy": current_policy,
             "base_soul": extract_base_soul(soul_path),
             "soul_sha256": soul_sha256(soul_path),
             "last_active": last_active,
@@ -429,26 +448,70 @@ def format_message_content(content):
     return content
 
 
+_QUALITY_CORRECTION_PATTERNS = (
+    re.compile(r"你.{0,6}说话.{0,4}(太)?机械"),
+    re.compile(r"你.{0,6}像程序"),
+    re.compile(r"(?:\bOOC\b|ooc).{0,4}出戏|出戏.{0,4}(?:\bOOC\b|ooc)"),
+    re.compile(r"你.{0,6}(?:出戏|ooc)"),
+    re.compile(r"不许把我叫成访客"),
+)
+
+
 def _is_quality_correction_message(content):
-    lowered = str(content or "").lower()
-    markers = (
-        "ooc",
-        "出戏",
-        "系统提示词",
-        "提示词",
-        "机械",
-        "像客服",
-        "访客",
-        "别总",
-        "不要再",
-        "不许把我",
+    text = str(content or "")
+    for pattern in _QUALITY_CORRECTION_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
+
+
+def _load_turn_reviews(profile_path):
+    db_path = os.path.join(profile_path, "companion_guard.db")
+    if not os.path.exists(db_path):
+        return None
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+                SELECT turn_id, assistant_sha256, status, continuity_summary
+                FROM turn_reviews
+            """
+        )
+        reviews = {}
+        for turn_id, assistant_hash, status, continuity_summary in cursor.fetchall():
+            reviews[str(turn_id or "")] = {
+                "assistant_sha256": str(assistant_hash or ""),
+                "status": str(status or ""),
+                "continuity_summary": str(continuity_summary or ""),
+            }
+        return reviews
+    except Exception:
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def _normalize_summary_text(value):
+    return " ".join(str(value or "").split())
+
+
+def _summary_leaks_raw(summary, raw_text):
+    normalized_summary = _normalize_summary_text(summary)
+    normalized_raw = _normalize_summary_text(raw_text)
+    if len(normalized_summary) < 8 or len(normalized_raw) < 8:
+        return False
+    return (
+        normalized_raw in normalized_summary
+        or normalized_summary in normalized_raw
     )
-    return any(marker in lowered for marker in markers)
 
 
 def _print_guarded_v2_dialogue(chat):
     print("\n### Dialogue History\n")
-    store = TurnReviewStore(chat["profile_path"])
+    reviews = _load_turn_reviews(chat["profile_path"])
     previous_user = None
     for message in chat["messages"]:
         if message["role"] == "user":
@@ -463,7 +526,7 @@ def _print_guarded_v2_dialogue(chat):
         if message["role"] != "assistant":
             continue
         turn_id = str((previous_user or {}).get("message_id") or "")
-        record = store.get(turn_id) if turn_id else None
+        record = reviews.get(turn_id) if reviews and turn_id else None
         if (
             not record
             or record.get("status") in ("pending", "invalid")
@@ -473,6 +536,10 @@ def _print_guarded_v2_dialogue(chat):
             print("")
             continue
         if record.get("status") == "drift":
+            if _summary_leaks_raw(record.get("continuity_summary"), message.get("content")):
+                print("[context_only] ASSISTANT: [review unavailable]")
+                print("")
+                continue
             print("[context_only] ASSISTANT SUMMARY: {0}".format(
                 record.get("continuity_summary") or "[review unavailable]"
             ))
@@ -581,7 +648,7 @@ def main():
         print("\nCurrent batch resolved to zero live profiles. Advance cursor manually if needed.")
         return
 
-    batch_policy = profiles[0].get("evolution_policy", LEGACY_POLICY)
+    batch_policy = current_batch_policy(manifest)
     print_manifest_header(now_dt, manifest, len(profiles), batch_policy)
     for chat in profiles:
         print_profile_section(chat, now_ts)

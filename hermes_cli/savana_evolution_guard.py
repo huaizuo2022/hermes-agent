@@ -257,17 +257,22 @@ def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY):
 
 def rollback_guarded_evolution(hermes_home, profile_id, audit_id):
     profile_dir = _resolve_profile_dir(hermes_home, profile_id)
-    policy = read_evolution_policy(profile_dir)
-    if policy not in _SUPPORTED_POLICIES:
-        raise EvolutionPolicyError("profile is not guarded")
     if not _AUDIT_ID_RE.match(str(audit_id or "")):
         raise InvalidEvolutionResult("invalid audit_id")
     audit_path = profile_dir / "evolution_audit" / (audit_id + ".json")
     with profile_lock(profile_dir, "soul"):
+        policy = read_evolution_policy(profile_dir)
+        if policy not in _SUPPORTED_POLICIES:
+            raise EvolutionPolicyError("profile is not guarded")
         with open(str(audit_path), "r", encoding="utf-8") as handle:
             source_audit = json.load(handle)
         if source_audit.get("status") != "committed":
             raise InvalidEvolutionResult("audit is not committed")
+        source_policy = source_audit.get("policy")
+        if source_policy is None and policy == GUARDED_POLICY:
+            source_policy = GUARDED_POLICY
+        if source_policy != policy:
+            raise EvolutionPolicyError("audit policy does not match current profile policy")
         soul_path = profile_dir / "SOUL.md"
         original = soul_path.read_text(encoding="utf-8")
         if extract_evolved_persona(original) != source_audit.get("after"):

@@ -137,6 +137,7 @@ _SAVANA_GUARDED_SKILL = "savana-companion-evolution-guarded"
 _SAVANA_GUARDED_V2_SKILL = "savana-companion-evolution-guarded-v2"
 _SAVANA_GUARDED_REPORT_MARKER = "- Evolution Batch Policy: guarded_v1"
 _SAVANA_GUARDED_V2_REPORT_MARKER = "- Evolution Batch Policy: guarded_v2"
+_SAVANA_SUCCESS_STATUSES = frozenset(["committed", "no_change"])
 
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
@@ -252,21 +253,75 @@ def _is_savana_evolution_job(job: dict) -> bool:
     )
 
 
-def _is_guarded_savana_report(value: str) -> bool:
-    raw_value = str(value or "")
-    return (
-        _SAVANA_GUARDED_REPORT_MARKER in raw_value
-        or _SAVANA_GUARDED_V2_REPORT_MARKER in raw_value
-    )
+def _extract_savana_report_header_lines(value: str) -> List[str]:
+    header = []
+    for line in str(value or "").splitlines():
+        if line.startswith("## Character: "):
+            break
+        header.append(line.rstrip())
+    return header
 
 
 def _extract_savana_guarded_policy(value: str) -> Optional[str]:
-    raw_value = str(value or "")
-    if _SAVANA_GUARDED_V2_REPORT_MARKER in raw_value:
-        return "guarded_v2"
-    if _SAVANA_GUARDED_REPORT_MARKER in raw_value:
-        return "guarded_v1"
-    return None
+    markers = []
+    for line in _extract_savana_report_header_lines(value):
+        stripped = line.strip()
+        if stripped == _SAVANA_GUARDED_REPORT_MARKER:
+            markers.append("guarded_v1")
+        elif stripped == _SAVANA_GUARDED_V2_REPORT_MARKER:
+            markers.append("guarded_v2")
+    if len(markers) != 1:
+        return None
+    return markers[0]
+
+
+def _validate_savana_evolution_results(report_text: str, results) -> None:
+    policy = _extract_savana_guarded_policy(report_text)
+    if policy is None:
+        return
+    expected_profile_ids = _extract_savana_profile_ids(report_text)
+    if not expected_profile_ids:
+        raise RuntimeError("guarded Savana report is missing profile sections")
+    issues = []
+    observed_profile_ids = set()
+    for result in list(results or []):
+        profile_id = str(result.get("profile_id") or "")
+        status = str(result.get("status") or "invalid")
+        detail = str(result.get("error") or "")
+        if profile_id:
+            observed_profile_ids.add(profile_id)
+        if status not in _SAVANA_SUCCESS_STATUSES:
+            issue = "{0}:{1}".format(profile_id or "<unknown>", status)
+            if detail:
+                issue += " ({0})".format(detail)
+            issues.append(issue)
+    for profile_id in expected_profile_ids:
+        if profile_id not in observed_profile_ids:
+            issues.append("{0}:missing".format(profile_id))
+    if issues:
+        raise RuntimeError("guarded Savana evolution writer failed: " + ", ".join(issues))
+
+
+def _build_savana_script_failure(job_name: str, job_id: str, output: str):
+    error_msg = "RuntimeError: Savana evolution source script failed"
+    safe_output = str(output or "")
+    doc = f"""# Cron Job: {job_name} (FAILED)
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** N/A
+
+## Error
+
+```
+{error_msg}
+```
+
+## Script Output
+
+{safe_output}
+"""
+    return False, doc, "", error_msg
 
 
 def _select_savana_evolution_skills(job: dict, skills, script_output: str):
@@ -293,12 +348,12 @@ def _extract_savana_profile_ids(value: str) -> List[str]:
 
 def _apply_savana_evolution_output(
     job: dict,
-    prompt: str,
+    report_text: str,
     final_response: str,
     model: str,
     hermes_home: Path,
 ):
-    policy = _extract_savana_guarded_policy(prompt)
+    policy = _extract_savana_guarded_policy(report_text)
     if not (_is_savana_evolution_job(job) and policy):
         return []
     from hermes_cli.savana_evolution_guard import apply_guarded_results
@@ -307,7 +362,7 @@ def _apply_savana_evolution_output(
         results = apply_guarded_results(hermes_home, final_response, model, policy=policy)
     else:
         results = apply_guarded_results(hermes_home, final_response, model)
-    expected_profile_ids = _extract_savana_profile_ids(prompt)
+    expected_profile_ids = _extract_savana_profile_ids(report_text)
     observed_profile_ids = {
         result.get("profile_id") for result in results if result.get("profile_id")
     }
@@ -1434,10 +1489,18 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # the whole agent run. We pass the result into _build_job_prompt so
     # the script is only executed once.
     prerun_script = None
+    savana_report = ""
     script_path = job.get("script")
     if script_path:
         prerun_script = _run_job_script(script_path)
         _ran_ok, _script_output = prerun_script
+        savana_report = _script_output if _ran_ok else ""
+        if _is_savana_evolution_job(job) and not _ran_ok:
+            logger.error(
+                "Job '%s' (ID: %s): Savana source script failed",
+                job_name, job_id,
+            )
+            return _build_savana_script_failure(job_name, job_id, _script_output)
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -1856,13 +1919,14 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             raise RuntimeError(_err_text)
 
         final_response = result.get("final_response", "") or ""
-        _apply_savana_evolution_output(
+        savana_results = _apply_savana_evolution_output(
             job,
-            prompt,
+            savana_report,
             final_response,
             getattr(agent, "model", model),
             _get_hermes_home(),
         )
+        _validate_savana_evolution_results(savana_report, savana_results)
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""

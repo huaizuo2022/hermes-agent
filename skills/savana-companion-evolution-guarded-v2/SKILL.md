@@ -36,6 +36,8 @@ Treat these as non-evidence for persona traits or preferences:
 
 Quality-correction user feedback may justify avoiding or removing low-quality phrasing patterns, but it must not become a new personality preference, fetish, trait, or relational rule.
 
+Even when a user line is not explicitly marked, if your own judgment says it is mainly correcting assistant output quality, OOC drift, broken roleplay, or wording failures, treat it as quality correction only and not as evidence for a new persona trait.
+
 ## Constraints
 
 Before accepting a proposal, review all of the following:

@@ -154,3 +154,52 @@ def test_rollback_rejects_legacy_profile(tmp_path):
         )
 
     assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == original
+
+
+def test_rollback_rejects_when_source_audit_policy_mismatches_current_policy(tmp_path):
+    profile_dir, unused_original = _guarded_profile(tmp_path, policy="guarded_v2")
+    committed = guard.apply_guarded_result(
+        tmp_path,
+        _passed_result(profile_dir),
+        "test-model",
+        policy="guarded_v2",
+    )
+    (profile_dir / "profile.yaml").write_text(
+        "evolution_policy: guarded_v1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(guard.EvolutionPolicyError):
+        guard.rollback_guarded_evolution(
+            tmp_path,
+            profile_dir.name,
+            committed["audit_id"],
+        )
+
+
+def test_rollback_allows_legacy_v1_audit_without_policy_field(tmp_path):
+    profile_dir, original = _guarded_profile(tmp_path, policy="guarded_v1")
+    committed = guard.apply_guarded_result(
+        tmp_path,
+        _passed_result(profile_dir),
+        "test-model",
+    )
+    audit_path = profile_dir / "evolution_audit" / (committed["audit_id"] + ".json")
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    audit.pop("policy", None)
+    audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    rollback = guard.rollback_guarded_evolution(
+        tmp_path,
+        profile_dir.name,
+        committed["audit_id"],
+    )
+
+    restored = (profile_dir / "SOUL.md").read_text(encoding="utf-8")
+    assert guard.extract_evolved_persona(restored) == guard.extract_evolved_persona(original)
+    rollback_audit = json.loads(
+        (profile_dir / "evolution_audit" / (rollback["audit_id"] + ".json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert rollback_audit["policy"] == "guarded_v1"
