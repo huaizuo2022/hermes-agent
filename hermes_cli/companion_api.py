@@ -406,6 +406,28 @@ def _start_background_thread(target) -> threading.Thread:
     return worker
 
 
+async def _acquire_session_lock_cancellation_safe(session_lock: threading.Lock) -> None:
+    loop = asyncio.get_running_loop()
+    acquire_future = loop.run_in_executor(None, session_lock.acquire)
+
+    def _release_if_acquired(future) -> None:
+        try:
+            acquired = bool(future.result())
+        except Exception:
+            return
+        if acquired:
+            session_lock.release()
+
+    try:
+        await asyncio.shield(acquire_future)
+    except asyncio.CancelledError:
+        if acquire_future.done():
+            _release_if_acquired(acquire_future)
+        else:
+            acquire_future.add_done_callback(_release_if_acquired)
+        raise
+
+
 def _build_style_guard_system_prompt(
     soul_text: str,
     memory_text: str,
@@ -995,7 +1017,7 @@ async def chat_endpoint(req: ChatRequest):
     session_lock = None
     if style_guard_enabled:
         session_lock = _get_session_lock(session_id)
-        await asyncio.get_running_loop().run_in_executor(None, session_lock.acquire)
+        await _acquire_session_lock_cancellation_safe(session_lock)
     session_lock_released = False
     stream_lock_owned_by_generator = False
     
@@ -1218,7 +1240,7 @@ async def chat_endpoint(req: ChatRequest):
                             break
                 finally:
                     final_marker_consumed.set()
-                    producer_done.wait(5.0)
+                    producer_done.wait()
                     if session_lock is not None and not session_lock_released:
                         session_lock.release()
                         session_lock_released = True

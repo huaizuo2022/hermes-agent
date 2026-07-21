@@ -121,6 +121,31 @@ class CountingLock:
         self._lock.release()
 
 
+class ObservableCountingLock:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.acquire_count = 0
+        self.release_count = 0
+        self.acquire_started = threading.Event()
+        self.acquire_completed = threading.Event()
+        self.release_observed = threading.Event()
+
+    def hold_for_test(self):
+        self._lock.acquire()
+
+    def acquire(self):
+        self.acquire_count += 1
+        self.acquire_started.set()
+        self._lock.acquire()
+        self.acquire_completed.set()
+        return True
+
+    def release(self):
+        self.release_count += 1
+        self.release_observed.set()
+        self._lock.release()
+
+
 def test_legacy_profile_keeps_memory_tools_and_directives_without_sidecar(monkeypatch, tmp_path):
     profile_dir = tmp_path / "legacy-profile"
     profile_dir.mkdir()
@@ -1118,3 +1143,167 @@ async def test_style_guard_stream_lock_wait_does_not_block_event_loop(monkeypatc
     assert result4[0] == 200
     stop_heartbeat.set()
     await hb_task
+
+
+@pytest.mark.asyncio
+async def test_style_guard_cancelled_lock_wait_releases_orphan_acquire(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "cancelled-lock-wait-profile"
+    ensure_companion_profile(profile_dir)
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+    lock = ObservableCountingLock()
+    lock.hold_for_test()
+    monkeypatch.setattr("hermes_cli.companion_api._get_session_lock", lambda _sid: lock)
+    _install_fake_agent(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.review_turn",
+        lambda **kwargs: {
+            "turn_id": kwargs["turn_id"],
+            "review_status": "clean",
+            "memory_status": "none",
+            "memory_modifications": [],
+        },
+    )
+
+    async def post_message(message_id):
+        payload = _payload(message_id, "第一句", stream=False)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            return await client.post("/companion/v1/chat", json=payload)
+
+    waiting_task = asyncio.create_task(post_message("msg-1"))
+    assert await asyncio.to_thread(lock.acquire_started.wait, 1.0)
+
+    waiting_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(waiting_task, 1.0)
+
+    lock.release()
+    assert await asyncio.to_thread(lock.acquire_completed.wait, 1.0)
+    await asyncio.sleep(0.1)
+    assert lock.acquire_count == 1
+    assert lock.release_count == 2
+
+    follow_up = await asyncio.wait_for(post_message("msg-2"), 2.0)
+    assert follow_up.status_code == 200
+    assert lock.acquire_count == 2
+    assert lock.release_count == 3
+
+
+def test_style_guard_disconnect_keeps_lock_until_slow_producer_finishes(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "slow-producer-disconnect-profile"
+    ensure_companion_profile(profile_dir)
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+    lock = ObservableCountingLock()
+    monkeypatch.setattr("hermes_cli.companion_api._get_session_lock", lambda _sid: lock)
+    producer_may_finish = threading.Event()
+    first_producer_entered = threading.Event()
+    second_producer_entered = threading.Event()
+
+    class SlowStreamingAgent:
+        def __init__(self, **kwargs):
+            self.session_db = kwargs["session_db"]
+            self.session_id = kwargs["session_id"]
+            self._memory_store = None
+            self.tools = []
+            self.suppress_status_output = False
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.base_url = kwargs["base_url"]
+
+        def run_conversation(
+            self,
+            user_message,
+            system_message=None,
+            conversation_history=None,
+            task_id=None,
+            stream_callback=None,
+            persist_user_message=None,
+            platform_message_id=None,
+        ):
+            if platform_message_id == "msg-1":
+                first_producer_entered.set()
+            else:
+                second_producer_entered.set()
+            if stream_callback:
+                stream_callback("chunk-a")
+            producer_may_finish.wait(1.0)
+            self.session_db.append_message(
+                session_id=self.session_id,
+                role="user",
+                content=user_message,
+                platform_message_id=platform_message_id,
+            )
+            self.session_db.append_message(
+                session_id=self.session_id,
+                role="assistant",
+                content="reply to {}".format(user_message),
+            )
+            if stream_callback:
+                stream_callback("chunk-b")
+            return {"final_response": "reply to {}".format(user_message)}
+
+    import run_agent
+
+    monkeypatch.setattr(run_agent, "AIAgent", SlowStreamingAgent)
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.review_turn",
+        lambda **kwargs: {
+            "turn_id": kwargs["turn_id"],
+            "review_status": "clean",
+            "memory_status": "none",
+            "memory_modifications": [],
+        },
+    )
+
+    first_finished = threading.Event()
+    second_finished = threading.Event()
+    results = {}
+
+    def first_request():
+        try:
+            with TestClient(app).stream(
+                "POST",
+                "/companion/v1/chat",
+                json=_payload("msg-1", "第一句", stream=True),
+            ) as response:
+                iterator = response.iter_text()
+                first_chunk = next(iterator)
+                results["first_status"] = response.status_code
+                results["first_chunk"] = first_chunk
+        finally:
+            first_finished.set()
+
+    def second_request():
+        try:
+            response = TestClient(app).post(
+                "/companion/v1/chat",
+                json=_payload("msg-2", "第二句", stream=False),
+            )
+            results["second_status"] = response.status_code
+        finally:
+            second_finished.set()
+
+    thread_a = threading.Thread(target=first_request)
+    thread_a.start()
+    assert first_producer_entered.wait(1.0)
+    thread_b = threading.Thread(target=second_request)
+    thread_b.start()
+    time.sleep(0.2)
+
+    assert not second_producer_entered.is_set()
+    assert not second_finished.is_set()
+    assert lock.acquire_count == 2
+    assert lock.release_count == 0
+
+    producer_may_finish.set()
+    assert first_finished.wait(2.0)
+    assert second_finished.wait(2.0)
+    thread_a.join(timeout=2.0)
+    thread_b.join(timeout=2.0)
+
+    assert results["first_status"] == 200
+    assert "event: token" in results["first_chunk"]
+    assert results["second_status"] == 200
+    assert second_producer_entered.is_set()
+    assert lock.acquire_count == 2
+    assert lock.release_count == 2
