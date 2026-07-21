@@ -20,10 +20,18 @@ from hermes_cli.companion_profile_policy import (
     read_conversation_policy,
 )
 from hermes_cli.companion_prompt import build_companion_system_prompt
-from hermes_cli.companion_turn_guard import TurnReviewStore, build_guarded_history, review_turn
+from hermes_cli.companion_turn_guard import (
+    TurnReviewStore,
+    assistant_sha256,
+    build_guarded_history,
+    review_turn,
+)
 
 router = APIRouter(prefix="/companion/v1")
 logger = logging.getLogger(__name__)
+_SESSION_LOCKS = {}
+_SESSION_LOCKS_GUARD = threading.Lock()
+_stream_event_hook = None
 
 class ChatRequest(BaseModel):
     user_id: str
@@ -372,6 +380,112 @@ def _load_companion_history(session_db, session_id: str, current_message_id: str
             continue
         history.append(msg)
     return history
+
+
+def _get_session_lock(session_id: str) -> threading.Lock:
+    with _SESSION_LOCKS_GUARD:
+        lock = _SESSION_LOCKS.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            _SESSION_LOCKS[session_id] = lock
+        return lock
+
+
+def _emit_stream_event(name: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    hook = _stream_event_hook
+    if callable(hook):
+        try:
+            hook(name, payload)
+        except Exception:
+            logger.exception("stream event hook failed for %s", name)
+
+
+def _build_style_guard_system_prompt(
+    soul_text: str,
+    memory_text: str,
+    user_profile_text: str,
+    companion_directives: Optional[str],
+) -> str:
+    prompt = build_companion_system_prompt(
+        soul_text,
+        memory_text,
+        user_profile_text,
+    )
+    directives_text = str(companion_directives or "").strip()
+    if not directives_text:
+        return prompt
+    return (
+        prompt
+        + "\n\n对话指引\n"
+        + directives_text
+    ).strip()
+
+
+def _index_history_turns(raw_history: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    indexed = {}
+    previous_user_turn = None
+    for idx, message in enumerate(list(raw_history or [])):
+        role = (message or {}).get("role")
+        if role == "user":
+            previous_user_turn = {
+                "turn_id": (message or {}).get("message_id"),
+                "user_message": (message or {}).get("content") or "",
+                "assistant_prefix_messages": list(raw_history[:idx]),
+            }
+            continue
+        if role == "assistant" and previous_user_turn and previous_user_turn.get("turn_id"):
+            indexed[previous_user_turn["turn_id"]] = {
+                "turn_id": previous_user_turn["turn_id"],
+                "user_message": previous_user_turn["user_message"],
+                "assistant_text": (message or {}).get("content") or "",
+                "messages": previous_user_turn["assistant_prefix_messages"],
+            }
+            previous_user_turn = None
+            continue
+        if role not in ("tool", "function"):
+            previous_user_turn = None
+    return indexed
+
+
+def _restore_unresolved_reviews(
+    *,
+    profile_dir: str,
+    raw_history: List[Dict[str, Any]],
+    provider: str,
+    model: str,
+    base_url: Optional[str],
+    api_key: Optional[str],
+    memory_store: Any,
+) -> None:
+    turn_store = TurnReviewStore(profile_dir)
+    unresolved = turn_store.list_unresolved()
+    if not unresolved:
+        return
+    indexed_turns = _index_history_turns(raw_history)
+    for item in unresolved:
+        turn_id = str(item.get("turn_id") or "")
+        history_turn = indexed_turns.get(turn_id)
+        if not history_turn:
+            continue
+        assistant_text = history_turn.get("assistant_text") or ""
+        if item.get("assistant_sha256") != assistant_sha256(assistant_text):
+            continue
+        try:
+            review_turn(
+                profile_dir=profile_dir,
+                turn_id=turn_id,
+                assistant_text=assistant_text,
+                user_message=history_turn.get("user_message") or "",
+                messages=history_turn.get("messages") or [],
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                memory_store=memory_store,
+                store=turn_store,
+            )
+        except Exception:
+            logger.exception("Failed to restore unresolved companion turn %s", turn_id)
 
 
 def _fallback_review_metadata(turn_id: str, error: Exception) -> Dict[str, Any]:
@@ -872,6 +986,9 @@ async def chat_endpoint(req: ChatRequest):
     ensure_companion_profile(Path(profile_dir))
     conversation_policy = read_conversation_policy(profile_dir)
     style_guard_enabled = conversation_policy == STYLE_GUARD_V1_POLICY
+    session_lock = _get_session_lock(session_id)
+    session_lock.acquire()
+    session_lock_released = False
     
     # 1. 动态物理隔离 Profile 目录 (使用线程安全的 ContextVar 覆盖)
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
@@ -908,10 +1025,12 @@ async def chat_endpoint(req: ChatRequest):
         base_url = req.api_base or os.environ.get("DEEPSEEK_API_BASE") or "https://api.deepseek.com"
         provider = req.provider or "deepseek"
         model = req.model or "deepseek-v4-flash"
-        effective_directives = req.companion_directives or ""
+        effective_directives = ""
+        diagnostics_directives = req.companion_directives or ""
         enabled_toolsets = []
         if not style_guard_enabled:
             effective_directives = req.directives
+            diagnostics_directives = req.directives
             enabled_toolsets = ["memory"]
 
         # 3. 实例化 AI 代理 (硬编码工具限制为 memory，完全封死危险操作)
@@ -934,10 +1053,21 @@ async def chat_endpoint(req: ChatRequest):
         )
         agent.suppress_status_output = True
         if style_guard_enabled:
-            agent._system_prompt_override = build_companion_system_prompt(
+            _restore_unresolved_reviews(
+                profile_dir=profile_dir,
+                raw_history=raw_history,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                memory_store=getattr(agent, "_memory_store", None),
+            )
+            conversation_history = build_guarded_history(raw_history, TurnReviewStore(profile_dir))
+            agent._system_prompt_override = _build_style_guard_system_prompt(
                 soul_text,
                 memory_snapshots.get("memory", ""),
                 memory_snapshots.get("user", ""),
+                req.companion_directives,
             )
 
         # Savana 伴侣场景：覆盖 memory 工具描述为角色扮演专用中文版本
@@ -965,7 +1095,7 @@ async def chat_endpoint(req: ChatRequest):
             getattr(agent, "skip_memory", None),
             getattr(agent, "_memory_enabled", None),
             agent._memory_store is not None,
-            repr(agent.ephemeral_system_prompt)
+            repr(getattr(agent, "ephemeral_system_prompt", None))
         ))
 
         _log_companion_prompt_diagnostics(
@@ -975,7 +1105,7 @@ async def chat_endpoint(req: ChatRequest):
             user_message=req.user_message,
             conversation_history=conversation_history,
             character_profile=req.character_profile,
-            directives=effective_directives,
+            directives=diagnostics_directives,
             soul_text=soul_text,
             memory_text=memory_snapshots.get("memory", ""),
             user_profile_text=memory_snapshots.get("user", ""),
@@ -995,7 +1125,7 @@ async def chat_endpoint(req: ChatRequest):
                 token_thread = set_hermes_home_override(profile_dir)
                 try:
                     def stream_callback(delta: str) -> None:
-                        q.put(delta)
+                        q.put(("token", delta))
 
                     # 触发对话生成
                     result = agent.run_conversation(
@@ -1005,49 +1135,59 @@ async def chat_endpoint(req: ChatRequest):
                         platform_message_id=req.message_id,
                     )
                     final_reply = result.get("final_response", "")
-                    review_metadata.update(
-                        _review_companion_turn(
-                            style_guard_enabled=style_guard_enabled,
-                            profile_dir=profile_dir,
-                            turn_id=req.message_id,
-                            assistant_text=final_reply,
-                            user_message=req.user_message,
-                            raw_history=raw_history,
-                            provider=provider,
-                            model=model,
-                            base_url=base_url,
-                            api_key=api_key,
-                            memory_store=getattr(agent, "_memory_store", None),
-                        )
-                    )
+                    q.put(("final", final_reply))
                 except Exception as e:
-                    q.put(e)
+                    q.put(("error", e))
                 finally:
-                    q.put(None)  # 哨兵标记，代表生成结束
                     reset_hermes_home_override(token_thread)
 
             threading.Thread(target=run_chat_thread).start()
 
             def sse_generator() -> Generator[str, None, None]:
-                while True:
-                    item = q.get()
-                    if item is None:
-                        break
-                    if isinstance(item, Exception):
-                        # 如果出现异常，返回 error 事件，并中断
-                        yield "event: error\ndata: {}\n\n".format(json.dumps({"detail": str(item)}))
-                        break
-                    yield_data = {"delta": item}
-                    yield "event: token\ndata: {}\n\n".format(json.dumps(yield_data))
-                
-                metadata = {
-                    "session_id": session_id,
-                    "status": "completed",
-                    "review_status": review_metadata.get("review_status"),
-                    "memory_status": review_metadata.get("memory_status"),
-                    "memory_modifications": review_metadata.get("memory_modifications", []),
-                }
-                yield "event: metadata\ndata: {}\n\n".format(json.dumps(metadata))
+                nonlocal session_lock_released
+                try:
+                    while True:
+                        item_type, item_value = q.get()
+                        if item_type == "error":
+                            _emit_stream_event("error")
+                            yield "event: error\ndata: {}\n\n".format(json.dumps({"detail": str(item_value)}))
+                            break
+                        if item_type == "token":
+                            yield_data = {"delta": item_value}
+                            _emit_stream_event("token", yield_data)
+                            yield "event: token\ndata: {}\n\n".format(json.dumps(yield_data))
+                            continue
+                        if item_type == "final":
+                            review_metadata.update(
+                                _review_companion_turn(
+                                    style_guard_enabled=style_guard_enabled,
+                                    profile_dir=profile_dir,
+                                    turn_id=req.message_id,
+                                    assistant_text=item_value,
+                                    user_message=req.user_message,
+                                    raw_history=raw_history,
+                                    provider=provider,
+                                    model=model,
+                                    base_url=base_url,
+                                    api_key=api_key,
+                                    memory_store=getattr(agent, "_memory_store", None),
+                                )
+                            )
+                            metadata = {
+                                "session_id": session_id,
+                                "status": "completed",
+                                "memory_modifications": review_metadata.get("memory_modifications", []),
+                            }
+                            if style_guard_enabled:
+                                metadata["review_status"] = review_metadata.get("review_status")
+                                metadata["memory_status"] = review_metadata.get("memory_status")
+                            _emit_stream_event("metadata", metadata)
+                            yield "event: metadata\ndata: {}\n\n".format(json.dumps(metadata))
+                            break
+                finally:
+                    if not session_lock_released:
+                        session_lock.release()
+                        session_lock_released = True
 
             return StreamingResponse(sse_generator(), media_type="text/event-stream")
         else:
@@ -1070,14 +1210,20 @@ async def chat_endpoint(req: ChatRequest):
                 api_key=api_key,
                 memory_store=getattr(agent, "_memory_store", None),
             )
-            return JSONResponse({
+            payload = {
                 "reply": reply,
                 "session_id": session_id,
-                "review_status": review_metadata.get("review_status"),
                 "memory_modifications": review_metadata.get("memory_modifications", []),
-            })
+            }
+            if style_guard_enabled:
+                payload["review_status"] = review_metadata.get("review_status")
+                payload["memory_status"] = review_metadata.get("memory_status")
+            return JSONResponse(payload)
             
     finally:
+        if not session_lock_released:
+            session_lock.release()
+            session_lock_released = True
         reset_hermes_home_override(token)
 
 @router.delete("/sessions/{session_id}")
