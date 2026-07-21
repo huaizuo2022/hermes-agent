@@ -5,7 +5,12 @@ import pytest
 from starlette.testclient import TestClient
 
 from hermes_cli.companion_api import sync_soul_file
-from hermes_cli.companion_profile_policy import GUARDED_POLICY, read_evolution_policy
+from hermes_cli.companion_profile_policy import (
+    GUARDED_V2_POLICY,
+    STYLE_GUARD_V1_POLICY,
+    read_conversation_policy,
+    read_evolution_policy,
+)
 from hermes_cli.web_server import app
 
 
@@ -19,7 +24,12 @@ def test_chat_initializes_guarded_policy_before_soul(monkeypatch, tmp_path):
     )
 
     def fake_sync(path, profile):
-        observed.append(read_evolution_policy(path))
+        observed.append(
+            (
+                read_evolution_policy(path),
+                read_conversation_policy(path),
+            )
+        )
         raise RuntimeError("stop after initialization")
 
     monkeypatch.setattr("hermes_cli.companion_api.sync_soul_file", fake_sync)
@@ -37,7 +47,7 @@ def test_chat_initializes_guarded_policy_before_soul(monkeypatch, tmp_path):
     )
 
     assert response.status_code == 500
-    assert observed == [GUARDED_POLICY]
+    assert observed == [(GUARDED_V2_POLICY, STYLE_GUARD_V1_POLICY)]
 
 
 def test_memory_sync_initializes_guarded_policy(monkeypatch, tmp_path):
@@ -53,7 +63,8 @@ def test_memory_sync_initializes_guarded_policy(monkeypatch, tmp_path):
     )
 
     assert response.status_code == 200
-    assert read_evolution_policy(profile_dir) == GUARDED_POLICY
+    assert read_evolution_policy(profile_dir) == GUARDED_V2_POLICY
+    assert read_conversation_policy(profile_dir) == STYLE_GUARD_V1_POLICY
 
 
 def test_weixin_start_initializes_guarded_policy_before_soul(monkeypatch, tmp_path):
@@ -66,7 +77,12 @@ def test_weixin_start_initializes_guarded_policy_before_soul(monkeypatch, tmp_pa
     )
 
     def fake_sync(path, profile):
-        observed.append(read_evolution_policy(path))
+        observed.append(
+            (
+                read_evolution_policy(path),
+                read_conversation_policy(path),
+            )
+        )
 
     async def fake_start(hermes_home, session_id, bot_type="3", timeout_seconds=480):
         return {
@@ -87,7 +103,7 @@ def test_weixin_start_initializes_guarded_policy_before_soul(monkeypatch, tmp_pa
     )
 
     assert response.status_code == 200
-    assert observed == [GUARDED_POLICY]
+    assert observed == [(GUARDED_V2_POLICY, STYLE_GUARD_V1_POLICY)]
 
 def test_sync_soul_file_appends_relationship(tmp_path):
     profile_dir = tmp_path / "profile_test"

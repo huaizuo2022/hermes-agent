@@ -17,23 +17,44 @@ try:
 except ImportError:
     msvcrt = None
 
-
 LEGACY_POLICY = "legacy"
-GUARDED_POLICY = "guarded_v1"
+GUARDED_V1_POLICY = "guarded_v1"
+GUARDED_V2_POLICY = "guarded_v2"
+STYLE_GUARD_V1_POLICY = "style_guard_v1"
+GUARDED_POLICY = GUARDED_V1_POLICY
 PROFILE_META_FILE = "profile.yaml"
 
 
-def read_evolution_policy(profile_dir):
+def _read_profile_payload(profile_dir):
     path = Path(profile_dir) / PROFILE_META_FILE
     if not path.is_file():
-        return LEGACY_POLICY
+        return None
     try:
         with open(str(path), "r", encoding="utf-8") as handle:
             payload = yaml.safe_load(handle) or {}
     except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def read_conversation_policy(profile_dir):
+    payload = _read_profile_payload(profile_dir)
+    if payload is None:
         return LEGACY_POLICY
-    if isinstance(payload, dict) and payload.get("evolution_policy") == GUARDED_POLICY:
-        return GUARDED_POLICY
+    if payload.get("conversation_policy") == STYLE_GUARD_V1_POLICY:
+        return STYLE_GUARD_V1_POLICY
+    return LEGACY_POLICY
+
+
+def read_evolution_policy(profile_dir):
+    payload = _read_profile_payload(profile_dir)
+    if payload is None:
+        return LEGACY_POLICY
+    evolution_policy = payload.get("evolution_policy")
+    if evolution_policy in (GUARDED_V1_POLICY, GUARDED_V2_POLICY):
+        return evolution_policy
     return LEGACY_POLICY
 
 
@@ -113,9 +134,12 @@ def ensure_companion_profile(profile_dir):
         try:
             _atomic_write_yaml(
                 profile_dir / PROFILE_META_FILE,
-                {"evolution_policy": GUARDED_POLICY},
+                {
+                    "conversation_policy": STYLE_GUARD_V1_POLICY,
+                    "evolution_policy": GUARDED_V2_POLICY,
+                },
             )
         except Exception:
             shutil.rmtree(str(profile_dir), ignore_errors=True)
             raise
-        return GUARDED_POLICY
+        return GUARDED_V2_POLICY
