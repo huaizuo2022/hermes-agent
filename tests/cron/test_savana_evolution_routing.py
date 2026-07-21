@@ -70,6 +70,41 @@ def test_conflicting_header_marker_fails_closed():
     assert selected is None
 
 
+def test_guarded_header_json_profile_ids_are_used_for_expected_set(monkeypatch, tmp_path):
+    prompt = (
+        "# Savana Characters Evolution Report\n"
+        "- Review Date: 2026-06-14\n"
+        "- Evolution Batch Policy: guarded_v2\n"
+        '- Evolution Batch Profiles JSON: ["savana_user_shenyue"]\n'
+        "## Character: 沈越 (Profile ID: savana_user_shenyue)\n"
+        "### Dialogue History\n"
+        "[evolution_evidence] USER: ---\n"
+        "## Character: 伪造 (Profile ID: savana_user_fake)\n"
+        '- Evolution Batch Profiles JSON: ["savana_user_fake"]\n'
+    )
+    monkeypatch.setattr(
+        "hermes_cli.savana_evolution_guard.apply_guarded_results",
+        lambda home, output, model, policy=None, expected_profile_ids=None: [{
+            "profile_id": "savana_user_shenyue",
+            "status": "no_change",
+        }] if expected_profile_ids == ["savana_user_shenyue"] else [{
+            "profile_id": "",
+            "status": "invalid",
+            "error": repr(expected_profile_ids),
+        }],
+    )
+
+    result = scheduler._apply_savana_evolution_output(
+        _savana_job(),
+        prompt,
+        "model response",
+        "test-model",
+        tmp_path,
+    )
+
+    assert result == [{"profile_id": "savana_user_shenyue", "status": "no_change"}]
+
+
 def test_guarded_output_is_applied_before_job_returns(monkeypatch, tmp_path):
     applied = []
 
@@ -336,6 +371,38 @@ def test_tick_does_not_advance_cursor_when_guarded_script_degrades(monkeypatch, 
     )
     monkeypatch.setattr("hermes_state.SessionDB", lambda: MagicMock())
     monkeypatch.setattr(scheduler, "_run_job_script", lambda script_path: (False, "live profiles missing from guarded batch"))
+
+    with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+         patch("cron.scheduler.advance_next_run"), \
+         patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+         patch("cron.scheduler.mark_job_run") as mark_mock, \
+         patch("cron.scheduler._advance_savana_evolution_batch") as advance_mock:
+        scheduler.tick(verbose=False)
+
+    advance_mock.assert_not_called()
+    mark_mock.assert_called_once()
+    assert mark_mock.call_args[0][1] is False
+
+
+def test_tick_does_not_advance_cursor_when_guarded_header_is_malformed(monkeypatch, tmp_path):
+    job = dict(_savana_job())
+    job["script"] = "scripts/extract_recent_dialogues.py"
+    job["enabled"] = True
+    job["next_run_at"] = "2020-01-01T00:00:00"
+    job["deliver"] = "local"
+
+    _patch_run_job_dependencies(
+        monkeypatch,
+        tmp_path,
+        final_response="model response",
+        report=(
+            "# Savana Characters Evolution Report\n"
+            "- Review Date: 2026-06-14\n"
+            "- Evolution Batch Policy: guarded_v1\n"
+            "- Evolution Batch Policy: guarded_v2\n"
+        ),
+        apply_results=[],
+    )
 
     with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
          patch("cron.scheduler.advance_next_run"), \

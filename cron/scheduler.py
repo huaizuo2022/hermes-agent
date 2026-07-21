@@ -14,6 +14,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -137,6 +138,7 @@ _SAVANA_GUARDED_SKILL = "savana-companion-evolution-guarded"
 _SAVANA_GUARDED_V2_SKILL = "savana-companion-evolution-guarded-v2"
 _SAVANA_GUARDED_REPORT_MARKER = "- Evolution Batch Policy: guarded_v1"
 _SAVANA_GUARDED_V2_REPORT_MARKER = "- Evolution Batch Policy: guarded_v2"
+_SAVANA_BATCH_PROFILES_JSON_PREFIX = "- Evolution Batch Profiles JSON: "
 _SAVANA_SUCCESS_STATUSES = frozenset(["committed", "no_change"])
 
 # Backward-compatible module override used by tests and emergency monkeypatches.
@@ -284,30 +286,43 @@ def _savana_header_is_malformed(value: str) -> bool:
     if not _is_savana_report(value):
         return False
     markers = []
+    json_headers = []
     for line in _extract_savana_report_header_lines(value):
         stripped = line.strip()
         if stripped in (_SAVANA_GUARDED_REPORT_MARKER, _SAVANA_GUARDED_V2_REPORT_MARKER):
             markers.append(stripped)
-    return len(markers) > 1
+        if stripped.startswith(_SAVANA_BATCH_PROFILES_JSON_PREFIX):
+            json_headers.append(stripped)
+    return len(markers) > 1 or len(json_headers) > 1
 
 
 def _extract_savana_expected_profile_ids(value: str) -> List[str]:
-    profile_ids = []
-    trust_profile_header = True
-    for line in str(value or "").splitlines():
+    header_lines = _extract_savana_report_header_lines(value)
+    payloads = []
+    for line in header_lines:
         stripped = line.strip()
-        if line.startswith("## Character: "):
-            if trust_profile_header and "(Profile ID: " in line:
-                profile_id = line.rsplit("(Profile ID: ", 1)[1].rstrip(")").strip()
-                if profile_id:
-                    profile_ids.append(profile_id)
-            continue
-        if stripped.startswith("### "):
-            trust_profile_header = False
-            continue
-        if stripped == "---":
-            trust_profile_header = True
-            continue
+        if stripped.startswith(_SAVANA_BATCH_PROFILES_JSON_PREFIX):
+            payloads.append(stripped[len(_SAVANA_BATCH_PROFILES_JSON_PREFIX):].strip())
+    if not payloads:
+        return []
+    if len(payloads) != 1:
+        raise RuntimeError("guarded Savana report header has conflicting profile JSON metadata")
+    try:
+        parsed = json.loads(payloads[0])
+    except Exception as exc:
+        raise RuntimeError("guarded Savana report header has invalid profile JSON metadata: {0}".format(exc))
+    if not isinstance(parsed, list) or not parsed:
+        raise RuntimeError("guarded Savana report header profile JSON must be a non-empty array")
+    profile_ids = []
+    seen = set()
+    for item in parsed:
+        profile_id = str(item or "").strip()
+        if not re.match(r"^savana_[A-Za-z0-9_.-]+$", profile_id):
+            raise RuntimeError("guarded Savana report header has invalid profile id")
+        if profile_id in seen:
+            raise RuntimeError("guarded Savana report header has duplicate profile ids")
+        seen.add(profile_id)
+        profile_ids.append(profile_id)
     return profile_ids
 
 
@@ -318,8 +333,6 @@ def _validate_savana_evolution_results(report_text: str, results) -> None:
             raise RuntimeError("guarded Savana report header is malformed")
         return
     expected_profile_ids = _extract_savana_expected_profile_ids(report_text)
-    if not expected_profile_ids:
-        raise RuntimeError("guarded Savana report is missing profile sections")
     issues = []
     observed_profile_ids = set()
     for result in list(results or []):

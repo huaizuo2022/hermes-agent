@@ -355,6 +355,7 @@ def test_guarded_report_contains_policy_base_and_hash(monkeypatch, tmp_path, cap
     assert "# 新角色" in base_snapshot
     assert "## Relationship with User" in base_snapshot
     assert "## Evolved Persona" not in base_snapshot
+    assert '- Evolution Batch Profiles JSON: ["savana_guarded_character"]' in output
 
 
 def test_guarded_v2_report_labels_sources_and_uses_exact_turn_reviews(monkeypatch, tmp_path, capsys):
@@ -407,6 +408,7 @@ def test_guarded_v2_report_labels_sources_and_uses_exact_turn_reviews(monkeypatc
     output = capsys.readouterr().out
 
     assert "- Evolution Batch Policy: guarded_v2" in output
+    assert '- Evolution Batch Profiles JSON: ["savana_guarded_v2_character"]' in output
     assert "[evolution_evidence] USER: 今晚想听你认真哄我睡。" in output
     assert "[context_only] ASSISTANT: 先闭眼，我会一直陪着你。" in output
     assert "[context_only] ASSISTANT SUMMARY: 她承认自己会更直接表达占有欲，但保持亲密语气。" in output
@@ -607,6 +609,28 @@ def test_guarded_batch_missing_live_profile_fails_closed(monkeypatch, tmp_path, 
 
     captured = capsys.readouterr()
     assert "live profiles missing from guarded batch" in captured.err
+
+
+def test_legacy_report_does_not_include_machine_profile_json(monkeypatch, tmp_path, capsys):
+    module = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("SAVANA_EVOLUTION_TARGET_DATE", "2026-06-15")
+    monkeypatch.setenv("SAVANA_EVOLUTION_SOURCE_DATE", "2026-06-14")
+    _write_profile(
+        tmp_path,
+        "savana_legacy_character",
+        "旧角色",
+        3,
+        [
+            ("user", "yesterday", 1781402400),
+            ("assistant", "reply", 1781402460),
+        ],
+    )
+
+    module.main()
+    output = capsys.readouterr().out
+
+    assert "Evolution Batch Profiles JSON" not in output
 
 
 def test_guarded_v2_summary_long_substring_leak_falls_back_to_unavailable(monkeypatch, tmp_path, capsys):

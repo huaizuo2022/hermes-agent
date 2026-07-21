@@ -32,6 +32,7 @@ DEFAULT_MESSAGE_LIMIT = 30
 DEFAULT_BATCH_CURSOR = 0
 STATE_DIR_NAME = os.path.join("cron", "state", "savana-self-evolution")
 RUN_DATE_FORMAT = "%Y-%m-%d"
+_SAVANA_BATCH_PROFILES_JSON_PREFIX = "- Evolution Batch Profiles JSON: "
 
 
 def parse_non_negative_int_env(name, default):
@@ -472,19 +473,23 @@ def _is_quality_correction_message(content):
     return False
 
 
-def _load_turn_reviews(profile_path):
+def _load_turn_reviews(profile_path, turn_ids):
     db_path = os.path.join(profile_path, "companion_guard.db")
-    if not os.path.exists(db_path):
+    filtered_turn_ids = [str(turn_id).strip() for turn_id in list(turn_ids or []) if str(turn_id).strip()]
+    if not os.path.exists(db_path) or not filtered_turn_ids:
         return None
     conn = None
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
+        placeholders = ",".join("?" for unused_item in filtered_turn_ids)
         cursor.execute(
             """
                 SELECT turn_id, assistant_sha256, status, continuity_summary
                 FROM turn_reviews
-            """
+                WHERE turn_id IN ({0})
+            """.format(placeholders),
+            filtered_turn_ids,
         )
         reviews = {}
         for turn_id, assistant_hash, status, continuity_summary in cursor.fetchall():
@@ -508,10 +513,10 @@ def _normalize_summary_text(value):
 def _summary_leaks_raw(summary, raw_text):
     normalized_summary = _normalize_summary_text(summary)
     normalized_raw = _normalize_summary_text(raw_text)
-    if len(normalized_summary) < 8 or len(normalized_raw) < 8:
-        return False
     if normalized_raw in normalized_summary or normalized_summary in normalized_raw:
         return True
+    if len(normalized_summary) < 8 or len(normalized_raw) < 8:
+        return False
     match = SequenceMatcher(None, normalized_summary, normalized_raw).find_longest_match(
         0,
         len(normalized_summary),
@@ -524,7 +529,12 @@ def _summary_leaks_raw(summary, raw_text):
 
 def _print_guarded_v2_dialogue(chat):
     print("\n### Dialogue History\n")
-    reviews = _load_turn_reviews(chat["profile_path"])
+    turn_ids = [
+        message.get("message_id")
+        for message in chat["messages"]
+        if message.get("role") == "user"
+    ]
+    reviews = _load_turn_reviews(chat["profile_path"], turn_ids)
     previous_user = None
     for message in chat["messages"]:
         if message["role"] == "user":
@@ -576,6 +586,14 @@ def print_manifest_header(now_dt, manifest, current_batch_count, batch_policy):
     print("- Profiles Included In Batch: {}".format(current_batch_count))
     if batch_policy in (GUARDED_POLICY, GUARDED_V2_POLICY):
         print("- Evolution Batch Policy: {}".format(batch_policy))
+        print(
+            _SAVANA_BATCH_PROFILES_JSON_PREFIX
+            + json.dumps(
+                list(manifest["batches"][manifest["cursor"]]),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
     print("- Total Eligible Profiles Yesterday: {}".format(manifest.get("total_profiles", 0)))
     print("- Per-Profile Message Limit: {}\n".format(
         manifest.get("message_limit", DEFAULT_MESSAGE_LIMIT)

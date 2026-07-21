@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 
 import pytest
 
@@ -235,4 +236,68 @@ def test_audit_commit_failure_restores_original_soul(monkeypatch, tmp_path):
             model="test-model",
         )
 
+    assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == original
+
+
+def test_batch_second_profile_write_failure_restores_first_profile(monkeypatch, tmp_path):
+    first_dir, first_original = _guarded_profile(tmp_path)
+    second_dir = tmp_path / "profiles" / "savana_u_d"
+    second_dir.mkdir(parents=True)
+    (second_dir / "profile.yaml").write_text(
+        "evolution_policy: guarded_v1\n",
+        encoding="utf-8",
+    )
+    second_original = (
+        "# 林岚\n\n## Personality\n安静、敏锐\n\n"
+        "## Evolved Persona\n基础状态\n\n## Speaking Style\n轻声慢语\n"
+    )
+    (second_dir / "SOUL.md").write_text(second_original, encoding="utf-8")
+
+    blocks = []
+    for profile_dir in (first_dir, second_dir):
+        blocks.append(_result_block(profile_dir))
+
+    original_atomic_write = guard._atomic_write_text
+    failure_target = str(second_dir / "SOUL.md")
+
+    def fail_second_write(path, content):
+        if str(path) == failure_target and "更愿意简短承认自己的担心。" in content:
+            raise IOError("disk full on second profile")
+        return original_atomic_write(path, content)
+
+    monkeypatch.setattr(guard, "_atomic_write_text", fail_second_write)
+
+    with pytest.raises(IOError):
+        guard.apply_guarded_results(
+            tmp_path,
+            "\n".join(blocks),
+            model="test-model",
+            expected_profile_ids=sorted([first_dir.name, second_dir.name]),
+        )
+
+    assert (first_dir / "SOUL.md").read_text(encoding="utf-8") == first_original
+    assert (second_dir / "SOUL.md").read_text(encoding="utf-8") == second_original
+
+
+def test_batch_lock_held_policy_change_fails_before_any_write(monkeypatch, tmp_path):
+    profile_dir, original = _guarded_profile(tmp_path)
+    original_read_policy = guard.read_evolution_policy
+    calls = {"count": 0}
+
+    def flip_policy(profile_path):
+        calls["count"] += 1
+        if calls["count"] >= 2:
+            return "guarded_v2"
+        return original_read_policy(profile_path)
+
+    monkeypatch.setattr(guard, "read_evolution_policy", flip_policy)
+
+    result = guard.apply_guarded_results(
+        tmp_path,
+        _result_block(profile_dir),
+        model="test-model",
+        expected_profile_ids=[profile_dir.name],
+    )
+
+    assert result[0]["status"] == "rejected"
     assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == original

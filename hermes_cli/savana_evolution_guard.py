@@ -3,6 +3,7 @@ import json
 import os
 import re
 import uuid
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 
@@ -243,6 +244,7 @@ def _prepare_guarded_result(hermes_home, result, policy):
         "profile_id": profile_id,
         "status": "committable",
         "profile_dir": profile_dir,
+        "soul_path": soul_path,
         "original": original,
         "updated": updated,
         "result": result,
@@ -295,32 +297,56 @@ def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY, exp
     if responses:
         return responses
 
-    prepared = []
-    preflight = []
+    parsed_by_id = {}
     for result in parsed:
-        profile_id = result["profile_id"]
-        try:
-            prepared_result = _prepare_guarded_result(hermes_home, result, policy)
-            prepared.append(prepared_result)
-            preflight.append({"profile_id": profile_id, "status": prepared_result["status"]})
-        except StaleEvolutionError as exc:
-            preflight.append({"profile_id": profile_id, "status": "stale", "error": str(exc)})
-        except EvolutionPolicyError as exc:
-            preflight.append({"profile_id": profile_id, "status": "rejected", "error": str(exc)})
-        except InvalidEvolutionResult as exc:
-            preflight.append({"profile_id": profile_id, "status": "invalid", "error": str(exc)})
+        parsed_by_id[result["profile_id"]] = result
+    ordered_profile_ids = sorted(expected or parsed_by_id.keys())
 
-    if any(item.get("status") not in ("no_change", "committable") for item in preflight):
-        return preflight
+    with ExitStack() as stack:
+        locked_dirs = {}
+        for profile_id in ordered_profile_ids:
+            result = parsed_by_id.get(profile_id)
+            if result is None:
+                continue
+            profile_dir = _resolve_profile_dir(hermes_home, profile_id)
+            stack.enter_context(profile_lock(profile_dir, "soul"))
+            locked_dirs[profile_id] = profile_dir
 
-    for item in prepared:
-        if item["status"] != "committable":
-            responses.append({"profile_id": item["profile_id"], "status": item["status"]})
-            continue
+        prepared = []
+        preflight = []
+        for profile_id in ordered_profile_ids:
+            result = parsed_by_id.get(profile_id)
+            if result is None:
+                continue
+            try:
+                profile_dir = locked_dirs[profile_id]
+                current_policy = read_evolution_policy(profile_dir)
+                if current_policy != policy:
+                    raise EvolutionPolicyError("profile is not {0}".format(policy))
+                prepared_result = _prepare_guarded_result(hermes_home, result, policy)
+                prepared.append(prepared_result)
+                preflight.append({"profile_id": profile_id, "status": prepared_result["status"]})
+            except StaleEvolutionError as exc:
+                preflight.append({"profile_id": profile_id, "status": "stale", "error": str(exc)})
+            except EvolutionPolicyError as exc:
+                preflight.append({"profile_id": profile_id, "status": "rejected", "error": str(exc)})
+            except InvalidEvolutionResult as exc:
+                preflight.append({"profile_id": profile_id, "status": "invalid", "error": str(exc)})
+
+        if any(item.get("status") not in ("no_change", "committable") for item in preflight):
+            return preflight
+
+        audit_paths = []
+        written = []
         try:
-            with profile_lock(item["profile_dir"], "soul"):
-                soul_path = item["profile_dir"] / "SOUL.md"
-                current = soul_path.read_text(encoding="utf-8")
+            for item in prepared:
+                if item["status"] != "committable":
+                    responses.append({"profile_id": item["profile_id"], "status": item["status"]})
+                    continue
+                current_policy = read_evolution_policy(item["profile_dir"])
+                if current_policy != policy:
+                    raise EvolutionPolicyError("profile is not {0}".format(policy))
+                current = item["soul_path"].read_text(encoding="utf-8")
                 if _sha256_text(current) != item["result"]["expected_soul_sha256"]:
                     raise StaleEvolutionError("SOUL.md changed after analysis")
                 audit_path = _write_pending_audit(
@@ -331,24 +357,30 @@ def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY, exp
                     model,
                     policy,
                 )
-                try:
-                    _atomic_write_text(soul_path, item["updated"])
-                    _mark_audit_committed(audit_path)
-                except Exception:
-                    _atomic_write_text(soul_path, item["original"])
-                    raise
+                audit_paths.append(audit_path)
+                _atomic_write_text(item["soul_path"], item["updated"])
+                written.append(item)
+                _mark_audit_committed(audit_path)
                 responses.append({
                     "profile_id": item["profile_id"],
                     "status": "committed",
                     "audit_id": audit_path.stem,
                 })
-        except StaleEvolutionError as exc:
-            responses.append({"profile_id": item["profile_id"], "status": "stale", "error": str(exc)})
-        except EvolutionPolicyError as exc:
-            responses.append({"profile_id": item["profile_id"], "status": "rejected", "error": str(exc)})
-        except InvalidEvolutionResult as exc:
-            responses.append({"profile_id": item["profile_id"], "status": "invalid", "error": str(exc)})
-    return responses
+            return responses
+        except Exception:
+            for item in reversed(written):
+                try:
+                    _atomic_write_text(item["soul_path"], item["original"])
+                except Exception:
+                    pass
+            for audit_path in audit_paths:
+                try:
+                    audit_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
+            raise
 
 
 def rollback_guarded_evolution(hermes_home, profile_id, audit_id):
