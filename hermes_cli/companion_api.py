@@ -1,10 +1,12 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import queue
 import shutil
 import threading
+import time
 from functools import partial
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Generator, List, Optional
@@ -24,6 +26,7 @@ from hermes_cli.companion_profile_policy import (
     read_conversation_policy,
 )
 from hermes_cli.companion_prompt import build_companion_system_prompt
+from hermes_cli.config import load_config
 from hermes_cli.companion_turn_guard import (
     TurnReviewStore,
     assistant_sha256,
@@ -36,6 +39,42 @@ logger = logging.getLogger(__name__)
 _SESSION_LOCKS = {}
 _SESSION_LOCKS_GUARD = threading.Lock()
 _stream_event_hook = None
+
+
+def _style_guard_new_profiles_enabled() -> bool:
+    try:
+        config = load_config()
+    except Exception:
+        logger.exception("Failed to load companion profile feature flags")
+        return True
+    companion_config = config.get("companion") or {}
+    return bool(companion_config.get("style_guard_new_profiles_enabled", True))
+
+
+def _log_style_guard_event(
+    *,
+    profile_dir: str,
+    turn_id: str,
+    policy: str,
+    status: str,
+    elapsed_ms: int,
+    model: str,
+) -> None:
+    profile_hash = hashlib.sha256(
+        str(Path(profile_dir).resolve()).encode("utf-8")
+    ).hexdigest()[:16]
+    payload = {
+        "profile_hash": profile_hash,
+        "turn_id": str(turn_id or ""),
+        "policy": str(policy or ""),
+        "status": str(status or ""),
+        "elapsed_ms": max(0, int(elapsed_ms)),
+        "model": str(model or ""),
+    }
+    logger.info(
+        "savana_companion.style_guard %s",
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+    )
 
 class ChatRequest(BaseModel):
     user_id: str
@@ -589,6 +628,22 @@ def _fallback_review_metadata(turn_id: str, error: Exception) -> Dict[str, Any]:
     }
 
 
+def _mark_companion_turn_pending(profile_dir: str, turn_id: str, assistant_text: str) -> None:
+    store = TurnReviewStore(profile_dir)
+    current = store.begin(turn_id, assistant_text)
+    if current and current.get("status") != "pending":
+        store._commit_status(
+            turn_id,
+            current["assistant_sha256"],
+            "pending",
+            "",
+            "",
+            {},
+            "pending",
+            "",
+        )
+
+
 def _review_companion_turn(
     *,
     style_guard_enabled: bool,
@@ -613,8 +668,9 @@ def _review_companion_turn(
             "memory_status": None,
             "memory_modifications": modifications,
         }
+    started_at = time.monotonic()
     try:
-        return review_turn(
+        result = review_turn(
             profile_dir=profile_dir,
             turn_id=turn_id,
             assistant_text=assistant_text,
@@ -626,8 +682,30 @@ def _review_companion_turn(
             api_key=api_key,
             memory_store=memory_store,
         )
+        _log_style_guard_event(
+            profile_dir=profile_dir,
+            turn_id=turn_id,
+            policy=STYLE_GUARD_V1_POLICY,
+            status=result.get("review_status") or "completed",
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            model=model,
+        )
+        return result
     except Exception as exc:
-        return _fallback_review_metadata(turn_id, exc)
+        try:
+            _mark_companion_turn_pending(profile_dir, turn_id, assistant_text)
+        except Exception:
+            logger.exception("Failed to preserve pending companion turn %s", turn_id)
+        result = _fallback_review_metadata(turn_id, exc)
+        _log_style_guard_event(
+            profile_dir=profile_dir,
+            turn_id=turn_id,
+            policy=STYLE_GUARD_V1_POLICY,
+            status="pending",
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            model=model,
+        )
+        return result
 
 
 def _get_weixin_bridge_runtime():
@@ -1073,7 +1151,14 @@ def _sync_soul_file_unlocked(profile_dir: str, profile_data: Dict[str, Any]) -> 
 async def chat_endpoint(req: ChatRequest):
     session_id = "savana_{}_{}".format(req.user_id.lower(), req.character_id.lower())
     profile_dir = get_profile_path(session_id)
-    ensure_companion_profile(Path(profile_dir))
+    profile_path = Path(profile_dir)
+    if not profile_path.exists() and not _style_guard_new_profiles_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="Companion profile initialization is temporarily unavailable; retry later.",
+            headers={"Retry-After": "5"},
+        )
+    ensure_companion_profile(profile_path)
     conversation_policy = read_conversation_policy(profile_dir)
     style_guard_enabled = conversation_policy == STYLE_GUARD_V1_POLICY
     session_lock = None
@@ -1192,19 +1277,29 @@ async def chat_endpoint(req: ChatRequest):
             repr(getattr(agent, "ephemeral_system_prompt", None))
         ))
 
-        _log_companion_prompt_diagnostics(
-            session_id=session_id,
-            provider=provider,
-            model=model,
-            user_message=req.user_message,
-            conversation_history=conversation_history,
-            character_profile=req.character_profile,
-            directives=diagnostics_directives,
-            soul_text=soul_text,
-            memory_text=memory_snapshots.get("memory", ""),
-            user_profile_text=memory_snapshots.get("user", ""),
-            session_stats=session_stats,
-        )
+        if style_guard_enabled:
+            _log_style_guard_event(
+                profile_dir=profile_dir,
+                turn_id=req.message_id,
+                policy=conversation_policy,
+                status="started",
+                elapsed_ms=0,
+                model=model,
+            )
+        else:
+            _log_companion_prompt_diagnostics(
+                session_id=session_id,
+                provider=provider,
+                model=model,
+                user_message=req.user_message,
+                conversation_history=conversation_history,
+                character_profile=req.character_profile,
+                directives=diagnostics_directives,
+                soul_text=soul_text,
+                memory_text=memory_snapshots.get("memory", ""),
+                user_profile_text=memory_snapshots.get("user", ""),
+                session_stats=session_stats,
+            )
 
 
         if req.stream:

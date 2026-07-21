@@ -80,6 +80,45 @@ class TestLoadConfigDefaults:
             assert config["agent"]["max_turns"] == 42
             assert "max_turns" not in config
 
+    def test_companion_style_guard_and_turn_review_defaults_are_complete(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            config = load_config()
+
+        assert config["companion"]["style_guard_new_profiles_enabled"] is True
+        review_defaults = config["auxiliary"]["companion_turn_review"]
+        assert set(review_defaults) >= {
+            "provider",
+            "model",
+            "base_url",
+            "api_key",
+            "timeout",
+            "extra_body",
+        }
+        assert review_defaults["provider"] == "auto"
+        assert review_defaults["timeout"] == 30
+        assert review_defaults["extra_body"] == {}
+
+    def test_companion_turn_review_nested_override_keeps_defaults(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_text(
+                "companion:\n"
+                "  style_guard_new_profiles_enabled: false\n"
+                "auxiliary:\n"
+                "  companion_turn_review:\n"
+                "    model: custom-review-model\n",
+                encoding="utf-8",
+            )
+            config = load_config()
+
+        assert config["companion"]["style_guard_new_profiles_enabled"] is False
+        review = config["auxiliary"]["companion_turn_review"]
+        assert review["model"] == "custom-review-model"
+        assert review["provider"] == "auto"
+        assert review["base_url"] == ""
+        assert review["api_key"] == ""
+        assert review["timeout"] == 30
+        assert review["extra_body"] == {}
+
 
 class TestLoadConfigParseFailure:
     """A YAML parse failure must NOT silently fall back to defaults.

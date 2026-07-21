@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import threading
 import time
 from pathlib import Path
@@ -483,6 +484,148 @@ def test_style_guard_nonstream_metadata_includes_review_and_memory_status(monkey
     assert response.json()["review_status"] == "clean"
     assert response.json()["memory_status"] == "applied"
     assert response.json()["memory_modifications"] == [{"kind": "applied"}]
+
+
+def test_new_profile_gate_returns_retryable_without_creating_profile(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "new-profile"
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.load_config",
+        lambda: {"companion": {"style_guard_new_profiles_enabled": False}},
+    )
+
+    response = TestClient(app).post(
+        "/companion/v1/chat",
+        json=_payload("msg-1", "第一句", stream=False),
+    )
+
+    assert response.status_code == 503
+    assert response.headers.get("retry-after") == "5"
+    assert not profile_dir.exists()
+
+
+def test_existing_profile_ignores_new_profile_gate(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "existing-profile"
+    profile_dir.mkdir()
+    captures = _install_fake_agent(monkeypatch)
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.load_config",
+        lambda: {"companion": {"style_guard_new_profiles_enabled": False}},
+    )
+
+    response = TestClient(app).post(
+        "/companion/v1/chat",
+        json=_payload("msg-1", "第一句", stream=False),
+    )
+
+    assert response.status_code == 200
+    assert captures["init_kwargs"][0]["enabled_toolsets"] == ["memory"]
+
+
+def test_review_failure_keeps_raw_state_but_marks_turn_pending(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "review-failure-profile"
+    ensure_companion_profile(profile_dir)
+    captures = _install_fake_agent(monkeypatch)
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+
+    def failing_review(**_kwargs):
+        raise RuntimeError("review backend unavailable")
+
+    monkeypatch.setattr("hermes_cli.companion_api.review_turn", failing_review)
+    client = TestClient(app)
+
+    response1 = client.post("/companion/v1/chat", json=_payload("msg-1", "第一句", stream=False))
+
+    assert response1.status_code == 200
+    assert response1.json()["review_status"] == "pending"
+    assert response1.json()["memory_status"] == "pending"
+    record = TurnReviewStore(profile_dir).get("msg-1")
+    assert record["status"] == "pending"
+
+    from hermes_state import SessionDB
+
+    session_db = SessionDB(db_path=Path(profile_dir) / "state.db")
+    messages = session_db.get_messages_as_conversation("savana_usera_chara")
+    assert messages[1]["content"] == "reply to 第一句"
+    session_db.close()
+
+    response2 = client.post("/companion/v1/chat", json=_payload("msg-2", "第二句", stream=False))
+
+    assert response2.status_code == 200
+    assert captures["history"][1][1]["content"] != "reply to 第一句"
+    assert "等待风格审查结果" in captures["history"][1][1]["content"]
+
+
+def test_review_failure_resets_existing_terminal_record_to_pending(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "terminal-review-failure-profile"
+    ensure_companion_profile(profile_dir)
+    _install_fake_agent(monkeypatch)
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+    store = TurnReviewStore(profile_dir)
+    store.begin("msg-1", "reply to 第一句")
+    current = store.get("msg-1")
+    store._commit_status(
+        "msg-1",
+        current["assistant_sha256"],
+        "clean",
+        "ok",
+        "",
+        {"style_decision": "clean"},
+        "none",
+        "judge",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.review_turn",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("review backend unavailable")),
+    )
+
+    response = TestClient(app).post(
+        "/companion/v1/chat",
+        json=_payload("msg-1", "第一句", stream=False),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["review_status"] == "pending"
+    assert store.get("msg-1")["status"] == "pending"
+
+
+def test_style_guard_logs_only_hashed_structured_metadata(monkeypatch, tmp_path, caplog):
+    profile_dir = tmp_path / "safe-log-profile"
+    captures = _install_fake_agent(monkeypatch)
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.review_turn",
+        lambda **kwargs: {
+            "turn_id": kwargs["turn_id"],
+            "review_status": "clean",
+            "memory_status": "none",
+            "memory_modifications": [],
+        },
+    )
+
+    secret = "super-secret-api-key"
+    payload = _payload("msg-1", "包含用户私密内容", stream=False)
+    payload["api_key"] = secret
+    payload["companion_directives"] = "不要记录这段敏感指令"
+    with caplog.at_level(logging.INFO, logger="hermes_cli.companion_api"):
+        response = TestClient(app).post("/companion/v1/chat", json=payload)
+
+    assert response.status_code == 200
+    style_records = [
+        json.loads(record.getMessage().split(" ", 1)[1])
+        for record in caplog.records
+        if record.name == "hermes_cli.companion_api" and "style_guard" in record.getMessage()
+    ]
+    assert style_records
+    allowed = {"profile_hash", "turn_id", "policy", "status", "elapsed_ms", "model"}
+    for record in style_records:
+        assert set(record) == allowed
+        serialized = json.dumps(record, ensure_ascii=False)
+        assert secret not in serialized
+        assert "包含用户私密内容" not in serialized
+        assert "不要记录这段敏感指令" not in serialized
+    assert captures["init_kwargs"]
 
 
 def test_legacy_stream_metadata_shape_remains_base_compatible(monkeypatch, tmp_path):

@@ -864,6 +864,11 @@ DEFAULT_CONFIG = {
         },
     },
 
+    "companion": {
+        # New profiles start with the guarded style-review conversation policy.
+        "style_guard_new_profiles_enabled": True,
+    },
+
     # Auxiliary model config — provider:model for each side task.
     # Format: provider is the provider name, model is the model slug.
     # "auto" for provider = auto-detect best available provider.
@@ -914,6 +919,14 @@ DEFAULT_CONFIG = {
             "base_url": "",
             "api_key": "",
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
+            "extra_body": {},
+        },
+        "companion_turn_review": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
             "extra_body": {},
         },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —
