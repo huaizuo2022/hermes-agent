@@ -245,7 +245,7 @@ def _write_recovery_journal(journal_path, journal):
     )
 
 
-def _create_recovery_journal(hermes_home, prepared, model, policy):
+def _create_recovery_journal(hermes_home, prepared, model, policy, action="evolution"):
     recovery_dir = _recovery_dir(hermes_home)
     recovery_dir.mkdir(parents=True, exist_ok=True)
     batch_id = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ-") + uuid.uuid4().hex
@@ -256,6 +256,7 @@ def _create_recovery_journal(hermes_home, prepared, model, policy):
         "created_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "policy": policy,
         "model": str(model or ""),
+        "action": action,
         "entries": [],
     }
     for item in prepared:
@@ -373,41 +374,34 @@ def _compensate_guarded_batch(
 
 
 def apply_guarded_result(hermes_home, result, model, policy=GUARDED_POLICY):
-    _require_no_pending_recovery(hermes_home)
     _validate_result_shape(result)
     if policy not in _SUPPORTED_POLICIES:
         raise EvolutionPolicyError("unsupported evolution policy")
     profile_id = result["profile_id"]
-    profile_dir = _resolve_profile_dir(hermes_home, profile_id)
-    if read_evolution_policy(profile_dir) != policy:
-        raise EvolutionPolicyError("profile is not {0}".format(policy))
-    with profile_lock(profile_dir, "soul"):
-        soul_path = profile_dir / "SOUL.md"
-        original = soul_path.read_text(encoding="utf-8")
-        if _sha256_text(original) != result["expected_soul_sha256"]:
-            raise StaleEvolutionError("SOUL.md changed after analysis")
-        if result["decision"] == "no_change":
-            return {"profile_id": profile_id, "status": "no_change"}
-        if not _review_passes(result):
-            return {"profile_id": profile_id, "status": "rejected"}
-        updated = replace_evolved_persona(
-            original,
-            result["candidate_evolved_persona"],
-        )
-        if strip_evolved_persona(updated) != strip_evolved_persona(original):
-            raise InvalidEvolutionResult("candidate changed base persona")
-        audit_path = _write_pending_audit(profile_dir, original, updated, result, model, policy)
-        try:
-            _atomic_write_text(soul_path, updated)
-            _mark_audit_committed(audit_path)
-        except Exception:
-            _atomic_write_text(soul_path, original)
-            raise
-        return {
-            "profile_id": profile_id,
-            "status": "committed",
-            "audit_id": audit_path.stem,
-        }
+    output = "{0}{1}{2}".format(
+        RESULT_START,
+        json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+        RESULT_END,
+    )
+    responses = apply_guarded_results(
+        hermes_home,
+        output,
+        model,
+        policy=policy,
+        expected_profile_ids=[profile_id],
+    )
+    if len(responses) != 1:
+        raise InvalidEvolutionResult("single guarded result produced an invalid response set")
+    response = responses[0]
+    status = response.get("status")
+    error = str(response.get("error") or "")
+    if status == "stale":
+        raise StaleEvolutionError(error or "SOUL.md changed after analysis")
+    if status == "invalid":
+        raise InvalidEvolutionResult(error or "invalid guarded evolution result")
+    if status == "rejected" and error:
+        raise EvolutionPolicyError(error)
+    return response
 
 
 def _prepare_guarded_result(profile_dir, result, policy):
@@ -440,6 +434,93 @@ def _prepare_guarded_result(profile_dir, result, policy):
         "updated": updated,
         "result": result,
     }
+
+
+def _commit_prepared_batch(
+    hermes_home,
+    prepared,
+    model,
+    policy,
+    action="evolution",
+    source_audit_ids=None,
+):
+    committable = [item for item in prepared if item["status"] == "committable"]
+    if not committable:
+        return [
+            {"profile_id": item["profile_id"], "status": item["status"]}
+            for item in prepared
+        ]
+    journal_path, journal = _create_recovery_journal(
+        hermes_home,
+        prepared,
+        model,
+        policy,
+        action=action,
+    )
+    responses = []
+    written_profile_ids = set()
+    source_audit_ids = source_audit_ids or {}
+    try:
+        for item in prepared:
+            if item["status"] != "committable":
+                responses.append({"profile_id": item["profile_id"], "status": item["status"]})
+                continue
+            current_policy = read_evolution_policy(item["profile_dir"])
+            if current_policy != policy:
+                raise EvolutionPolicyError("profile is not {0}".format(policy))
+            current = item["soul_path"].read_text(encoding="utf-8")
+            if _sha256_text(current) != item["result"]["expected_soul_sha256"]:
+                raise StaleEvolutionError("SOUL.md changed after analysis")
+            audit_path = _write_pending_audit(
+                item["profile_dir"],
+                item["original"],
+                item["updated"],
+                item["result"],
+                model,
+                policy,
+                action=action,
+                source_audit_id=source_audit_ids.get(item["profile_id"]),
+                batch_id=journal["id"],
+            )
+            entry = _journal_entry(journal, item["profile_id"])
+            entry["audit_path"] = str(audit_path)
+            entry["audit_state"] = "pending"
+            _write_recovery_journal(journal_path, journal)
+            _atomic_write_text(item["soul_path"], item["updated"])
+            written_profile_ids.add(item["profile_id"])
+            entry["soul_state"] = "candidate"
+            _write_recovery_journal(journal_path, journal)
+            _mark_audit_committed(audit_path)
+            entry["audit_state"] = "committed"
+            _write_recovery_journal(journal_path, journal)
+            responses.append({
+                "profile_id": item["profile_id"],
+                "status": "committed",
+                "audit_id": audit_path.stem,
+            })
+        journal["status"] = "committed"
+        _write_recovery_journal(journal_path, journal)
+        try:
+            journal_path.unlink()
+        except Exception as exc:
+            raise BatchRecoveryError(
+                "committed Savana evolution journal cleanup failed: {0} ({1})".format(
+                    journal_path,
+                    exc,
+                )
+            )
+        return responses
+    except BatchRecoveryError:
+        raise
+    except Exception as exc:
+        _compensate_guarded_batch(
+            journal_path,
+            journal,
+            prepared,
+            written_profile_ids,
+            exc,
+        )
+        raise
 
 
 def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY, expected_profile_ids=None):
@@ -559,78 +640,12 @@ def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY, exp
         if any(item.get("status") not in ("no_change", "committable") for item in preflight):
             return preflight
 
-        committable = [item for item in prepared if item["status"] == "committable"]
-        if not committable:
-            return [
-                {"profile_id": item["profile_id"], "status": item["status"]}
-                for item in prepared
-            ]
-        journal_path, journal = _create_recovery_journal(
+        return _commit_prepared_batch(
             hermes_home,
             prepared,
             model,
             policy,
         )
-        written_profile_ids = set()
-        try:
-            for item in prepared:
-                if item["status"] != "committable":
-                    responses.append({"profile_id": item["profile_id"], "status": item["status"]})
-                    continue
-                current_policy = read_evolution_policy(item["profile_dir"])
-                if current_policy != policy:
-                    raise EvolutionPolicyError("profile is not {0}".format(policy))
-                current = item["soul_path"].read_text(encoding="utf-8")
-                if _sha256_text(current) != item["result"]["expected_soul_sha256"]:
-                    raise StaleEvolutionError("SOUL.md changed after analysis")
-                audit_path = _write_pending_audit(
-                    item["profile_dir"],
-                    item["original"],
-                    item["updated"],
-                    item["result"],
-                    model,
-                    policy,
-                    batch_id=journal["id"],
-                )
-                entry = _journal_entry(journal, item["profile_id"])
-                entry["audit_path"] = str(audit_path)
-                entry["audit_state"] = "pending"
-                _write_recovery_journal(journal_path, journal)
-                _atomic_write_text(item["soul_path"], item["updated"])
-                written_profile_ids.add(item["profile_id"])
-                entry["soul_state"] = "candidate"
-                _write_recovery_journal(journal_path, journal)
-                _mark_audit_committed(audit_path)
-                entry["audit_state"] = "committed"
-                _write_recovery_journal(journal_path, journal)
-                responses.append({
-                    "profile_id": item["profile_id"],
-                    "status": "committed",
-                    "audit_id": audit_path.stem,
-                })
-            journal["status"] = "committed"
-            _write_recovery_journal(journal_path, journal)
-            try:
-                journal_path.unlink()
-            except Exception as exc:
-                raise BatchRecoveryError(
-                    "committed Savana evolution journal cleanup failed: {0} ({1})".format(
-                        journal_path,
-                        exc,
-                    )
-                )
-            return responses
-        except BatchRecoveryError:
-            raise
-        except Exception as exc:
-            _compensate_guarded_batch(
-                journal_path,
-                journal,
-                prepared,
-                written_profile_ids,
-                exc,
-            )
-            raise
 
 
 def rollback_guarded_evolution(hermes_home, profile_id, audit_id):
@@ -657,27 +672,25 @@ def rollback_guarded_evolution(hermes_home, profile_id, audit_id):
             raise StaleEvolutionError("current persona differs from audit version")
         updated = replace_evolved_persona(original, source_audit.get("before"))
         rollback_result = {
+            "expected_soul_sha256": _sha256_text(original),
             "reason": "operator rollback to audit {0}".format(audit_id),
             "self_review": {},
         }
-        rollback_audit_path = _write_pending_audit(
-            profile_dir,
-            original,
-            updated,
-            rollback_result,
+        prepared = [{
+            "profile_id": profile_id,
+            "status": "committable",
+            "profile_dir": profile_dir,
+            "soul_path": soul_path,
+            "original": original,
+            "updated": updated,
+            "result": rollback_result,
+        }]
+        responses = _commit_prepared_batch(
+            hermes_home,
+            prepared,
             "operator",
             policy,
             action="rollback",
-            source_audit_id=audit_id,
+            source_audit_ids={profile_id: audit_id},
         )
-        try:
-            _atomic_write_text(soul_path, updated)
-            _mark_audit_committed(rollback_audit_path)
-        except Exception:
-            _atomic_write_text(soul_path, original)
-            raise
-        return {
-            "profile_id": profile_id,
-            "status": "committed",
-            "audit_id": rollback_audit_path.stem,
-        }
+        return responses[0]

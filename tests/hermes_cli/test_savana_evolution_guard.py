@@ -51,6 +51,11 @@ def _result_block(profile_dir, **overrides):
     )
 
 
+def _result_payload(profile_dir, **overrides):
+    block = _result_block(profile_dir, **overrides)
+    return json.loads(block[len(guard.RESULT_START):-len(guard.RESULT_END)])
+
+
 def _second_guarded_profile(tmp_path):
     profile_dir = tmp_path / "profiles" / "savana_u_d"
     profile_dir.mkdir(parents=True)
@@ -262,6 +267,75 @@ def test_audit_commit_failure_restores_original_soul(monkeypatch, tmp_path):
     assert _recovery_journals(tmp_path) == []
 
 
+def test_single_audit_commit_failure_cleans_pending_audit_and_journal(monkeypatch, tmp_path):
+    profile_dir, original = _guarded_profile(tmp_path)
+
+    def fail_commit(*args, **kwargs):
+        raise IOError("single audit commit failed")
+
+    monkeypatch.setattr(guard, "_mark_audit_committed", fail_commit)
+
+    with pytest.raises(IOError, match="single audit commit failed"):
+        guard.apply_guarded_result(
+            tmp_path,
+            _result_payload(profile_dir),
+            model="test-model",
+        )
+
+    assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == original
+    assert list((profile_dir / "evolution_audit").glob("*.json")) == []
+    assert _recovery_journals(tmp_path) == []
+
+
+def test_single_double_failure_keeps_recovery_evidence_and_blocks_later_writes(
+    monkeypatch,
+    tmp_path,
+):
+    profile_dir, original = _guarded_profile(tmp_path)
+    soul_path = profile_dir / "SOUL.md"
+    original_atomic_write = guard._atomic_write_text
+
+    def fail_commit(*args, **kwargs):
+        raise IOError("single audit commit failed")
+
+    def fail_restore(path, content):
+        if Path(path) == soul_path and content == original:
+            raise IOError("single SOUL restore failed")
+        return original_atomic_write(path, content)
+
+    monkeypatch.setattr(guard, "_mark_audit_committed", fail_commit)
+    monkeypatch.setattr(guard, "_atomic_write_text", fail_restore)
+
+    with pytest.raises(guard.BatchRecoveryError) as exc_info:
+        guard.apply_guarded_result(
+            tmp_path,
+            _result_payload(profile_dir),
+            model="test-model",
+        )
+
+    assert "single audit commit failed" in str(exc_info.value)
+    assert "single SOUL restore failed" in str(exc_info.value)
+    assert soul_path.read_text(encoding="utf-8") != original
+    journals = _recovery_journals(tmp_path)
+    assert len(journals) == 1
+    journal = json.loads(journals[0].read_text(encoding="utf-8"))
+    assert journal["status"] == "recovery_required"
+    entry = journal["entries"][0]
+    assert entry["soul_state"] == "rollback_failed"
+    assert entry["audit_state"] == "retained_for_recovery"
+    audit_path = Path(entry["audit_path"])
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert audit["status"] == "pending"
+    assert audit["batch_id"] == journal["id"]
+
+    with pytest.raises(guard.BatchRecoveryError, match=str(journals[0])):
+        guard.apply_guarded_results(
+            tmp_path,
+            _result_block(profile_dir),
+            model="test-model",
+        )
+
+
 def test_batch_second_profile_write_failure_restores_first_profile(monkeypatch, tmp_path):
     first_dir, first_original = _guarded_profile(tmp_path)
     second_dir, second_original = _second_guarded_profile(tmp_path)
@@ -406,11 +480,12 @@ def test_single_result_writer_blocks_unresolved_batch_journal(tmp_path):
         json.dumps({"status": "recovery_required", "entries": []}),
         encoding="utf-8",
     )
-    block = _result_block(profile_dir)
-    result = json.loads(block[len(guard.RESULT_START):-len(guard.RESULT_END)])
-
     with pytest.raises(guard.BatchRecoveryError, match=str(journal_path)):
-        guard.apply_guarded_result(tmp_path, result, model="test-model")
+        guard.apply_guarded_result(
+            tmp_path,
+            _result_payload(profile_dir),
+            model="test-model",
+        )
 
     assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == original
     assert not (profile_dir / "evolution_audit").exists()

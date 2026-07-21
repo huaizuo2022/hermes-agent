@@ -1,5 +1,6 @@
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -41,6 +42,10 @@ def _passed_result(profile_dir):
     }
 
 
+def _recovery_journals(tmp_path):
+    return sorted((tmp_path / "savana_evolution_recovery").glob("*.json"))
+
+
 def test_rollback_restores_only_evolved_persona_and_audits_action(tmp_path):
     profile_dir, original = _guarded_profile(tmp_path)
     committed = guard.apply_guarded_result(
@@ -67,6 +72,120 @@ def test_rollback_restores_only_evolved_persona_and_audits_action(tmp_path):
     assert rollback_audit["status"] == "committed"
     assert rollback_audit["action"] == "rollback"
     assert rollback_audit["source_audit_id"] == committed["audit_id"]
+
+
+def test_rollback_audit_commit_failure_restores_soul_and_cleans_artifacts(
+    monkeypatch,
+    tmp_path,
+):
+    profile_dir, unused_original = _guarded_profile(tmp_path)
+    committed = guard.apply_guarded_result(
+        tmp_path,
+        _passed_result(profile_dir),
+        "test-model",
+    )
+    evolved = (profile_dir / "SOUL.md").read_text(encoding="utf-8")
+
+    def fail_commit(*args, **kwargs):
+        raise IOError("rollback audit commit failed")
+
+    monkeypatch.setattr(guard, "_mark_audit_committed", fail_commit)
+
+    with pytest.raises(IOError, match="rollback audit commit failed"):
+        guard.rollback_guarded_evolution(
+            tmp_path,
+            profile_dir.name,
+            committed["audit_id"],
+        )
+
+    assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == evolved
+    audit_paths = sorted((profile_dir / "evolution_audit").glob("*.json"))
+    assert [path.stem for path in audit_paths] == [committed["audit_id"]]
+    assert _recovery_journals(tmp_path) == []
+
+
+def test_rollback_double_failure_keeps_recovery_evidence_and_blocks_evolution(
+    monkeypatch,
+    tmp_path,
+):
+    profile_dir, unused_original = _guarded_profile(tmp_path)
+    committed = guard.apply_guarded_result(
+        tmp_path,
+        _passed_result(profile_dir),
+        "test-model",
+    )
+    soul_path = profile_dir / "SOUL.md"
+    evolved = soul_path.read_text(encoding="utf-8")
+    original_atomic_write = guard._atomic_write_text
+
+    def fail_commit(*args, **kwargs):
+        raise IOError("rollback audit commit failed")
+
+    def fail_restore(path, content):
+        if Path(path) == soul_path and content == evolved:
+            raise IOError("rollback SOUL restore failed")
+        return original_atomic_write(path, content)
+
+    monkeypatch.setattr(guard, "_mark_audit_committed", fail_commit)
+    monkeypatch.setattr(guard, "_atomic_write_text", fail_restore)
+
+    with pytest.raises(guard.BatchRecoveryError) as exc_info:
+        guard.rollback_guarded_evolution(
+            tmp_path,
+            profile_dir.name,
+            committed["audit_id"],
+        )
+
+    assert "rollback audit commit failed" in str(exc_info.value)
+    assert "rollback SOUL restore failed" in str(exc_info.value)
+    assert soul_path.read_text(encoding="utf-8") != evolved
+    journals = _recovery_journals(tmp_path)
+    assert len(journals) == 1
+    journal = json.loads(journals[0].read_text(encoding="utf-8"))
+    assert journal["status"] == "recovery_required"
+    assert journal["action"] == "rollback"
+    entry = journal["entries"][0]
+    assert entry["soul_state"] == "rollback_failed"
+    assert entry["audit_state"] == "retained_for_recovery"
+    rollback_audit = json.loads(Path(entry["audit_path"]).read_text(encoding="utf-8"))
+    assert rollback_audit["status"] == "pending"
+    assert rollback_audit["action"] == "rollback"
+    assert rollback_audit["source_audit_id"] == committed["audit_id"]
+    assert rollback_audit["batch_id"] == journal["id"]
+
+    with pytest.raises(guard.BatchRecoveryError, match=str(journals[0])):
+        guard.apply_guarded_result(
+            tmp_path,
+            _passed_result(profile_dir),
+            "test-model",
+        )
+
+
+def test_operator_rollback_remains_available_with_unresolved_recovery_journal(tmp_path):
+    profile_dir, original = _guarded_profile(tmp_path)
+    committed = guard.apply_guarded_result(
+        tmp_path,
+        _passed_result(profile_dir),
+        "test-model",
+    )
+    recovery_dir = tmp_path / "savana_evolution_recovery"
+    recovery_dir.mkdir(exist_ok=True)
+    unresolved_path = recovery_dir / "existing.json"
+    unresolved_path.write_text(
+        json.dumps({"status": "recovery_required", "entries": []}),
+        encoding="utf-8",
+    )
+
+    rollback = guard.rollback_guarded_evolution(
+        tmp_path,
+        profile_dir.name,
+        committed["audit_id"],
+    )
+
+    restored = (profile_dir / "SOUL.md").read_text(encoding="utf-8")
+    assert guard.extract_evolved_persona(restored) == guard.extract_evolved_persona(original)
+    assert rollback["status"] == "committed"
+    assert unresolved_path.exists()
 
 
 def test_rollback_refuses_when_current_persona_no_longer_matches_audit(tmp_path):
