@@ -8,6 +8,7 @@ from pathlib import Path
 
 from hermes_cli.companion_profile_policy import (
     GUARDED_POLICY,
+    GUARDED_V2_POLICY,
     profile_lock,
     read_evolution_policy,
 )
@@ -28,6 +29,7 @@ _RESULT_RE = re.compile(
     re.escape(RESULT_START) + r"(.*?)" + re.escape(RESULT_END),
     re.DOTALL,
 )
+_SUPPORTED_POLICIES = frozenset([GUARDED_POLICY, GUARDED_V2_POLICY])
 
 
 class InvalidEvolutionResult(ValueError):
@@ -132,7 +134,7 @@ def _resolve_profile_dir(hermes_home, profile_id):
     return profile_dir
 
 
-def _write_pending_audit(profile_dir, original, updated, result, model, action="evolution", source_audit_id=None):
+def _write_pending_audit(profile_dir, original, updated, result, model, policy, action="evolution", source_audit_id=None):
     audit_dir = profile_dir / "evolution_audit"
     audit_dir.mkdir(parents=True, exist_ok=True)
     audit_id = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ-") + uuid.uuid4().hex
@@ -142,7 +144,7 @@ def _write_pending_audit(profile_dir, original, updated, result, model, action="
         "action": action,
         "status": "pending",
         "created_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-        "policy": GUARDED_POLICY,
+        "policy": policy,
         "model": str(model or ""),
         "reason": str(result.get("reason") or ""),
         "self_review": result.get("self_review") or {},
@@ -178,12 +180,14 @@ def _review_passes(result):
     )
 
 
-def apply_guarded_result(hermes_home, result, model):
+def apply_guarded_result(hermes_home, result, model, policy=GUARDED_POLICY):
     _validate_result_shape(result)
+    if policy not in _SUPPORTED_POLICIES:
+        raise EvolutionPolicyError("unsupported evolution policy")
     profile_id = result["profile_id"]
     profile_dir = _resolve_profile_dir(hermes_home, profile_id)
-    if read_evolution_policy(profile_dir) != GUARDED_POLICY:
-        raise EvolutionPolicyError("profile is not guarded_v1")
+    if read_evolution_policy(profile_dir) != policy:
+        raise EvolutionPolicyError("profile is not {0}".format(policy))
     with profile_lock(profile_dir, "soul"):
         soul_path = profile_dir / "SOUL.md"
         original = soul_path.read_text(encoding="utf-8")
@@ -199,7 +203,7 @@ def apply_guarded_result(hermes_home, result, model):
         )
         if strip_evolved_persona(updated) != strip_evolved_persona(original):
             raise InvalidEvolutionResult("candidate changed base persona")
-        audit_path = _write_pending_audit(profile_dir, original, updated, result, model)
+        audit_path = _write_pending_audit(profile_dir, original, updated, result, model, policy)
         try:
             _atomic_write_text(soul_path, updated)
             _mark_audit_committed(audit_path)
@@ -213,7 +217,7 @@ def apply_guarded_result(hermes_home, result, model):
         }
 
 
-def apply_guarded_results(hermes_home, output, model):
+def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY):
     matches = list(_RESULT_RE.finditer(str(output or "")))
     parsed = []
     responses = []
@@ -241,7 +245,7 @@ def apply_guarded_results(hermes_home, output, model):
                 })
             continue
         try:
-            responses.append(apply_guarded_result(hermes_home, result, model))
+            responses.append(apply_guarded_result(hermes_home, result, model, policy=policy))
         except StaleEvolutionError as exc:
             responses.append({"profile_id": profile_id, "status": "stale", "error": str(exc)})
         except EvolutionPolicyError as exc:
@@ -278,6 +282,7 @@ def rollback_guarded_evolution(hermes_home, profile_id, audit_id):
             updated,
             rollback_result,
             "operator",
+            read_evolution_policy(profile_dir),
             action="rollback",
             source_audit_id=audit_id,
         )

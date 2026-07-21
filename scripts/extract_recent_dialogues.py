@@ -19,9 +19,11 @@ from datetime import datetime
 
 from hermes_cli.companion_profile_policy import (
     GUARDED_POLICY,
+    GUARDED_V2_POLICY,
     LEGACY_POLICY,
     read_evolution_policy,
 )
+from hermes_cli.companion_turn_guard import TurnReviewStore, assistant_sha256
 
 DEFAULT_BATCH_SIZE = 10
 DEFAULT_MESSAGE_LIMIT = 30
@@ -178,7 +180,7 @@ def strip_invisible_chars(text):
 def dedupe_messages(rows):
     messages = []
     last_msg = None
-    for role, content, timestamp in rows:
+    for message_id, role, content, timestamp in rows:
         cleaned_content = strip_invisible_chars(content)
         if (
             last_msg
@@ -188,6 +190,7 @@ def dedupe_messages(rows):
         ):
             continue
         msg_obj = {
+            "message_id": "" if message_id is None else str(message_id),
             "role": role,
             "content": cleaned_content,
             "timestamp": timestamp,
@@ -206,7 +209,7 @@ def get_messages_for_window(db_path, window_start, window_end, limit):
         cursor = conn.cursor()
         cursor.execute(
             """
-                SELECT role, content, timestamp
+                SELECT id, role, content, timestamp
                 FROM messages
                 WHERE role IN ('user', 'assistant')
                   AND timestamp >= ?
@@ -307,7 +310,7 @@ def chunk_profiles(profiles, batch_size):
 def chunk_profiles_by_policy(profiles, batch_size):
     batches = []
     batch_policies = []
-    for policy in (LEGACY_POLICY, GUARDED_POLICY):
+    for policy in (LEGACY_POLICY, GUARDED_POLICY, GUARDED_V2_POLICY):
         policy_profiles = [
             item for item in profiles
             if item.get("evolution_policy", LEGACY_POLICY) == policy
@@ -426,6 +429,61 @@ def format_message_content(content):
     return content
 
 
+def _is_quality_correction_message(content):
+    lowered = str(content or "").lower()
+    markers = (
+        "ooc",
+        "出戏",
+        "系统提示词",
+        "提示词",
+        "机械",
+        "像客服",
+        "访客",
+        "别总",
+        "不要再",
+        "不许把我",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _print_guarded_v2_dialogue(chat):
+    print("\n### Dialogue History\n")
+    store = TurnReviewStore(chat["profile_path"])
+    previous_user = None
+    for message in chat["messages"]:
+        if message["role"] == "user":
+            previous_user = message
+            suffix = " [quality_correction_only]" if _is_quality_correction_message(message.get("content")) else ""
+            print("[evolution_evidence] USER: {0}{1}".format(
+                format_message_content(message.get("content") or ""),
+                suffix,
+            ))
+            print("")
+            continue
+        if message["role"] != "assistant":
+            continue
+        turn_id = str((previous_user or {}).get("message_id") or "")
+        record = store.get(turn_id) if turn_id else None
+        if (
+            not record
+            or record.get("status") in ("pending", "invalid")
+            or record.get("assistant_sha256") != assistant_sha256(message.get("content") or "")
+        ):
+            print("[context_only] ASSISTANT: [review unavailable]")
+            print("")
+            continue
+        if record.get("status") == "drift":
+            print("[context_only] ASSISTANT SUMMARY: {0}".format(
+                record.get("continuity_summary") or "[review unavailable]"
+            ))
+            print("")
+            continue
+        print("[context_only] ASSISTANT: {0}".format(
+            format_message_content(message.get("content") or "")
+        ))
+        print("")
+
+
 def print_manifest_header(now_dt, manifest, current_batch_count, batch_policy):
     print("# Savana Characters Evolution Report")
     print("Generated at: {}\n".format(now_dt.strftime("%Y-%m-%d %H:%M:%S")))
@@ -436,8 +494,8 @@ def print_manifest_header(now_dt, manifest, current_batch_count, batch_policy):
     ))
     print("- Batch Size: {}".format(manifest.get("batch_size", DEFAULT_BATCH_SIZE)))
     print("- Profiles Included In Batch: {}".format(current_batch_count))
-    if batch_policy == GUARDED_POLICY:
-        print("- Evolution Batch Policy: {}".format(GUARDED_POLICY))
+    if batch_policy in (GUARDED_POLICY, GUARDED_V2_POLICY):
+        print("- Evolution Batch Policy: {}".format(batch_policy))
     print("- Total Eligible Profiles Yesterday: {}".format(manifest.get("total_profiles", 0)))
     print("- Per-Profile Message Limit: {}\n".format(
         manifest.get("message_limit", DEFAULT_MESSAGE_LIMIT)
@@ -462,21 +520,24 @@ def print_profile_section(chat, now_ts):
     print("  ```markdown")
     print("  " + (chat["evolved_persona"] or "(暂无自主进化，人设遵循基础设定)"))
     print("  ```")
-    if chat.get("evolution_policy") == GUARDED_POLICY:
+    if chat.get("evolution_policy") in (GUARDED_POLICY, GUARDED_V2_POLICY):
         print("- SOUL.md SHA-256: {}".format(chat["soul_sha256"]))
         print("\n### Base Persona Snapshot\n")
         print("```markdown")
         print(chat.get("base_soul") or "")
         print("```")
-    print("\n### Dialogue History\n")
-    for msg in chat["messages"]:
-        role_display = "User" if msg["role"] == "user" else chat["character_name"]
-        print("[{} ({})]: {}".format(
-            role_display,
-            display_time(msg["timestamp"]),
-            format_message_content(msg["content"] or "")
-        ))
-        print("")
+    if chat.get("evolution_policy") == GUARDED_V2_POLICY:
+        _print_guarded_v2_dialogue(chat)
+    else:
+        print("\n### Dialogue History\n")
+        for msg in chat["messages"]:
+            role_display = "User" if msg["role"] == "user" else chat["character_name"]
+            print("[{} ({})]: {}".format(
+                role_display,
+                display_time(msg["timestamp"]),
+                format_message_content(msg["content"] or "")
+            ))
+            print("")
     print("---\n")
 
 

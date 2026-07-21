@@ -6,11 +6,11 @@ import pytest
 from hermes_cli import savana_evolution_guard as guard
 
 
-def _guarded_profile(tmp_path):
+def _guarded_profile(tmp_path, policy="guarded_v1"):
     profile_dir = tmp_path / "profiles" / "savana_u_c"
     profile_dir.mkdir(parents=True)
     (profile_dir / "profile.yaml").write_text(
-        "evolution_policy: guarded_v1\n",
+        "evolution_policy: {0}\n".format(policy),
         encoding="utf-8",
     )
     original = (
@@ -89,8 +89,27 @@ def test_passed_result_changes_only_evolved_persona_and_commits_audit(tmp_path):
     audit_path = profile_dir / "evolution_audit" / (result[0]["audit_id"] + ".json")
     audit = json.loads(audit_path.read_text(encoding="utf-8"))
     assert audit["status"] == "committed"
+    assert audit["policy"] == "guarded_v1"
     assert audit["before"] == "基础状态"
     assert audit["after"] == "更愿意简短承认自己的担心。"
+
+
+def test_guarded_v2_result_commits_audit_with_v2_policy(tmp_path):
+    profile_dir, original = _guarded_profile(tmp_path, policy="guarded_v2")
+
+    result = guard.apply_guarded_results(
+        tmp_path,
+        _result_block(profile_dir),
+        model="test-model",
+        policy="guarded_v2",
+    )
+
+    updated = (profile_dir / "SOUL.md").read_text(encoding="utf-8")
+    assert guard.strip_evolved_persona(updated) == guard.strip_evolved_persona(original)
+    audit_path = profile_dir / "evolution_audit" / (result[0]["audit_id"] + ".json")
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert audit["status"] == "committed"
+    assert audit["policy"] == "guarded_v2"
 
 
 def test_hash_mismatch_refuses_stale_candidate(tmp_path):
@@ -109,6 +128,19 @@ def test_hash_mismatch_refuses_stale_candidate(tmp_path):
 def test_legacy_profile_cannot_use_guarded_writer(tmp_path):
     profile_dir, original = _guarded_profile(tmp_path)
     (profile_dir / "profile.yaml").unlink()
+
+    result = guard.apply_guarded_results(
+        tmp_path,
+        _result_block(profile_dir),
+        model="test-model",
+    )
+
+    assert result[0]["status"] == "rejected"
+    assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == original
+
+
+def test_guarded_v1_writer_rejects_guarded_v2_profile(tmp_path):
+    profile_dir, original = _guarded_profile(tmp_path, policy="guarded_v2")
 
     result = guard.apply_guarded_results(
         tmp_path,

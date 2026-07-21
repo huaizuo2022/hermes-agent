@@ -134,7 +134,9 @@ SILENT_MARKER = "[SILENT]"
 _SAVANA_EVOLUTION_JOB_NAME = "Savana-Self-Evolution"
 _SAVANA_EVOLUTION_CONTINUE_MINUTES = 5
 _SAVANA_GUARDED_SKILL = "savana-companion-evolution-guarded"
+_SAVANA_GUARDED_V2_SKILL = "savana-companion-evolution-guarded-v2"
 _SAVANA_GUARDED_REPORT_MARKER = "- Evolution Batch Policy: guarded_v1"
+_SAVANA_GUARDED_V2_REPORT_MARKER = "- Evolution Batch Policy: guarded_v2"
 
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
@@ -251,11 +253,29 @@ def _is_savana_evolution_job(job: dict) -> bool:
 
 
 def _is_guarded_savana_report(value: str) -> bool:
-    return _SAVANA_GUARDED_REPORT_MARKER in str(value or "")
+    raw_value = str(value or "")
+    return (
+        _SAVANA_GUARDED_REPORT_MARKER in raw_value
+        or _SAVANA_GUARDED_V2_REPORT_MARKER in raw_value
+    )
+
+
+def _extract_savana_guarded_policy(value: str) -> Optional[str]:
+    raw_value = str(value or "")
+    if _SAVANA_GUARDED_V2_REPORT_MARKER in raw_value:
+        return "guarded_v2"
+    if _SAVANA_GUARDED_REPORT_MARKER in raw_value:
+        return "guarded_v1"
+    return None
 
 
 def _select_savana_evolution_skills(job: dict, skills, script_output: str):
-    if _is_savana_evolution_job(job) and _is_guarded_savana_report(script_output):
+    policy = _extract_savana_guarded_policy(script_output)
+    if not _is_savana_evolution_job(job) or policy is None:
+        return skills
+    if policy == "guarded_v2":
+        return [_SAVANA_GUARDED_V2_SKILL]
+    if policy == "guarded_v1":
         return [_SAVANA_GUARDED_SKILL]
     return skills
 
@@ -278,11 +298,15 @@ def _apply_savana_evolution_output(
     model: str,
     hermes_home: Path,
 ):
-    if not (_is_savana_evolution_job(job) and _is_guarded_savana_report(prompt)):
+    policy = _extract_savana_guarded_policy(prompt)
+    if not (_is_savana_evolution_job(job) and policy):
         return []
     from hermes_cli.savana_evolution_guard import apply_guarded_results
 
-    results = apply_guarded_results(hermes_home, final_response, model)
+    if policy == "guarded_v2":
+        results = apply_guarded_results(hermes_home, final_response, model, policy=policy)
+    else:
+        results = apply_guarded_results(hermes_home, final_response, model)
     expected_profile_ids = _extract_savana_profile_ids(prompt)
     observed_profile_ids = {
         result.get("profile_id") for result in results if result.get("profile_id")
