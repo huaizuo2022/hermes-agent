@@ -586,6 +586,47 @@ def test_guarded_v2_drift_summary_that_repeats_raw_falls_back_to_unavailable(mon
     assert output.count("[context_only] ASSISTANT: [review unavailable]") >= 2
 
 
+@pytest.mark.parametrize("review_status", ["unknown", ""])
+def test_guarded_v2_unknown_or_empty_review_status_hides_assistant_raw(
+    monkeypatch,
+    tmp_path,
+    capsys,
+    review_status,
+):
+    module = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("SAVANA_EVOLUTION_TARGET_DATE", "2026-06-15")
+    monkeypatch.setenv("SAVANA_EVOLUTION_SOURCE_DATE", "2026-06-14")
+    assistant_text = "不应泄漏的未验证原文"
+    profile_dir = _write_profile(
+        tmp_path,
+        "savana_guarded_v2_character",
+        "二代角色",
+        3,
+        [
+            {
+                "id": 1,
+                "role": "user",
+                "content": "请记录这一轮。",
+                "timestamp": 1781402400,
+                "platform_message_id": "turn-untrusted",
+            },
+            {"id": 2, "role": "assistant", "content": assistant_text, "timestamp": 1781402460},
+        ],
+        policy="guarded_v2",
+    )
+    _write_raw_turn_review_db(
+        profile_dir,
+        [("turn-untrusted", assistant_sha256(assistant_text), review_status, "")],
+    )
+
+    module.main()
+    output = capsys.readouterr().out
+
+    assert assistant_text not in output
+    assert "[context_only] ASSISTANT: [review unavailable]" in output
+
+
 def test_quality_correction_detection_is_narrow(tmp_path):
     module = _load_module()
 

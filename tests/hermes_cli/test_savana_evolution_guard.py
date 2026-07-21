@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -73,6 +74,17 @@ def _second_guarded_profile(tmp_path):
 
 def _recovery_journals(tmp_path):
     return sorted((tmp_path / "savana_evolution_recovery").glob("*.json"))
+
+
+def _reject_canonical_profile_locks(monkeypatch, message):
+    original_profile_lock = guard.profile_lock
+
+    def checked_lock(profile_dir, purpose):
+        if purpose == "savana-evolution-recovery-transaction":
+            return original_profile_lock(profile_dir, purpose)
+        pytest.fail(message)
+
+    monkeypatch.setattr(guard, "profile_lock", checked_lock)
 
 
 def test_no_change_does_not_touch_soul(tmp_path):
@@ -471,6 +483,89 @@ def test_batch_audit_cleanup_failure_is_exposed_and_journaled(monkeypatch, tmp_p
     assert any(Path(item["audit_path"]).exists() for item in journal["entries"])
 
 
+def test_recovery_gate_is_held_until_failed_transaction_records_recovery(
+    monkeypatch,
+    tmp_path,
+):
+    profile_dir, original = _guarded_profile(tmp_path)
+    soul_path = profile_dir / "SOUL.md"
+    writer_a_output = _result_block(profile_dir)
+    writer_b_output = _result_block(
+        profile_dir,
+        candidate_evolved_persona="Writer B must never write this candidate.",
+    )
+    original_atomic_write = guard._atomic_write_text
+    original_require_recovery = guard._require_no_pending_recovery
+    writer_a_at_commit = threading.Event()
+    release_writer_a = threading.Event()
+    writer_b_started = threading.Event()
+    writer_b_checked_gate = threading.Event()
+    outcomes = {}
+
+    def track_recovery_gate(hermes_home):
+        if threading.current_thread().name == "writer-b":
+            writer_b_checked_gate.set()
+        return original_require_recovery(hermes_home)
+
+    def fail_writer_a_commit(*args, **kwargs):
+        if threading.current_thread().name == "writer-a":
+            writer_a_at_commit.set()
+            assert release_writer_a.wait(3)
+            raise IOError("writer A audit commit failed")
+        return None
+
+    def fail_writer_a_restore(path, content):
+        if (
+            threading.current_thread().name == "writer-a"
+            and Path(path) == soul_path
+            and content == original
+        ):
+            raise IOError("writer A SOUL restore failed")
+        return original_atomic_write(path, content)
+
+    def run_writer_a():
+        try:
+            guard.apply_guarded_results(tmp_path, writer_a_output, model="writer-a")
+        except Exception as exc:
+            outcomes["a"] = exc
+
+    def run_writer_b():
+        writer_b_started.set()
+        try:
+            outcomes["b"] = guard.apply_guarded_results(
+                tmp_path,
+                writer_b_output,
+                model="writer-b",
+            )
+        except Exception as exc:
+            outcomes["b"] = exc
+
+    monkeypatch.setattr(guard, "_require_no_pending_recovery", track_recovery_gate)
+    monkeypatch.setattr(guard, "_mark_audit_committed", fail_writer_a_commit)
+    monkeypatch.setattr(guard, "_atomic_write_text", fail_writer_a_restore)
+    writer_a = threading.Thread(target=run_writer_a, name="writer-a")
+    writer_b = threading.Thread(target=run_writer_b, name="writer-b")
+
+    writer_a.start()
+    assert writer_a_at_commit.wait(3)
+    writer_b.start()
+    assert writer_b_started.wait(3)
+    writer_b_crossed_gate_while_a_active = writer_b_checked_gate.wait(0.5)
+    release_writer_a.set()
+    writer_a.join(3)
+    writer_b.join(3)
+
+    assert writer_a.is_alive() is False
+    assert writer_b.is_alive() is False
+    assert writer_b_crossed_gate_while_a_active is False
+    assert isinstance(outcomes["a"], guard.BatchRecoveryError)
+    assert isinstance(outcomes["b"], guard.BatchRecoveryError)
+    assert "Writer B must never write this candidate." not in soul_path.read_text(encoding="utf-8")
+    journals = _recovery_journals(tmp_path)
+    assert len(journals) == 1
+    assert len(list((profile_dir / "evolution_audit").glob("*.json"))) == 1
+
+
 def test_single_result_writer_blocks_unresolved_batch_journal(tmp_path):
     profile_dir, original = _guarded_profile(tmp_path)
     recovery_dir = tmp_path / "savana_evolution_recovery"
@@ -493,10 +588,9 @@ def test_single_result_writer_blocks_unresolved_batch_journal(tmp_path):
 
 def test_explicit_empty_expected_profile_ids_fail_closed_before_write(monkeypatch, tmp_path):
     profile_dir, original = _guarded_profile(tmp_path)
-    monkeypatch.setattr(
-        guard,
-        "profile_lock",
-        lambda *args, **kwargs: pytest.fail("empty expected set must not acquire locks"),
+    _reject_canonical_profile_locks(
+        monkeypatch,
+        "empty expected set must not acquire canonical profile locks",
     )
 
     result = guard.apply_guarded_results(
@@ -516,10 +610,9 @@ def test_explicit_empty_expected_profile_ids_fail_closed_before_write(monkeypatc
 
 def test_duplicate_expected_profile_ids_fail_closed_before_lock(monkeypatch, tmp_path):
     profile_dir, original = _guarded_profile(tmp_path)
-    monkeypatch.setattr(
-        guard,
-        "profile_lock",
-        lambda *args, **kwargs: pytest.fail("duplicate expected ids must not acquire locks"),
+    _reject_canonical_profile_locks(
+        monkeypatch,
+        "duplicate expected ids must not acquire canonical profile locks",
     )
 
     result = guard.apply_guarded_results(
@@ -542,10 +635,9 @@ def test_profile_symlink_aliases_are_rejected_before_lock(monkeypatch, tmp_path)
     alias_dir = tmp_path / "profiles" / "savana_alias"
     alias_dir.symlink_to(profile_dir.name, target_is_directory=True)
     output = "\n".join([_result_block(profile_dir), _result_block(alias_dir)])
-    monkeypatch.setattr(
-        guard,
-        "profile_lock",
-        lambda *args, **kwargs: pytest.fail("canonical aliases must not acquire locks"),
+    _reject_canonical_profile_locks(
+        monkeypatch,
+        "canonical aliases must not acquire canonical profile locks",
     )
 
     result = guard.apply_guarded_results(

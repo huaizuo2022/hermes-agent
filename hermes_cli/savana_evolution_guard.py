@@ -32,6 +32,7 @@ _RESULT_RE = re.compile(
 )
 _SUPPORTED_POLICIES = frozenset([GUARDED_POLICY, GUARDED_V2_POLICY])
 _RECOVERY_DIR_NAME = "savana_evolution_recovery"
+_RECOVERY_LOCK_PURPOSE = "savana-evolution-recovery-transaction"
 
 
 class InvalidEvolutionResult(ValueError):
@@ -200,6 +201,11 @@ def _review_passes(result):
 
 def _recovery_dir(hermes_home):
     return Path(hermes_home) / _RECOVERY_DIR_NAME
+
+
+def _recovery_transaction_lock(hermes_home):
+    lock_target = Path(hermes_home).resolve() / ".savana-evolution-recovery"
+    return profile_lock(lock_target, _RECOVERY_LOCK_PURPOSE)
 
 
 def _pending_recovery_journals(hermes_home):
@@ -523,8 +529,13 @@ def _commit_prepared_batch(
         raise
 
 
-def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY, expected_profile_ids=None):
-    _require_no_pending_recovery(hermes_home)
+def _apply_guarded_results_locked(
+    hermes_home,
+    output,
+    model,
+    policy=GUARDED_POLICY,
+    expected_profile_ids=None,
+):
     matches = list(_RESULT_RE.finditer(str(output or "")))
     parsed = []
     responses = []
@@ -648,49 +659,62 @@ def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY, exp
         )
 
 
+def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY, expected_profile_ids=None):
+    with _recovery_transaction_lock(hermes_home):
+        _require_no_pending_recovery(hermes_home)
+        return _apply_guarded_results_locked(
+            hermes_home,
+            output,
+            model,
+            policy=policy,
+            expected_profile_ids=expected_profile_ids,
+        )
+
+
 def rollback_guarded_evolution(hermes_home, profile_id, audit_id):
     profile_dir = _resolve_profile_dir(hermes_home, profile_id)
     if not _AUDIT_ID_RE.match(str(audit_id or "")):
         raise InvalidEvolutionResult("invalid audit_id")
     audit_path = profile_dir / "evolution_audit" / (audit_id + ".json")
-    with profile_lock(profile_dir, "soul"):
-        policy = read_evolution_policy(profile_dir)
-        if policy not in _SUPPORTED_POLICIES:
-            raise EvolutionPolicyError("profile is not guarded")
-        with open(str(audit_path), "r", encoding="utf-8") as handle:
-            source_audit = json.load(handle)
-        if source_audit.get("status") != "committed":
-            raise InvalidEvolutionResult("audit is not committed")
-        source_policy = source_audit.get("policy")
-        if source_policy is None and policy == GUARDED_POLICY:
-            source_policy = GUARDED_POLICY
-        if source_policy != policy:
-            raise EvolutionPolicyError("audit policy does not match current profile policy")
-        soul_path = profile_dir / "SOUL.md"
-        original = soul_path.read_text(encoding="utf-8")
-        if extract_evolved_persona(original) != source_audit.get("after"):
-            raise StaleEvolutionError("current persona differs from audit version")
-        updated = replace_evolved_persona(original, source_audit.get("before"))
-        rollback_result = {
-            "expected_soul_sha256": _sha256_text(original),
-            "reason": "operator rollback to audit {0}".format(audit_id),
-            "self_review": {},
-        }
-        prepared = [{
-            "profile_id": profile_id,
-            "status": "committable",
-            "profile_dir": profile_dir,
-            "soul_path": soul_path,
-            "original": original,
-            "updated": updated,
-            "result": rollback_result,
-        }]
-        responses = _commit_prepared_batch(
-            hermes_home,
-            prepared,
-            "operator",
-            policy,
-            action="rollback",
-            source_audit_ids={profile_id: audit_id},
-        )
-        return responses[0]
+    with _recovery_transaction_lock(hermes_home):
+        with profile_lock(profile_dir, "soul"):
+            policy = read_evolution_policy(profile_dir)
+            if policy not in _SUPPORTED_POLICIES:
+                raise EvolutionPolicyError("profile is not guarded")
+            with open(str(audit_path), "r", encoding="utf-8") as handle:
+                source_audit = json.load(handle)
+            if source_audit.get("status") != "committed":
+                raise InvalidEvolutionResult("audit is not committed")
+            source_policy = source_audit.get("policy")
+            if source_policy is None and policy == GUARDED_POLICY:
+                source_policy = GUARDED_POLICY
+            if source_policy != policy:
+                raise EvolutionPolicyError("audit policy does not match current profile policy")
+            soul_path = profile_dir / "SOUL.md"
+            original = soul_path.read_text(encoding="utf-8")
+            if extract_evolved_persona(original) != source_audit.get("after"):
+                raise StaleEvolutionError("current persona differs from audit version")
+            updated = replace_evolved_persona(original, source_audit.get("before"))
+            rollback_result = {
+                "expected_soul_sha256": _sha256_text(original),
+                "reason": "operator rollback to audit {0}".format(audit_id),
+                "self_review": {},
+            }
+            prepared = [{
+                "profile_id": profile_id,
+                "status": "committable",
+                "profile_dir": profile_dir,
+                "soul_path": soul_path,
+                "original": original,
+                "updated": updated,
+                "result": rollback_result,
+            }]
+            responses = _commit_prepared_batch(
+                hermes_home,
+                prepared,
+                "operator",
+                policy,
+                action="rollback",
+                source_audit_ids={profile_id: audit_id},
+            )
+            return responses[0]

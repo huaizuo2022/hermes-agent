@@ -564,20 +564,24 @@ def _print_guarded_v2_dialogue(chat):
         record = reviews.get(turn_id) if reviews and turn_id else None
         if (
             not record
-            or record.get("status") in ("pending", "invalid")
+            or record.get("status") not in ("clean", "drift")
             or record.get("assistant_sha256") != assistant_sha256(message.get("content") or "")
         ):
             print("[context_only] ASSISTANT: [review unavailable]")
             print("")
             continue
         if record.get("status") == "drift":
-            if _summary_leaks_raw(record.get("continuity_summary"), message.get("content")):
+            continuity_summary = record.get("continuity_summary") or ""
+            if not continuity_summary or _summary_leaks_raw(
+                continuity_summary,
+                message.get("content"),
+            ):
                 print("[context_only] ASSISTANT: [review unavailable]")
                 print("")
                 continue
             print("[context_only] ASSISTANT SUMMARY: {0}".format(
                 _encode_guarded_report_content(
-                    record.get("continuity_summary") or "[review unavailable]"
+                    continuity_summary
                 )
             ))
             print("")
