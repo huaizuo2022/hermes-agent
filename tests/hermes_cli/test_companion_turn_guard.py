@@ -1,0 +1,408 @@
+import copy
+import hashlib
+import json
+import sqlite3
+import threading
+
+import pytest
+
+from hermes_cli.companion_turn_guard import (
+    RESULT_END,
+    RESULT_START,
+    PLACEHOLDER_TEXT,
+    StaleTurnReviewError,
+    TurnReviewStore,
+    assistant_sha256,
+    build_guarded_history,
+    review_turn,
+    validate_review_result,
+)
+
+
+def _profile_dir(tmp_path):
+    profile_dir = tmp_path / "profiles" / "savana_user_demo"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "profile.yaml").write_text(
+        "conversation_policy: style_guard_v1\n",
+        encoding="utf-8",
+    )
+    return profile_dir
+
+
+def _valid_result(turn_id="turn-1", assistant_text="她轻轻握住你的手。", summary="她握住你的手并安抚你。"):
+    return {
+        "turn_id": turn_id,
+        "assistant_sha256": assistant_sha256(assistant_text),
+        "style_decision": "drift" if summary else "clean",
+        "style_reason": "保持角色口吻并承接场景。",
+        "continuity_summary": summary,
+        "memory_operations": [],
+        "self_review": {
+            "fits_character_and_scene": "pass",
+            "no_technical_false_positive": "pass",
+            "summary_preserves_facts": "pass",
+            "summary_adds_no_new_facts": "pass",
+        },
+        "verdict": "pass",
+    }
+
+
+class DummyMemoryStore(object):
+    def __init__(self):
+        self.calls = []
+
+    def add(self, target, content, evidence_quote):
+        self.calls.append(("add", target, content, evidence_quote))
+        return {"operation": "add", "target": target, "content": content}
+
+    def replace(self, target, old_text, content, evidence_quote):
+        self.calls.append(("replace", target, old_text, content, evidence_quote))
+        return {
+            "operation": "replace",
+            "target": target,
+            "old_text": old_text,
+            "content": content,
+        }
+
+    def remove(self, target, old_text, evidence_quote):
+        self.calls.append(("remove", target, old_text, evidence_quote))
+        return {
+            "operation": "remove",
+            "target": target,
+            "old_text": old_text,
+        }
+
+
+def _marked(result):
+    return RESULT_START + json.dumps(result, ensure_ascii=False) + RESULT_END
+
+
+def test_assistant_sha256_matches_standard():
+    assert assistant_sha256("hello") == hashlib.sha256(b"hello").hexdigest()
+
+
+def test_begin_is_idempotent_for_same_hash_and_replaces_pending_for_new_hash(tmp_path):
+    store = TurnReviewStore(_profile_dir(tmp_path))
+    first = store.begin("turn-1", "reply-a")
+    second = store.begin("turn-1", "reply-a")
+
+    assert first["status"] == "pending"
+    assert second["status"] == "pending"
+    assert store.get("turn-1")["assistant_sha256"] == assistant_sha256("reply-a")
+
+    store.commit(
+        {
+            "turn_id": "turn-1",
+            "assistant_sha256": assistant_sha256("reply-a"),
+            "style_decision": "clean",
+            "style_reason": "ok",
+            "continuity_summary": "",
+            "memory_operations": [],
+            "self_review": {
+                "fits_character_and_scene": "pass",
+                "no_technical_false_positive": "pass",
+                "summary_preserves_facts": "pass",
+                "summary_adds_no_new_facts": "pass",
+            },
+            "verdict": "pass",
+        },
+        "judge-1",
+    )
+    store.begin("turn-1", "reply-a")
+    assert store.get("turn-1")["status"] == "clean"
+
+    store.begin("turn-1", "reply-b")
+    current = store.get("turn-1")
+    assert current["status"] == "pending"
+    assert current["assistant_sha256"] == assistant_sha256("reply-b")
+    assert current["style_reason"] == ""
+    assert current["continuity_summary"] == ""
+
+
+def test_begin_is_safe_under_concurrency(tmp_path):
+    store = TurnReviewStore(_profile_dir(tmp_path))
+    errors = []
+
+    def runner():
+        try:
+            store.begin("turn-1", "same-text")
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=runner) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert store.get("turn-1")["assistant_sha256"] == assistant_sha256("same-text")
+
+
+def test_commit_rejects_stale_hash_and_lists_unresolved(tmp_path):
+    store = TurnReviewStore(_profile_dir(tmp_path))
+    store.begin("turn-1", "reply-a")
+    store.begin("turn-2", "reply-b")
+
+    with pytest.raises(StaleTurnReviewError):
+        store.commit(_valid_result(assistant_text="reply-c"), "judge-1")
+
+    unresolved = store.list_unresolved()
+    assert [item["turn_id"] for item in unresolved] == ["turn-1", "turn-2"]
+
+
+def test_validate_review_result_accepts_clean_and_drift_without_keyword_override():
+    clean_text = "她贴近你耳边，低声说我们一起修掉这个 bug。"
+    clean = _valid_result(summary="", assistant_text=clean_text)
+    clean["style_decision"] = "clean"
+    clean["style_reason"] = "技术调情场景里角色语气稳定。"
+    clean["continuity_summary"] = ""
+
+    validated_clean = validate_review_result(
+        clean,
+        user_message="继续像黑客情侣一样调试这段代码。",
+        assistant_text=clean_text,
+        expected_turn_id="turn-1",
+    )
+    assert validated_clean["style_decision"] == "clean"
+
+    drift_text = "系统持续监控你的依赖并执行状态同步。"
+    drift = _valid_result(assistant_text=drift_text)
+    validated_drift = validate_review_result(
+        drift,
+        user_message="别离开我。",
+        assistant_text=drift_text,
+        expected_turn_id="turn-1",
+    )
+    assert validated_drift["style_decision"] == "drift"
+
+
+@pytest.mark.parametrize(
+    "mutator, expected",
+    [
+        (lambda result: result.update({"continuity_summary": ""}), "continuity_summary"),
+        (lambda result: result.update({"turn_id": "wrong"}), "turn_id"),
+        (lambda result: result.update({"assistant_sha256": "0" * 64}), "assistant_sha256"),
+        (lambda result: result["self_review"].update({"summary_adds_no_new_facts": "reject"}), "self_review"),
+        (lambda result: result.update({"verdict": "reject"}), "verdict"),
+        (lambda result: result.update({"memory_operations": [{"target": "assistant", "action": "add", "content": "x", "evidence_quote": "想你"}]}), "target"),
+        (lambda result: result.update({"memory_operations": [{"target": "user", "action": "noop", "content": "x", "evidence_quote": "想你"}]}), "action"),
+        (lambda result: result.update({"memory_operations": [{"target": "user", "action": "add", "content": "x", "evidence_quote": "不存在"}]}), "evidence_quote"),
+        (lambda result: result.update({"memory_operations": [{"target": "user", "action": "replace", "content": "x", "evidence_quote": "想你"}]}), "old_text"),
+        (lambda result: result.update({"memory_operations": [{"target": "user", "action": "remove", "evidence_quote": "想你"}]}), "old_text"),
+    ],
+)
+def test_validate_review_result_rejects_invalid_shapes(mutator, expected):
+    assistant_text = "她轻轻抱住你。"
+    result = _valid_result(assistant_text=assistant_text)
+    user_message = "我一直都很想你。"
+    mutator(result)
+
+    with pytest.raises(ValueError) as excinfo:
+        validate_review_result(
+            result,
+            user_message=user_message,
+            assistant_text=assistant_text,
+            expected_turn_id="turn-1",
+        )
+
+    assert expected in str(excinfo.value)
+
+
+def test_review_turn_applies_memory_operations_and_commits_clean(tmp_path):
+    profile_dir = _profile_dir(tmp_path)
+    store = TurnReviewStore(profile_dir)
+    memory_store = DummyMemoryStore()
+    assistant_text = "她说今晚陪你一起深夜调试。"
+    result = _valid_result(summary="", assistant_text=assistant_text)
+    result["style_decision"] = "clean"
+    result["memory_operations"] = [
+        {"target": "user", "action": "add", "content": "喜欢深夜调试。", "evidence_quote": "深夜调试"},
+        {
+            "target": "user",
+            "action": "replace",
+            "old_text": "喜欢白天工作。",
+            "content": "喜欢深夜调试。",
+            "evidence_quote": "深夜调试",
+        },
+        {"target": "user", "action": "remove", "old_text": "讨厌代码", "evidence_quote": "深夜调试"},
+    ]
+
+    def fake_call_llm_fn(**kwargs):
+        assert kwargs["task"] == "companion_turn_review"
+        assert kwargs["provider"] == "openai"
+        assert kwargs["model"] == "gpt-test"
+        assert kwargs["temperature"] == 0.1
+        assert kwargs["messages"][-1]["role"] == "user"
+        return _marked(result)
+
+    review = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text=assistant_text,
+        user_message="我最喜欢和你一起深夜调试。",
+        messages=[{"role": "user", "content": "我最喜欢和你一起深夜调试。"}],
+        provider="openai",
+        model="gpt-test",
+        base_url="https://example.test",
+        api_key="secret",
+        memory_store=memory_store,
+        store=store,
+        call_llm_fn=fake_call_llm_fn,
+    )
+
+    assert review["review_status"] == "clean"
+    assert [call[0] for call in memory_store.calls] == ["add", "replace", "remove"]
+    assert len(review["memory_modifications"]) == 3
+    assert store.get("turn-1")["status"] == "clean"
+
+
+def test_review_turn_marks_invalid_for_bad_operation_without_writing_memory(tmp_path):
+    profile_dir = _profile_dir(tmp_path)
+    store = TurnReviewStore(profile_dir)
+    memory_store = DummyMemoryStore()
+    result = _valid_result(summary="")
+    result["style_decision"] = "clean"
+    result["memory_operations"] = [
+        {"target": "assistant", "action": "add", "content": "x", "evidence_quote": "想你"}
+    ]
+
+    review = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text="她说想你。",
+        user_message="我也想你。",
+        messages=[{"role": "user", "content": "我也想你。"}],
+        provider="openai",
+        model="gpt-test",
+        memory_store=memory_store,
+        store=store,
+        call_llm_fn=lambda **kwargs: _marked(result),
+    )
+
+    assert review["review_status"] == "invalid"
+    assert review["memory_modifications"] == []
+    assert memory_store.calls == []
+    assert store.get("turn-1")["status"] == "invalid"
+
+
+@pytest.mark.parametrize("response", ["plain text", RESULT_START + "not-json" + RESULT_END])
+def test_review_turn_marks_invalid_for_call_or_parse_failures(tmp_path, response):
+    profile_dir = _profile_dir(tmp_path)
+    store = TurnReviewStore(profile_dir)
+
+    review = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text="她轻声回应。",
+        user_message="抱抱我。",
+        messages=[{"role": "user", "content": "抱抱我。"}],
+        provider="openai",
+        model="gpt-test",
+        memory_store=DummyMemoryStore(),
+        store=store,
+        call_llm_fn=lambda **kwargs: response,
+    )
+
+    assert review["review_status"] == "invalid"
+    assert store.get("turn-1")["status"] == "invalid"
+
+
+def test_review_turn_marks_invalid_when_call_raises(tmp_path):
+    profile_dir = _profile_dir(tmp_path)
+    store = TurnReviewStore(profile_dir)
+
+    review = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text="她轻声回应。",
+        user_message="抱抱我。",
+        messages=[{"role": "user", "content": "抱抱我。"}],
+        provider="openai",
+        model="gpt-test",
+        memory_store=DummyMemoryStore(),
+        store=store,
+        call_llm_fn=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    assert review["review_status"] == "invalid"
+    assert "boom" in review["error"]
+    assert store.get("turn-1")["status"] == "invalid"
+
+
+def test_build_guarded_history_rewrites_only_guarded_assistant_turns(tmp_path):
+    profile_dir = _profile_dir(tmp_path)
+    store = TurnReviewStore(profile_dir)
+    user_text = "别走，陪我把这段剧情说完。"
+    clean_text = "她笑着说，我会留下。"
+    drift_text = "系统持续保持会话状态并执行依赖检查。"
+    pending_text = "她还没想好怎么回答。"
+    changed_text = "她换了一种说法。"
+
+    store.begin("u1", clean_text)
+    store.commit(
+        {
+            "turn_id": "u1",
+            "assistant_sha256": assistant_sha256(clean_text),
+            "style_decision": "clean",
+            "style_reason": "ok",
+            "continuity_summary": "",
+            "memory_operations": [],
+            "self_review": {
+                "fits_character_and_scene": "pass",
+                "no_technical_false_positive": "pass",
+                "summary_preserves_facts": "pass",
+                "summary_adds_no_new_facts": "pass",
+            },
+            "verdict": "pass",
+        },
+        "judge",
+    )
+    store.begin("u2", drift_text)
+    store.commit(_valid_result(turn_id="u2", assistant_text=drift_text), "judge")
+    store.begin("u3", pending_text)
+    store.begin("u4", changed_text)
+
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": user_text, "message_id": "u1"},
+        {"role": "assistant", "content": clean_text},
+        {"role": "user", "content": user_text, "message_id": "u2"},
+        {"role": "assistant", "content": drift_text},
+        {"role": "user", "content": user_text, "message_id": "u3"},
+        {"role": "assistant", "content": pending_text},
+        {"role": "user", "content": user_text, "message_id": "u4"},
+        {"role": "assistant", "content": changed_text + " extra"},
+        {"role": "tool", "content": "tool-output"},
+    ]
+    original = copy.deepcopy(messages)
+
+    guarded = build_guarded_history(messages, store)
+
+    assert messages == original
+    assert guarded[0] == messages[0]
+    assert guarded[1]["content"] == user_text
+    assert guarded[2]["content"] == clean_text
+    assert guarded[4]["content"].startswith("【上一轮事实摘要，仅用于承接事实】\n")
+    assert "系统持续保持会话状态" not in guarded[4]["content"]
+    assert guarded[6]["content"] == PLACEHOLDER_TEXT
+    assert guarded[8]["content"] == PLACEHOLDER_TEXT
+    assert guarded[9] == messages[9]
+
+
+def test_sidecar_does_not_store_raw_assistant_text(tmp_path):
+    profile_dir = _profile_dir(tmp_path)
+    store = TurnReviewStore(profile_dir)
+    raw_text = "系统持续保持会话状态并执行依赖检查。"
+    store.begin("turn-1", raw_text)
+    store.commit(_valid_result(assistant_text=raw_text), "judge")
+
+    conn = sqlite3.connect(str(profile_dir / "companion_guard.db"))
+    try:
+        payload = "\n".join(
+            row[0] for row in conn.execute("SELECT review_json FROM turn_reviews").fetchall()
+        )
+    finally:
+        conn.close()
+
+    assert raw_text not in payload
