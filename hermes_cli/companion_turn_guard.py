@@ -602,81 +602,58 @@ def _build_review_request(turn_id, assistant_text, user_message):
         assistant_text=str(assistant_text or ""),
     )
 
+def _supports_exact_lookup(memory_store):
+    return bool(
+        memory_store is not None
+        and (hasattr(memory_store, "has_exact") or hasattr(memory_store, "_entries_for"))
+    )
 
-def _apply_memory_operations(memory_store, operations):
-    modifications = []
-    if memory_store is None:
-        return modifications
-    for operation in operations:
-        if operation["action"] == "add":
-            modifications.append(
-                memory_store.add(
-                    operation["target"],
-                    operation["content"],
-                    operation["evidence_quote"],
-                )
-            )
-        elif operation["action"] == "replace":
-            modifications.append(
-                memory_store.replace(
-                    operation["target"],
-                    operation["old_text"],
-                    operation["content"],
-                    operation["evidence_quote"],
-                )
-            )
-        else:
-            modifications.append(
-                memory_store.remove(
-                    operation["target"],
-                    operation["old_text"],
-                    operation["evidence_quote"],
-                )
-            )
-    return modifications
+
+def _memory_store_has_exact(memory_store, target, text):
+    if not _supports_exact_lookup(memory_store):
+        return False
+    if hasattr(memory_store, "has_exact"):
+        return bool(memory_store.has_exact(target, text))
+    if hasattr(memory_store, "_entries_for"):
+        try:
+            return text in list(memory_store._entries_for(target))
+        except Exception:
+            return False
+    return False
 
 
 def _operation_already_applied(memory_store, operation):
-    if memory_store is None or not hasattr(memory_store, "has_exact"):
+    if not _supports_exact_lookup(memory_store):
         return False
     target = operation["target"]
     action = operation["action"]
     if action == "add":
-        return bool(memory_store.has_exact(target, operation["content"]))
+        return _memory_store_has_exact(memory_store, target, operation["content"])
     if action == "replace":
-        has_old = bool(memory_store.has_exact(target, operation["old_text"]))
-        has_new = bool(memory_store.has_exact(target, operation["content"]))
+        has_old = _memory_store_has_exact(memory_store, target, operation["old_text"])
+        has_new = _memory_store_has_exact(memory_store, target, operation["content"])
         return has_new and not has_old
-    return not bool(memory_store.has_exact(target, operation["old_text"]))
+    return not _memory_store_has_exact(memory_store, target, operation["old_text"])
+
+
+def _memory_call_succeeded(result):
+    return not isinstance(result, dict) or result.get("success", True) is not False
 
 
 def _execute_memory_operation(memory_store, operation):
     action = operation["action"]
     if action == "add":
-        return memory_store.add(
-            operation["target"],
-            operation["content"],
-            operation["evidence_quote"],
-        )
+        return memory_store.add(operation["target"], operation["content"])
     if action == "replace":
-        if memory_store is not None and hasattr(memory_store, "has_exact"):
-            has_old = bool(memory_store.has_exact(operation["target"], operation["old_text"]))
-            has_new = bool(memory_store.has_exact(operation["target"], operation["content"]))
+        if _supports_exact_lookup(memory_store):
+            has_old = _memory_store_has_exact(memory_store, operation["target"], operation["old_text"])
+            has_new = _memory_store_has_exact(memory_store, operation["target"], operation["content"])
             if not has_old and has_new:
                 return {"operation": "replace", "status": "already_applied", "content": operation["content"]}
             if not has_old and not has_new:
                 raise RuntimeError("replace target missing")
-        return memory_store.replace(
-            operation["target"],
-            operation["old_text"],
-            operation["content"],
-            operation["evidence_quote"],
-        )
-    return memory_store.remove(
-        operation["target"],
-        operation["old_text"],
-        operation["evidence_quote"],
-    )
+        return memory_store.replace(operation["target"], operation["old_text"], operation["content"])
+    return memory_store.remove(operation["target"], operation["old_text"])
 
 
 def _resume_memory_operations(
@@ -711,6 +688,15 @@ def _resume_memory_operations(
                 row["operation_index"],
                 "failed",
                 {"error": str(exc)},
+            )
+            continue
+        if not _memory_call_succeeded(result):
+            turn_store.update_memory_operation(
+                turn_id,
+                assistant_hash,
+                row["operation_index"],
+                "failed",
+                result,
             )
             continue
         modifications.append(result)

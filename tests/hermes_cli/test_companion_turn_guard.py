@@ -17,6 +17,7 @@ from hermes_cli.companion_turn_guard import (
     review_turn,
     validate_review_result,
 )
+from tools import memory_tool
 
 
 def _profile_dir(tmp_path):
@@ -51,12 +52,12 @@ class DummyMemoryStore(object):
     def __init__(self):
         self.calls = []
 
-    def add(self, target, content, evidence_quote):
-        self.calls.append(("add", target, content, evidence_quote))
+    def add(self, target, content):
+        self.calls.append(("add", target, content))
         return {"operation": "add", "target": target, "content": content}
 
-    def replace(self, target, old_text, content, evidence_quote):
-        self.calls.append(("replace", target, old_text, content, evidence_quote))
+    def replace(self, target, old_text, content):
+        self.calls.append(("replace", target, old_text, content))
         return {
             "operation": "replace",
             "target": target,
@@ -64,8 +65,8 @@ class DummyMemoryStore(object):
             "content": content,
         }
 
-    def remove(self, target, old_text, evidence_quote):
-        self.calls.append(("remove", target, old_text, evidence_quote))
+    def remove(self, target, old_text):
+        self.calls.append(("remove", target, old_text))
         return {
             "operation": "remove",
             "target": target,
@@ -89,18 +90,17 @@ class LedgerMemoryStore(object):
         if self.fail_on_call == self.call_count:
             raise RuntimeError("memory write failed")
 
-    def add(self, target, content, evidence_quote):
-        payload = {"target": target, "content": content, "evidence_quote": evidence_quote}
+    def add(self, target, content):
+        payload = {"target": target, "content": content}
         self._record("add", payload)
         self.entries.add(content)
         return {"operation": "add", "target": target, "content": content}
 
-    def replace(self, target, old_text, content, evidence_quote):
+    def replace(self, target, old_text, content):
         payload = {
             "target": target,
             "old_text": old_text,
             "content": content,
-            "evidence_quote": evidence_quote,
         }
         self._record("replace", payload)
         self.entries.discard(old_text)
@@ -112,8 +112,8 @@ class LedgerMemoryStore(object):
             "content": content,
         }
 
-    def remove(self, target, old_text, evidence_quote):
-        payload = {"target": target, "old_text": old_text, "evidence_quote": evidence_quote}
+    def remove(self, target, old_text):
+        payload = {"target": target, "old_text": old_text}
         self._record("remove", payload)
         self.entries.discard(old_text)
         return {"operation": "remove", "target": target, "old_text": old_text}
@@ -134,6 +134,14 @@ def _ledger_rows(profile_dir):
         ).fetchall()
     finally:
         conn.close()
+
+
+def _real_memory_store(tmp_path, monkeypatch):
+    mem_dir = tmp_path / "memory"
+    monkeypatch.setattr(memory_tool, "get_memory_dir", lambda: mem_dir)
+    store = memory_tool.MemoryStore()
+    store.load_from_disk()
+    return store, mem_dir
 
 
 def _marked(result):
@@ -579,7 +587,7 @@ def test_review_turn_persists_review_before_memory_and_stale_during_memory_does_
     )
 
     current = store.get("turn-1")
-    assert review["review_status"] in ("stale", "clean")
+    assert review["review_status"] == "stale"
     assert current["assistant_sha256"] == assistant_sha256(new_text)
     assert current["status"] == "pending"
     assert current["memory_status"] in ("", "none", "pending")
@@ -681,3 +689,68 @@ def test_review_turn_retry_avoids_duplicate_memory_write_after_post_write_crash(
     assert len(memory_store.calls) == 1
     assert retry_store.calls == []
     assert retried["memory_status"] == "applied"
+
+
+def test_review_turn_uses_real_memory_store_signature_for_add_replace_remove(tmp_path, monkeypatch):
+    profile_dir = _profile_dir(tmp_path)
+    store = TurnReviewStore(profile_dir)
+    memory_store, mem_dir = _real_memory_store(tmp_path, monkeypatch)
+    result = _valid_result(summary="", assistant_text="她记住了你的偏好。")
+    result["style_decision"] = "clean"
+    result["memory_operations"] = [
+        {"target": "user", "action": "add", "content": "喜欢深夜调试", "evidence_quote": "深夜调试"},
+        {"target": "user", "action": "replace", "old_text": "喜欢深夜调试", "content": "喜欢清晨调试", "evidence_quote": "清晨调试"},
+        {"target": "user", "action": "remove", "old_text": "喜欢清晨调试", "evidence_quote": "清晨调试"},
+    ]
+
+    review = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text="她记住了你的偏好。",
+        user_message="我现在更喜欢清晨调试，不再执着深夜调试。",
+        messages=[{"role": "user", "content": "我现在更喜欢清晨调试，不再执着深夜调试。"}],
+        provider="openai",
+        model="gpt-test",
+        memory_store=memory_store,
+        store=store,
+        call_llm_fn=lambda **kwargs: _marked(result),
+    )
+
+    assert review["review_status"] == "clean"
+    assert review["memory_status"] == "applied"
+    assert "喜欢深夜调试" not in (mem_dir / "USER.md").read_text(encoding="utf-8")
+    assert "喜欢清晨调试" not in (mem_dir / "USER.md").read_text(encoding="utf-8")
+
+
+def test_review_turn_marks_ledger_failed_when_real_memory_store_returns_success_false(tmp_path, monkeypatch):
+    profile_dir = _profile_dir(tmp_path)
+    turn_store = TurnReviewStore(profile_dir)
+    memory_store, unused_mem_dir = _real_memory_store(tmp_path, monkeypatch)
+    result = _valid_result(summary="", assistant_text="她认真记下了。")
+    result["style_decision"] = "clean"
+    result["memory_operations"] = [
+        {"target": "user", "action": "add", "content": "新的偏好", "evidence_quote": "新的偏好"},
+    ]
+    monkeypatch.setattr(
+        memory_store,
+        "add",
+        lambda target, content: {"success": False, "error": "disk full", "target": target, "content": content},
+    )
+
+    review = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text="她认真记下了。",
+        user_message="请记住这个新的偏好。",
+        messages=[{"role": "user", "content": "请记住这个新的偏好。"}],
+        provider="openai",
+        model="gpt-test",
+        memory_store=memory_store,
+        store=turn_store,
+        call_llm_fn=lambda **kwargs: _marked(result),
+    )
+
+    rows = _ledger_rows(profile_dir)
+    assert review["review_status"] == "clean"
+    assert review["memory_status"] == "failed"
+    assert [row[1] for row in rows] == ["failed"]
