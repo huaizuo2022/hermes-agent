@@ -400,6 +400,12 @@ def _emit_stream_event(name: str, payload: Optional[Dict[str, Any]] = None) -> N
             logger.exception("stream event hook failed for %s", name)
 
 
+def _start_background_thread(target) -> threading.Thread:
+    worker = threading.Thread(target=target)
+    worker.start()
+    return worker
+
+
 def _build_style_guard_system_prompt(
     soul_text: str,
     memory_text: str,
@@ -986,10 +992,12 @@ async def chat_endpoint(req: ChatRequest):
     ensure_companion_profile(Path(profile_dir))
     conversation_policy = read_conversation_policy(profile_dir)
     style_guard_enabled = conversation_policy == STYLE_GUARD_V1_POLICY
-    session_lock = _get_session_lock(session_id)
-    session_lock.acquire()
+    session_lock = None
+    if style_guard_enabled:
+        session_lock = _get_session_lock(session_id)
+        await asyncio.get_running_loop().run_in_executor(None, session_lock.acquire)
     session_lock_released = False
-    stream_owns_session_lock = False
+    stream_lock_owned_by_generator = False
     
     # 1. 动态物理隔离 Profile 目录 (使用线程安全的 ContextVar 覆盖)
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
@@ -1070,6 +1078,7 @@ async def chat_endpoint(req: ChatRequest):
                 memory_snapshots.get("user", ""),
                 req.companion_directives,
             )
+            agent._cached_system_prompt = agent._system_prompt_override
 
         # Savana 伴侣场景：覆盖 memory 工具描述为角色扮演专用中文版本
         # 原始通用描述是面向开发者的英文，DeepSeek 在角色扮演模式下无法关联到"记住用户偏好"这一触发场景
@@ -1122,11 +1131,25 @@ async def chat_endpoint(req: ChatRequest):
                 "memory_modifications": [],
             }
             final_marker_consumed = threading.Event()
-            stream_finished = threading.Event()
-            stream_owns_session_lock = True
+            producer_done = threading.Event()
+
+            def _build_stream_metadata():
+                modifications = review_metadata.get("memory_modifications", [])
+                if not style_guard_enabled and not modifications:
+                    memory_store = getattr(agent, "_memory_store", None)
+                    if memory_store is not None and hasattr(memory_store, "modifications"):
+                        modifications = memory_store.modifications
+                metadata = {
+                    "session_id": session_id,
+                    "status": "completed",
+                    "memory_modifications": modifications,
+                }
+                if style_guard_enabled:
+                    metadata["review_status"] = review_metadata.get("review_status")
+                    metadata["memory_status"] = review_metadata.get("memory_status")
+                return metadata
 
             def run_chat_thread():
-                nonlocal session_lock_released
                 token_thread = set_hermes_home_override(profile_dir)
                 try:
                     def stream_callback(delta: str) -> None:
@@ -1157,35 +1180,28 @@ async def chat_endpoint(req: ChatRequest):
                             memory_store=getattr(agent, "_memory_store", None),
                         )
                     )
-                    metadata = {
-                        "session_id": session_id,
-                        "status": "completed",
-                        "memory_modifications": review_metadata.get("memory_modifications", []),
-                    }
-                    if style_guard_enabled:
-                        metadata["review_status"] = review_metadata.get("review_status")
-                        metadata["memory_status"] = review_metadata.get("memory_status")
-                    q.put(("metadata", metadata))
+                    q.put(("metadata", _build_stream_metadata()))
                     q.put(("end", None))
                 except Exception as e:
                     q.put(("error", e))
+                    q.put(("metadata", _build_stream_metadata()))
+                    q.put(("end", None))
                 finally:
-                    if not session_lock_released:
-                        session_lock.release()
-                        session_lock_released = True
                     reset_hermes_home_override(token_thread)
-                    stream_finished.set()
+                    producer_done.set()
 
-            threading.Thread(target=run_chat_thread).start()
+            _start_background_thread(run_chat_thread)
+            stream_lock_owned_by_generator = True
 
             def sse_generator() -> Generator[str, None, None]:
+                nonlocal session_lock_released
                 try:
                     while True:
                         item_type, item_value = q.get()
                         if item_type == "error":
                             _emit_stream_event("error")
                             yield "event: error\ndata: {}\n\n".format(json.dumps({"detail": str(item_value)}))
-                            break
+                            continue
                         if item_type == "token":
                             yield_data = {"delta": item_value}
                             _emit_stream_event("token", yield_data)
@@ -1202,7 +1218,10 @@ async def chat_endpoint(req: ChatRequest):
                             break
                 finally:
                     final_marker_consumed.set()
-                    stream_finished.wait(5.0)
+                    producer_done.wait(5.0)
+                    if session_lock is not None and not session_lock_released:
+                        session_lock.release()
+                        session_lock_released = True
 
             return StreamingResponse(sse_generator(), media_type="text/event-stream")
         else:
@@ -1236,7 +1255,7 @@ async def chat_endpoint(req: ChatRequest):
             return JSONResponse(payload)
             
     finally:
-        if not session_lock_released and not stream_owns_session_lock:
+        if session_lock is not None and not session_lock_released and not stream_lock_owned_by_generator:
             session_lock.release()
             session_lock_released = True
         reset_hermes_home_override(token)

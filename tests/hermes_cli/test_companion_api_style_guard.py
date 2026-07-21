@@ -1,8 +1,11 @@
+import asyncio
 import json
 import threading
 import time
 from pathlib import Path
 
+import httpx
+import pytest
 from starlette.testclient import TestClient
 
 from hermes_cli.companion_profile_policy import ensure_companion_profile
@@ -100,6 +103,22 @@ def _install_fake_agent(monkeypatch, events=None):
 
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
     return captures
+
+
+class CountingLock:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.acquire_count = 0
+        self.release_count = 0
+
+    def acquire(self):
+        self.acquire_count += 1
+        self._lock.acquire()
+        return True
+
+    def release(self):
+        self.release_count += 1
+        self._lock.release()
 
 
 def test_legacy_profile_keeps_memory_tools_and_directives_without_sidecar(monkeypatch, tmp_path):
@@ -454,6 +473,107 @@ def test_legacy_stream_metadata_shape_remains_base_compatible(monkeypatch, tmp_p
     assert '"memory_status"' not in body
 
 
+def test_legacy_stream_error_still_emits_base_metadata(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "legacy-stream-error-profile"
+    profile_dir.mkdir()
+
+    class FailingAgent:
+        def __init__(self, **kwargs):
+            self.session_db = kwargs["session_db"]
+            self.session_id = kwargs["session_id"]
+            self._memory_store = type("MemoryStore", (), {"modifications": [{"kind": "legacy-memory"}]})()
+            self.tools = []
+            self.suppress_status_output = False
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.base_url = kwargs["base_url"]
+            self.ephemeral_system_prompt = kwargs.get("ephemeral_system_prompt")
+
+        def run_conversation(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    import run_agent
+
+    monkeypatch.setattr(run_agent, "AIAgent", FailingAgent)
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+
+    with TestClient(app).stream(
+        "POST",
+        "/companion/v1/chat",
+        json=_payload("msg-1", "第一句", stream=True),
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert body.index("event: error") < body.index("event: metadata")
+    assert '"session_id": "savana_usera_chara"' in body
+    assert '"status": "completed"' in body
+    assert '"memory_modifications": [{"kind": "legacy-memory"}]' in body
+    assert '"review_status"' not in body
+    assert '"memory_status"' not in body
+
+
+def test_style_guard_prompt_cache_overrides_stored_system_prompt_each_turn(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "prompt-cache-profile"
+    ensure_companion_profile(profile_dir)
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+
+    from hermes_state import SessionDB
+
+    session_id = "savana_usera_chara"
+    session_db = SessionDB(db_path=Path(profile_dir) / "state.db")
+    session_db.create_session(session_id, "savana")
+    session_db._conn.execute(
+        "UPDATE sessions SET system_prompt = ? WHERE id = ?",
+        ("OLD SYSTEM PROMPT legacy directives", session_id),
+    )
+    session_db._conn.commit()
+    session_db.close()
+
+    captured_prompts = []
+
+    def fake_run_conversation(
+        self,
+        user_message,
+        system_message=None,
+        conversation_history=None,
+        task_id=None,
+        stream_callback=None,
+        persist_user_message=None,
+        platform_message_id=None,
+    ):
+        captured_prompts.append(self._cached_system_prompt)
+        return {"final_response": "reply to {}".format(user_message)}
+
+    monkeypatch.setattr(AIAgent, "run_conversation", fake_run_conversation)
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.review_turn",
+        lambda **kwargs: {
+            "turn_id": kwargs["turn_id"],
+            "review_status": "clean",
+            "memory_status": "none",
+            "memory_modifications": [],
+        },
+    )
+
+    payload1 = _payload("msg-1", "第一句", stream=False)
+    payload1["companion_directives"] = "NATURAL NEW 1"
+    payload2 = _payload("msg-2", "第二句", stream=False)
+    payload2["companion_directives"] = "NATURAL NEW 2"
+
+    response1 = TestClient(app).post("/companion/v1/chat", json=payload1)
+    response2 = TestClient(app).post("/companion/v1/chat", json=payload2)
+
+    assert response1.status_code == 200
+    assert response2.status_code == 200
+    assert "NATURAL NEW 1" in captured_prompts[0]
+    assert "NATURAL NEW 2" in captured_prompts[1]
+    assert "OLD SYSTEM PROMPT" not in captured_prompts[0]
+    assert "OLD SYSTEM PROMPT" not in captured_prompts[1]
+    assert "legacy directives" not in captured_prompts[0]
+    assert "legacy directives" not in captured_prompts[1]
+
+
 def test_same_session_requests_are_serialized_but_different_sessions_can_overlap(monkeypatch, tmp_path):
     state = {
         "active": 0,
@@ -731,3 +851,270 @@ def test_stream_requests_hold_same_session_lock_until_stream_completes(monkeypat
     thread_c.join()
     thread_d.join()
     assert [status for status, body in different_results] == [200, 200]
+
+
+def test_style_guard_does_not_touch_session_lock_for_legacy(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "legacy-no-lock-profile"
+    profile_dir.mkdir()
+    _install_fake_agent(monkeypatch)
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+    class SentinelLock:
+        def acquire(self):
+            raise AssertionError("legacy should not acquire session lock")
+
+    monkeypatch.setattr("hermes_cli.companion_api._get_session_lock", lambda _sid: SentinelLock())
+
+    response = TestClient(app).post(
+        "/companion/v1/chat",
+        json=_payload("msg-1", "第一句", stream=False),
+    )
+
+    assert response.status_code == 200
+
+
+def test_style_guard_stream_counting_lock_releases_on_success_and_disconnect(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "counting-lock-profile"
+    ensure_companion_profile(profile_dir)
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+    counting_lock = CountingLock()
+    monkeypatch.setattr("hermes_cli.companion_api._get_session_lock", lambda _sid: counting_lock)
+
+    class StreamingAgent:
+        def __init__(self, **kwargs):
+            self.session_db = kwargs["session_db"]
+            self.session_id = kwargs["session_id"]
+            self._memory_store = None
+            self.tools = []
+            self.suppress_status_output = False
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.base_url = kwargs["base_url"]
+
+        def run_conversation(
+            self,
+            user_message,
+            system_message=None,
+            conversation_history=None,
+            task_id=None,
+            stream_callback=None,
+            persist_user_message=None,
+            platform_message_id=None,
+        ):
+            if stream_callback:
+                stream_callback("chunk-a")
+            time.sleep(0.1)
+            self.session_db.append_message(
+                session_id=self.session_id,
+                role="user",
+                content=user_message,
+                platform_message_id=platform_message_id,
+            )
+            self.session_db.append_message(
+                session_id=self.session_id,
+                role="assistant",
+                content="reply to {}".format(user_message),
+            )
+            if stream_callback:
+                stream_callback("chunk-b")
+            return {"final_response": "reply to {}".format(user_message)}
+
+    import run_agent
+
+    monkeypatch.setattr(run_agent, "AIAgent", StreamingAgent)
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.review_turn",
+        lambda **kwargs: {
+            "turn_id": kwargs["turn_id"],
+            "review_status": "clean",
+            "memory_status": "none",
+            "memory_modifications": [],
+        },
+    )
+
+    with TestClient(app).stream(
+        "POST",
+        "/companion/v1/chat",
+        json=_payload("msg-1", "第一句", stream=True),
+    ) as response:
+        _ = "".join(response.iter_text())
+
+    assert counting_lock.acquire_count == 1
+    assert counting_lock.release_count == 1
+
+    with TestClient(app).stream(
+        "POST",
+        "/companion/v1/chat",
+        json=_payload("msg-2", "第二句", stream=True),
+    ) as response:
+        iterator = response.iter_text()
+        next(iterator)
+
+    assert counting_lock.acquire_count == 2
+    assert counting_lock.release_count == 2
+
+
+def test_style_guard_stream_counting_lock_releases_when_thread_start_fails(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "thread-start-fail-profile"
+    ensure_companion_profile(profile_dir)
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+    counting_lock = CountingLock()
+    monkeypatch.setattr("hermes_cli.companion_api._get_session_lock", lambda _sid: counting_lock)
+    _install_fake_agent(monkeypatch)
+
+    monkeypatch.setattr(
+        "hermes_cli.companion_api._start_background_thread",
+        lambda target: (_ for _ in ()).throw(RuntimeError("start failed")),
+    )
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/companion/v1/chat",
+        json=_payload("msg-1", "第一句", stream=True),
+    )
+
+    assert response.status_code == 500
+    assert counting_lock.acquire_count == 1
+    assert counting_lock.release_count == 1
+
+
+@pytest.mark.asyncio
+async def test_style_guard_stream_lock_wait_does_not_block_event_loop(monkeypatch, tmp_path):
+    state = {
+        "active": 0,
+        "max_active": 0,
+        "entered": {},
+    }
+    state_lock = threading.Lock()
+    release_event = threading.Event()
+    heartbeat = {"ticks": 0}
+    stop_heartbeat = asyncio.Event()
+
+    class AsyncBlockingStreamAgent:
+        def __init__(self, **kwargs):
+            self.session_db = kwargs["session_db"]
+            self.session_id = kwargs["session_id"]
+            self._memory_store = None
+            self.tools = []
+            self.suppress_status_output = False
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.base_url = kwargs["base_url"]
+
+        def run_conversation(
+            self,
+            user_message,
+            system_message=None,
+            conversation_history=None,
+            task_id=None,
+            stream_callback=None,
+            persist_user_message=None,
+            platform_message_id=None,
+        ):
+            with state_lock:
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+                state["entered"].setdefault(self.session_id, []).append(
+                    [user_message, [dict(item) for item in (conversation_history or [])]]
+                )
+            if stream_callback:
+                stream_callback("chunk-a")
+            release_event.wait(2.0)
+            self.session_db.append_message(
+                session_id=self.session_id,
+                role="user",
+                content=user_message,
+                platform_message_id=platform_message_id,
+            )
+            self.session_db.append_message(
+                session_id=self.session_id,
+                role="assistant",
+                content="reply to {}".format(user_message),
+            )
+            if stream_callback:
+                stream_callback("chunk-b")
+            with state_lock:
+                state["active"] -= 1
+            return {"final_response": "reply to {}".format(user_message)}
+
+    import run_agent
+
+    monkeypatch.setattr(run_agent, "AIAgent", AsyncBlockingStreamAgent)
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda sid: str(tmp_path / sid))
+    def fake_review_turn(**kwargs):
+        store = TurnReviewStore(Path(kwargs["profile_dir"]))
+        store.begin(kwargs["turn_id"], kwargs["assistant_text"])
+        store.commit(
+            {
+                "turn_id": kwargs["turn_id"],
+                "assistant_sha256": assistant_sha256(kwargs["assistant_text"]),
+                "style_decision": "clean",
+                "style_reason": "ok",
+                "continuity_summary": "",
+                "memory_operations": [],
+                "self_review": {
+                    "fits_character_and_scene": "pass",
+                    "no_technical_false_positive": "pass",
+                    "summary_preserves_facts": "pass",
+                    "summary_adds_no_new_facts": "pass",
+                },
+                "verdict": "pass",
+            },
+            "judge",
+        )
+        return {
+            "turn_id": kwargs["turn_id"],
+            "review_status": "clean",
+            "memory_status": "none",
+            "memory_modifications": [],
+        }
+
+    monkeypatch.setattr("hermes_cli.companion_api.review_turn", fake_review_turn)
+
+    async def heartbeat_task():
+        while not stop_heartbeat.is_set():
+            heartbeat["ticks"] += 1
+            await asyncio.sleep(0.01)
+
+    async def consume_stream(user_id, message_id, text):
+        payload = _payload(message_id, text, stream=True)
+        payload["user_id"] = user_id
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            async with client.stream("POST", "/companion/v1/chat", json=payload) as response:
+                body = ""
+                async for chunk in response.aiter_text():
+                    body += chunk
+                return response.status_code, body
+
+    hb_task = asyncio.create_task(heartbeat_task())
+    task1 = asyncio.create_task(consume_stream("UserA", "msg-1", "第一句"))
+    await asyncio.sleep(0.1)
+    task2 = asyncio.create_task(consume_stream("UserA", "msg-2", "第二句"))
+    before = heartbeat["ticks"]
+    await asyncio.sleep(0.1)
+    after = heartbeat["ticks"]
+    assert after > before
+    with state_lock:
+        assert len(state["entered"].get("savana_usera_chara", [])) == 1
+
+    release_event.set()
+    result1, result2 = await asyncio.gather(task1, task2)
+    assert result1[0] == 200
+    assert result2[0] == 200
+    with state_lock:
+        assert state["entered"]["savana_usera_chara"][1][1][-1]["content"] == "reply to 第一句"
+
+    state["active"] = 0
+    state["max_active"] = 0
+    state["entered"] = {}
+    release_event.clear()
+    task3 = asyncio.create_task(consume_stream("UserB", "msg-1", "你好"))
+    task4 = asyncio.create_task(consume_stream("UserC", "msg-1", "你好"))
+    await asyncio.sleep(0.1)
+    with state_lock:
+        assert state["max_active"] >= 2
+    release_event.set()
+    result3, result4 = await asyncio.gather(task3, task4)
+    assert result3[0] == 200
+    assert result4[0] == 200
+    stop_heartbeat.set()
+    await hb_task
