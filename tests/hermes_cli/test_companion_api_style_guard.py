@@ -146,6 +146,10 @@ class ObservableCountingLock:
         self._lock.release()
 
 
+async def _invoke_asgi_app(scope, receive, send):
+    await app(scope, receive, send)
+
+
 def test_legacy_profile_keeps_memory_tools_and_directives_without_sidecar(monkeypatch, tmp_path):
     profile_dir = tmp_path / "legacy-profile"
     profile_dir.mkdir()
@@ -240,7 +244,9 @@ def test_style_guard_stream_emits_multiple_tokens_before_review(monkeypatch, tmp
     assert body.count("event: token") == 3
     assert events[:3] == ["token:part-1", "token:part-2", "token:part-3"]
     assert events[3:6] == ["yield:token", "yield:token", "yield:token"]
-    assert events[6] == "review_started"
+    review_index = events.index("review_started")
+    assert review_index >= 6
+    assert "yield:metadata" in events[review_index + 1 :]
     assert '"review_status": "pending"' in body
     assert '"memory_status": "pending"' in body
     assert '"memory_modifications": [{"kind": "queued"}]' in body
@@ -1226,7 +1232,7 @@ def test_style_guard_disconnect_keeps_lock_until_slow_producer_finishes(monkeypa
                 second_producer_entered.set()
             if stream_callback:
                 stream_callback("chunk-a")
-            producer_may_finish.wait(1.0)
+            producer_may_finish.wait(5.0)
             self.session_db.append_message(
                 session_id=self.session_id,
                 role="user",
@@ -1307,3 +1313,285 @@ def test_style_guard_disconnect_keeps_lock_until_slow_producer_finishes(monkeypa
     assert second_producer_entered.is_set()
     assert lock.acquire_count == 2
     assert lock.release_count == 2
+
+
+@pytest.mark.asyncio
+async def test_style_guard_asgi_send_start_failure_cleans_up_without_iterating_body(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "asgi-send-start-failure-profile"
+    ensure_companion_profile(profile_dir)
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+    lock = ObservableCountingLock()
+    monkeypatch.setattr("hermes_cli.companion_api._get_session_lock", lambda _sid: lock)
+    final_marker_seen = threading.Event()
+    producer_done_seen = threading.Event()
+    lock_released_seen = threading.Event()
+
+    class FastStreamAgent:
+        def __init__(self, **kwargs):
+            self.session_db = kwargs["session_db"]
+            self.session_id = kwargs["session_id"]
+            self._memory_store = None
+            self.tools = []
+            self.suppress_status_output = False
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.base_url = kwargs["base_url"]
+
+        def run_conversation(
+            self,
+            user_message,
+            system_message=None,
+            conversation_history=None,
+            task_id=None,
+            stream_callback=None,
+            persist_user_message=None,
+            platform_message_id=None,
+        ):
+            if stream_callback:
+                stream_callback("chunk-a")
+            self.session_db.append_message(
+                session_id=self.session_id,
+                role="user",
+                content=user_message,
+                platform_message_id=platform_message_id,
+            )
+            self.session_db.append_message(
+                session_id=self.session_id,
+                role="assistant",
+                content="reply to {}".format(user_message),
+            )
+            return {"final_response": "reply to {}".format(user_message)}
+
+    import run_agent
+
+    monkeypatch.setattr(run_agent, "AIAgent", FastStreamAgent)
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.review_turn",
+        lambda **kwargs: {
+            "turn_id": kwargs["turn_id"],
+            "review_status": "clean",
+            "memory_status": "none",
+            "memory_modifications": [],
+        },
+    )
+
+    def stream_hook(name, payload=None):
+        if name == "final_marker_set":
+            final_marker_seen.set()
+        if name == "producer_done":
+            producer_done_seen.set()
+        if name == "lock_released":
+            lock_released_seen.set()
+
+    monkeypatch.setattr("hermes_cli.companion_api._stream_event_hook", stream_hook, raising=False)
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def fail_on_start(message):
+        if message["type"] == "http.response.start":
+            raise OSError("send start failed")
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/companion/v1/chat",
+        "raw_path": b"/companion/v1/chat",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+    }
+    body = json.dumps(_payload("msg-1", "第一句", stream=True)).encode("utf-8")
+    sent_body = {"done": False}
+
+    async def receive_once():
+        if sent_body["done"]:
+            await asyncio.sleep(0)
+            return {"type": "http.disconnect"}
+        sent_body["done"] = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    with pytest.raises(OSError):
+        await asyncio.wait_for(_invoke_asgi_app(scope, receive_once, fail_on_start), 2.0)
+
+    assert await asyncio.to_thread(final_marker_seen.wait, 1.0)
+    assert await asyncio.to_thread(producer_done_seen.wait, 1.0)
+    assert await asyncio.to_thread(lock_released_seen.wait, 1.0)
+    assert lock.acquire_count == 1
+    assert lock.release_count == 1
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        follow_up = await asyncio.wait_for(
+            client.post("/companion/v1/chat", json=_payload("msg-2", "第二句", stream=False)),
+            2.0,
+        )
+    assert follow_up.status_code == 200
+    assert lock.acquire_count == 2
+    assert lock.release_count == 2
+
+
+@pytest.mark.asyncio
+async def test_style_guard_asgi_disconnect_cleanup_wait_does_not_block_event_loop(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "asgi-disconnect-cleanup-profile"
+    ensure_companion_profile(profile_dir)
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+    lock = ObservableCountingLock()
+    monkeypatch.setattr("hermes_cli.companion_api._get_session_lock", lambda _sid: lock)
+    producer_may_finish = threading.Event()
+    first_producer_entered = threading.Event()
+    second_producer_entered = threading.Event()
+    final_marker_seen = threading.Event()
+    producer_done_seen = threading.Event()
+    lock_released_seen = threading.Event()
+    heartbeat = {"ticks": 0}
+    stop_heartbeat = asyncio.Event()
+
+    class SlowStreamingAgent:
+        def __init__(self, **kwargs):
+            self.session_db = kwargs["session_db"]
+            self.session_id = kwargs["session_id"]
+            self._memory_store = None
+            self.tools = []
+            self.suppress_status_output = False
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.base_url = kwargs["base_url"]
+
+        def run_conversation(
+            self,
+            user_message,
+            system_message=None,
+            conversation_history=None,
+            task_id=None,
+            stream_callback=None,
+            persist_user_message=None,
+            platform_message_id=None,
+        ):
+            if platform_message_id == "msg-1":
+                first_producer_entered.set()
+            else:
+                second_producer_entered.set()
+            if stream_callback:
+                stream_callback("chunk-a")
+            producer_may_finish.wait(5.0)
+            self.session_db.append_message(
+                session_id=self.session_id,
+                role="user",
+                content=user_message,
+                platform_message_id=platform_message_id,
+            )
+            self.session_db.append_message(
+                session_id=self.session_id,
+                role="assistant",
+                content="reply to {}".format(user_message),
+            )
+            if stream_callback:
+                stream_callback("chunk-b")
+            return {"final_response": "reply to {}".format(user_message)}
+
+    import run_agent
+
+    monkeypatch.setattr(run_agent, "AIAgent", SlowStreamingAgent)
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.review_turn",
+        lambda **kwargs: {
+            "turn_id": kwargs["turn_id"],
+            "review_status": "clean",
+            "memory_status": "none",
+            "memory_modifications": [],
+        },
+    )
+
+    def stream_hook(name, payload=None):
+        if name == "final_marker_set":
+            final_marker_seen.set()
+        if name == "producer_done":
+            producer_done_seen.set()
+        if name == "lock_released":
+            lock_released_seen.set()
+
+    monkeypatch.setattr("hermes_cli.companion_api._stream_event_hook", stream_hook, raising=False)
+
+    async def heartbeat_task():
+        while not stop_heartbeat.is_set():
+            heartbeat["ticks"] += 1
+            await asyncio.sleep(0.01)
+
+    body = json.dumps(_payload("msg-1", "第一句", stream=True)).encode("utf-8")
+    receive_calls = {"count": 0}
+
+    async def receive_disconnect():
+        if receive_calls["count"] == 0:
+            receive_calls["count"] += 1
+            return {"type": "http.request", "body": body, "more_body": False}
+        await asyncio.sleep(0.01)
+        return {"type": "http.disconnect"}
+
+    sent_messages = []
+    first_cleanup_done = asyncio.Event()
+
+    async def send_and_disconnect(message):
+        sent_messages.append(message["type"])
+        if message["type"] == "http.response.body":
+            raise OSError("client disconnected")
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/companion/v1/chat",
+        "raw_path": b"/companion/v1/chat",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+    }
+
+    async def first_request():
+        try:
+            await _invoke_asgi_app(scope, receive_disconnect, send_and_disconnect)
+        except OSError:
+            pass
+        finally:
+            first_cleanup_done.set()
+
+    async def second_request():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            return await client.post("/companion/v1/chat", json=_payload("msg-2", "第二句", stream=False))
+
+    hb_task = asyncio.create_task(heartbeat_task())
+    first_task = asyncio.create_task(first_request())
+    assert await asyncio.to_thread(first_producer_entered.wait, 1.0)
+    await asyncio.sleep(0.1)
+    second_task = asyncio.create_task(second_request())
+    before = heartbeat["ticks"]
+    await asyncio.sleep(0.1)
+    after = heartbeat["ticks"]
+
+    assert after > before
+    assert not second_producer_entered.is_set()
+    assert not second_task.done()
+    assert not first_cleanup_done.is_set()
+    assert lock.acquire_count == 2
+    assert lock.release_count == 0
+
+    producer_may_finish.set()
+    await asyncio.wait_for(first_task, 2.0)
+    response = await asyncio.wait_for(second_task, 2.0)
+    assert response.status_code == 200
+    assert await asyncio.to_thread(final_marker_seen.wait, 1.0)
+    assert await asyncio.to_thread(producer_done_seen.wait, 1.0)
+    assert await asyncio.to_thread(lock_released_seen.wait, 1.0)
+    assert second_producer_entered.is_set()
+    assert lock.acquire_count == 2
+    assert lock.release_count == 2
+    stop_heartbeat.set()
+    await hb_task

@@ -5,13 +5,17 @@ import os
 import queue
 import shutil
 import threading
+from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Generator, List, Optional
 
+import anyio
 import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from starlette._utils import collapse_excgroups
+from starlette.requests import ClientDisconnect
 
 from hermes_cli.companion_profile_policy import (
     STYLE_GUARD_V1_POLICY,
@@ -406,6 +410,60 @@ def _start_background_thread(target) -> threading.Thread:
     return worker
 
 
+class _CompanionStreamResponse(StreamingResponse):
+    def __init__(
+        self,
+        *args,
+        final_marker_consumed: threading.Event,
+        producer_done: threading.Event,
+        session_lock: Optional[threading.Lock],
+        session_lock_released_ref: Dict[str, bool],
+        **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self._final_marker_consumed = final_marker_consumed
+        self._producer_done = producer_done
+        self._session_lock = session_lock
+        self._session_lock_released_ref = session_lock_released_ref
+
+    async def _cleanup_stream_resources(self) -> None:
+        self._final_marker_consumed.set()
+        _emit_stream_event("final_marker_set")
+        await asyncio.get_running_loop().run_in_executor(None, self._producer_done.wait)
+        if self._session_lock is not None and not self._session_lock_released_ref["released"]:
+            self._session_lock.release()
+            self._session_lock_released_ref["released"] = True
+            _emit_stream_event("lock_released")
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            spec_version = tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split(".")))
+
+            if spec_version >= (2, 4):
+                try:
+                    await self.stream_response(send)
+                except OSError:
+                    raise
+            else:
+                with collapse_excgroups():
+                    async with anyio.create_task_group() as task_group:
+
+                        async def wrap(func: Callable[[], Awaitable[None]]) -> None:
+                            await func()
+                            task_group.cancel_scope.cancel()
+
+                        task_group.start_soon(wrap, partial(self.stream_response, send))
+                        await wrap(partial(self.listen_for_disconnect, receive))
+
+            if self.background is not None:
+                await self.background()
+        except ClientDisconnect:
+            return
+        finally:
+            cleanup_task = asyncio.create_task(self._cleanup_stream_resources())
+            await asyncio.shield(cleanup_task)
+
+
 async def _acquire_session_lock_cancellation_safe(session_lock: threading.Lock) -> None:
     loop = asyncio.get_running_loop()
     acquire_future = loop.run_in_executor(None, session_lock.acquire)
@@ -414,9 +472,13 @@ async def _acquire_session_lock_cancellation_safe(session_lock: threading.Lock) 
         try:
             acquired = bool(future.result())
         except Exception:
+            logger.exception("session lock acquire future cleanup failed")
             return
         if acquired:
-            session_lock.release()
+            try:
+                session_lock.release()
+            except Exception:
+                logger.exception("session lock orphan acquire release failed")
 
     try:
         await asyncio.shield(acquire_future)
@@ -1018,8 +1080,8 @@ async def chat_endpoint(req: ChatRequest):
     if style_guard_enabled:
         session_lock = _get_session_lock(session_id)
         await _acquire_session_lock_cancellation_safe(session_lock)
-    session_lock_released = False
-    stream_lock_owned_by_generator = False
+    session_lock_released_ref = {"released": False}
+    stream_lock_owned_by_response = False
     
     # 1. 动态物理隔离 Profile 目录 (使用线程安全的 ContextVar 覆盖)
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
@@ -1209,43 +1271,50 @@ async def chat_endpoint(req: ChatRequest):
                     q.put(("metadata", _build_stream_metadata()))
                     q.put(("end", None))
                 finally:
-                    reset_hermes_home_override(token_thread)
-                    producer_done.set()
+                    try:
+                        try:
+                            reset_hermes_home_override(token_thread)
+                        except Exception:
+                            logger.exception("Failed to reset Hermes home override for companion stream thread")
+                    finally:
+                        producer_done.set()
+                        _emit_stream_event("producer_done")
 
             _start_background_thread(run_chat_thread)
-            stream_lock_owned_by_generator = True
 
             def sse_generator() -> Generator[str, None, None]:
-                nonlocal session_lock_released
-                try:
-                    while True:
-                        item_type, item_value = q.get()
-                        if item_type == "error":
-                            _emit_stream_event("error")
-                            yield "event: error\ndata: {}\n\n".format(json.dumps({"detail": str(item_value)}))
-                            continue
-                        if item_type == "token":
-                            yield_data = {"delta": item_value}
-                            _emit_stream_event("token", yield_data)
-                            yield "event: token\ndata: {}\n\n".format(json.dumps(yield_data))
-                            continue
-                        if item_type == "final":
-                            final_marker_consumed.set()
-                            continue
-                        if item_type == "metadata":
-                            _emit_stream_event("metadata", item_value)
-                            yield "event: metadata\ndata: {}\n\n".format(json.dumps(item_value))
-                            continue
-                        if item_type == "end":
-                            break
-                finally:
-                    final_marker_consumed.set()
-                    producer_done.wait()
-                    if session_lock is not None and not session_lock_released:
-                        session_lock.release()
-                        session_lock_released = True
+                while True:
+                    item_type, item_value = q.get()
+                    if item_type == "error":
+                        _emit_stream_event("error")
+                        yield "event: error\ndata: {}\n\n".format(json.dumps({"detail": str(item_value)}))
+                        continue
+                    if item_type == "token":
+                        yield_data = {"delta": item_value}
+                        _emit_stream_event("token", yield_data)
+                        yield "event: token\ndata: {}\n\n".format(json.dumps(yield_data))
+                        continue
+                    if item_type == "final":
+                        final_marker_consumed.set()
+                        _emit_stream_event("final_marker_set")
+                        continue
+                    if item_type == "metadata":
+                        _emit_stream_event("metadata", item_value)
+                        yield "event: metadata\ndata: {}\n\n".format(json.dumps(item_value))
+                        continue
+                    if item_type == "end":
+                        break
 
-            return StreamingResponse(sse_generator(), media_type="text/event-stream")
+            response = _CompanionStreamResponse(
+                sse_generator(),
+                media_type="text/event-stream",
+                final_marker_consumed=final_marker_consumed,
+                producer_done=producer_done,
+                session_lock=session_lock,
+                session_lock_released_ref=session_lock_released_ref,
+            )
+            stream_lock_owned_by_response = True
+            return response
         else:
             result = agent.run_conversation(
                 req.user_message,
@@ -1277,9 +1346,9 @@ async def chat_endpoint(req: ChatRequest):
             return JSONResponse(payload)
             
     finally:
-        if session_lock is not None and not session_lock_released and not stream_lock_owned_by_generator:
+        if session_lock is not None and not session_lock_released_ref["released"] and not stream_lock_owned_by_response:
             session_lock.release()
-            session_lock_released = True
+            session_lock_released_ref["released"] = True
         reset_hermes_home_override(token)
 
 @router.delete("/sessions/{session_id}")
