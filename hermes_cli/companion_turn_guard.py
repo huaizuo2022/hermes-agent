@@ -68,6 +68,21 @@ def _parse_review_json(value):
         return {"raw": value}
 
 
+def _public_memory_operation(operation):
+    sanitized = dict(operation)
+    sanitized.pop("evidence_quote", None)
+    return sanitized
+
+
+def _public_review_result(validated):
+    sanitized = dict(validated)
+    sanitized["memory_operations"] = [
+        _public_memory_operation(item)
+        for item in list(validated.get("memory_operations") or [])
+    ]
+    return sanitized
+
+
 class TurnReviewStore(object):
     def __init__(self, profile_dir):
         self.profile_dir = Path(profile_dir)
@@ -261,6 +276,7 @@ class TurnReviewStore(object):
         turn_id = validated["turn_id"]
         assistant_hash = validated["assistant_sha256"]
         memory_operations = list(validated.get("memory_operations") or [])
+        public_review = _public_review_result(validated)
         memory_status = "pending" if memory_operations else "none"
         now = _utc_now()
         with profile_lock(self.profile_dir, "companion_turn_guard_write"):
@@ -289,7 +305,7 @@ class TurnReviewStore(object):
                         validated["style_decision"],
                         validated["style_reason"],
                         validated["continuity_summary"],
-                        _normalize_review_json(validated),
+                        _normalize_review_json(public_review),
                         memory_status,
                         str(model or ""),
                         now,
@@ -798,13 +814,14 @@ def review_turn(
             memory_store,
             after_memory_write_hook=_after_memory_write_hook,
         )
-        validated["memory_status"] = memory_status
+        public_review = _public_review_result(validated)
+        public_review["memory_status"] = memory_status
         return {
             "turn_id": validated["turn_id"],
             "review_status": validated["style_decision"],
             "memory_status": memory_status,
             "memory_modifications": modifications,
-            "review_result": validated,
+            "review_result": public_review,
         }
     except StaleTurnReviewError:
         return {

@@ -754,3 +754,37 @@ def test_review_turn_marks_ledger_failed_when_real_memory_store_returns_success_
     assert review["review_status"] == "clean"
     assert review["memory_status"] == "failed"
     assert [row[1] for row in rows] == ["failed"]
+
+
+def test_evidence_quote_stays_only_in_ledger_not_review_json_or_public_result(tmp_path):
+    profile_dir = _profile_dir(tmp_path)
+    store = TurnReviewStore(profile_dir)
+    memory_store = DummyMemoryStore()
+    assistant_text = "她记住了你的偏好。"
+    result = _valid_result(summary="", assistant_text=assistant_text)
+    result["style_decision"] = "clean"
+    result["memory_operations"] = [
+        {"target": "user", "action": "add", "content": "喜欢深夜调试", "evidence_quote": "深夜调试"},
+    ]
+
+    review = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text=assistant_text,
+        user_message="我最喜欢深夜调试。",
+        messages=[{"role": "user", "content": "我最喜欢深夜调试。"}],
+        provider="openai",
+        model="gpt-test",
+        memory_store=memory_store,
+        store=store,
+        call_llm_fn=lambda **kwargs: _marked(result),
+    )
+
+    persisted = store.get("turn-1")
+    ledger_rows = _ledger_rows(profile_dir)
+    review_json = persisted["review_json"]
+
+    assert ledger_rows[0][2]
+    assert "evidence_quote" in json.loads(ledger_rows[0][2])
+    assert "evidence_quote" not in json.dumps(review_json, ensure_ascii=False)
+    assert "evidence_quote" not in json.dumps(review["review_result"], ensure_ascii=False)
