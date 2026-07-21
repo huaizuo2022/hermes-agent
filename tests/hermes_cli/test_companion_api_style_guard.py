@@ -593,3 +593,141 @@ def test_same_session_requests_are_serialized_but_different_sessions_can_overlap
     thread_c.join()
     thread_d.join()
     assert [resp.status_code for resp in different_results] == [200, 200]
+
+
+def test_stream_requests_hold_same_session_lock_until_stream_completes(monkeypatch, tmp_path):
+    state = {
+        "active": 0,
+        "max_active": 0,
+        "entered": {},
+    }
+    state_lock = threading.Lock()
+    release_event = threading.Event()
+
+    class BlockingStreamAgent:
+        def __init__(self, **kwargs):
+            self.session_db = kwargs["session_db"]
+            self.session_id = kwargs["session_id"]
+            self._memory_store = None
+            self.tools = []
+            self.suppress_status_output = False
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.base_url = kwargs["base_url"]
+
+        def run_conversation(
+            self,
+            user_message,
+            system_message=None,
+            conversation_history=None,
+            task_id=None,
+            stream_callback=None,
+            persist_user_message=None,
+            platform_message_id=None,
+        ):
+            with state_lock:
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+                state["entered"].setdefault(self.session_id, []).append(
+                    [user_message, [dict(item) for item in (conversation_history or [])]]
+                )
+            if stream_callback:
+                stream_callback("chunk-a")
+            release_event.wait(2.0)
+            self.session_db.append_message(
+                session_id=self.session_id,
+                role="user",
+                content=user_message,
+                platform_message_id=platform_message_id,
+            )
+            self.session_db.append_message(
+                session_id=self.session_id,
+                role="assistant",
+                content="reply to {}".format(user_message),
+            )
+            if stream_callback:
+                stream_callback("chunk-b")
+            with state_lock:
+                state["active"] -= 1
+            return {"final_response": "reply to {}".format(user_message)}
+
+    import run_agent
+
+    monkeypatch.setattr(run_agent, "AIAgent", BlockingStreamAgent)
+
+    def fake_review_turn(**kwargs):
+        store = TurnReviewStore(Path(kwargs["profile_dir"]))
+        store.begin(kwargs["turn_id"], kwargs["assistant_text"])
+        store.commit(
+            {
+                "turn_id": kwargs["turn_id"],
+                "assistant_sha256": assistant_sha256(kwargs["assistant_text"]),
+                "style_decision": "clean",
+                "style_reason": "ok",
+                "continuity_summary": "",
+                "memory_operations": [],
+                "self_review": {
+                    "fits_character_and_scene": "pass",
+                    "no_technical_false_positive": "pass",
+                    "summary_preserves_facts": "pass",
+                    "summary_adds_no_new_facts": "pass",
+                },
+                "verdict": "pass",
+            },
+            "judge",
+        )
+        return {
+            "turn_id": kwargs["turn_id"],
+            "review_status": "clean",
+            "memory_status": "none",
+            "memory_modifications": [],
+        }
+
+    monkeypatch.setattr("hermes_cli.companion_api.review_turn", fake_review_turn)
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda sid: str(tmp_path / sid))
+
+    same_results = []
+
+    def stream_request(results, user_id, message_id, text):
+        payload = _payload(message_id, text, stream=True)
+        payload["user_id"] = user_id
+        with TestClient(app).stream("POST", "/companion/v1/chat", json=payload) as response:
+            body = "".join(response.iter_text())
+        results.append((response.status_code, body))
+
+    thread_a = threading.Thread(target=stream_request, args=(same_results, "UserA", "msg-1", "第一句"))
+    thread_b = threading.Thread(target=stream_request, args=(same_results, "UserA", "msg-2", "第二句"))
+    thread_a.start()
+    time.sleep(0.2)
+    thread_b.start()
+    time.sleep(0.2)
+
+    with state_lock:
+        assert len(state["entered"].get("savana_usera_chara", [])) == 1
+
+    release_event.set()
+    thread_a.join()
+    thread_b.join()
+
+    assert [status for status, body in same_results] == [200, 200]
+    same_history = state["entered"]["savana_usera_chara"][1][1]
+    assert same_history[-1]["role"] == "assistant"
+    assert same_history[-1]["content"] == "reply to 第一句"
+
+    state["active"] = 0
+    state["max_active"] = 0
+    state["entered"] = {}
+    release_event.clear()
+    different_results = []
+
+    thread_c = threading.Thread(target=stream_request, args=(different_results, "UserB", "msg-1", "你好"))
+    thread_d = threading.Thread(target=stream_request, args=(different_results, "UserC", "msg-1", "你好"))
+    thread_c.start()
+    thread_d.start()
+    time.sleep(0.2)
+    with state_lock:
+        assert state["max_active"] >= 2
+    release_event.set()
+    thread_c.join()
+    thread_d.join()
+    assert [status for status, body in different_results] == [200, 200]

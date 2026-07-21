@@ -989,6 +989,7 @@ async def chat_endpoint(req: ChatRequest):
     session_lock = _get_session_lock(session_id)
     session_lock.acquire()
     session_lock_released = False
+    stream_owns_session_lock = False
     
     # 1. 动态物理隔离 Profile 目录 (使用线程安全的 ContextVar 覆盖)
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
@@ -1120,8 +1121,12 @@ async def chat_endpoint(req: ChatRequest):
                 "memory_status": None,
                 "memory_modifications": [],
             }
+            final_marker_consumed = threading.Event()
+            stream_finished = threading.Event()
+            stream_owns_session_lock = True
 
             def run_chat_thread():
+                nonlocal session_lock_released
                 token_thread = set_hermes_home_override(profile_dir)
                 try:
                     def stream_callback(delta: str) -> None:
@@ -1136,15 +1141,44 @@ async def chat_endpoint(req: ChatRequest):
                     )
                     final_reply = result.get("final_response", "")
                     q.put(("final", final_reply))
+                    final_marker_consumed.wait()
+                    review_metadata.update(
+                        _review_companion_turn(
+                            style_guard_enabled=style_guard_enabled,
+                            profile_dir=profile_dir,
+                            turn_id=req.message_id,
+                            assistant_text=final_reply,
+                            user_message=req.user_message,
+                            raw_history=raw_history,
+                            provider=provider,
+                            model=model,
+                            base_url=base_url,
+                            api_key=api_key,
+                            memory_store=getattr(agent, "_memory_store", None),
+                        )
+                    )
+                    metadata = {
+                        "session_id": session_id,
+                        "status": "completed",
+                        "memory_modifications": review_metadata.get("memory_modifications", []),
+                    }
+                    if style_guard_enabled:
+                        metadata["review_status"] = review_metadata.get("review_status")
+                        metadata["memory_status"] = review_metadata.get("memory_status")
+                    q.put(("metadata", metadata))
+                    q.put(("end", None))
                 except Exception as e:
                     q.put(("error", e))
                 finally:
+                    if not session_lock_released:
+                        session_lock.release()
+                        session_lock_released = True
                     reset_hermes_home_override(token_thread)
+                    stream_finished.set()
 
             threading.Thread(target=run_chat_thread).start()
 
             def sse_generator() -> Generator[str, None, None]:
-                nonlocal session_lock_released
                 try:
                     while True:
                         item_type, item_value = q.get()
@@ -1158,36 +1192,17 @@ async def chat_endpoint(req: ChatRequest):
                             yield "event: token\ndata: {}\n\n".format(json.dumps(yield_data))
                             continue
                         if item_type == "final":
-                            review_metadata.update(
-                                _review_companion_turn(
-                                    style_guard_enabled=style_guard_enabled,
-                                    profile_dir=profile_dir,
-                                    turn_id=req.message_id,
-                                    assistant_text=item_value,
-                                    user_message=req.user_message,
-                                    raw_history=raw_history,
-                                    provider=provider,
-                                    model=model,
-                                    base_url=base_url,
-                                    api_key=api_key,
-                                    memory_store=getattr(agent, "_memory_store", None),
-                                )
-                            )
-                            metadata = {
-                                "session_id": session_id,
-                                "status": "completed",
-                                "memory_modifications": review_metadata.get("memory_modifications", []),
-                            }
-                            if style_guard_enabled:
-                                metadata["review_status"] = review_metadata.get("review_status")
-                                metadata["memory_status"] = review_metadata.get("memory_status")
-                            _emit_stream_event("metadata", metadata)
-                            yield "event: metadata\ndata: {}\n\n".format(json.dumps(metadata))
+                            final_marker_consumed.set()
+                            continue
+                        if item_type == "metadata":
+                            _emit_stream_event("metadata", item_value)
+                            yield "event: metadata\ndata: {}\n\n".format(json.dumps(item_value))
+                            continue
+                        if item_type == "end":
                             break
                 finally:
-                    if not session_lock_released:
-                        session_lock.release()
-                        session_lock_released = True
+                    final_marker_consumed.set()
+                    stream_finished.wait(5.0)
 
             return StreamingResponse(sse_generator(), media_type="text/event-stream")
         else:
@@ -1221,7 +1236,7 @@ async def chat_endpoint(req: ChatRequest):
             return JSONResponse(payload)
             
     finally:
-        if not session_lock_released:
+        if not session_lock_released and not stream_owns_session_lock:
             session_lock.release()
             session_lock_released = True
         reset_hermes_home_override(token)
