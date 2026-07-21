@@ -9,18 +9,30 @@ Business rule:
 - Eligible profiles are processed in batches to avoid one giant prompt.
 """
 
+import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
+from difflib import SequenceMatcher
 from datetime import datetime
+
+from hermes_cli.companion_profile_policy import (
+    GUARDED_POLICY,
+    GUARDED_V2_POLICY,
+    LEGACY_POLICY,
+    read_evolution_policy,
+)
+from hermes_cli.companion_turn_guard import assistant_sha256
 
 DEFAULT_BATCH_SIZE = 10
 DEFAULT_MESSAGE_LIMIT = 30
 DEFAULT_BATCH_CURSOR = 0
 STATE_DIR_NAME = os.path.join("cron", "state", "savana-self-evolution")
 RUN_DATE_FORMAT = "%Y-%m-%d"
+_SAVANA_BATCH_PROFILES_JSON_PREFIX = "- Evolution Batch Profiles JSON: "
 
 
 def parse_non_negative_int_env(name, default):
@@ -131,6 +143,34 @@ def extract_evolved_persona(soul_path):
         return ""
 
 
+def extract_base_soul(soul_path):
+    if not os.path.exists(soul_path):
+        return ""
+    try:
+        with open(soul_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return ""
+    marker = "## Evolved Persona"
+    marker_index = content.find(marker)
+    if marker_index == -1:
+        return content.strip()
+    body_start = content.find("\n", marker_index)
+    if body_start == -1:
+        return content[:marker_index].rstrip()
+    next_header = content.find("\n## ", body_start + 1)
+    if next_header == -1:
+        return content[:marker_index].rstrip()
+    return (content[:marker_index].rstrip() + "\n\n" + content[next_header + 1:].lstrip()).strip()
+
+
+def soul_sha256(soul_path):
+    digest = hashlib.sha256()
+    with open(soul_path, "rb") as f:
+        digest.update(f.read())
+    return digest.hexdigest()
+
+
 def strip_invisible_chars(text):
     if not text:
         return text
@@ -143,7 +183,7 @@ def strip_invisible_chars(text):
 def dedupe_messages(rows):
     messages = []
     last_msg = None
-    for role, content, timestamp in rows:
+    for platform_message_id, role, content, timestamp in rows:
         cleaned_content = strip_invisible_chars(content)
         if (
             last_msg
@@ -153,6 +193,7 @@ def dedupe_messages(rows):
         ):
             continue
         msg_obj = {
+            "message_id": "" if platform_message_id is None else str(platform_message_id),
             "role": role,
             "content": cleaned_content,
             "timestamp": timestamp,
@@ -171,7 +212,7 @@ def get_messages_for_window(db_path, window_start, window_end, limit):
         cursor = conn.cursor()
         cursor.execute(
             """
-                SELECT role, content, timestamp
+                SELECT platform_message_id, role, content, timestamp
                 FROM messages
                 WHERE role IN ('user', 'assistant')
                   AND timestamp >= ?
@@ -247,6 +288,7 @@ def discover_profiles(hermes_home, source_date, batch_size, message_limit):
             "character_name": parse_character_name(soul_path),
             "intimacy": parse_intimacy_score(soul_path),
             "evolved_persona": extract_evolved_persona(soul_path),
+            "evolution_policy": read_evolution_policy(profile_path),
             "messages": messages,
             "last_active": last_active,
         })
@@ -268,8 +310,23 @@ def chunk_profiles(profiles, batch_size):
     return batches
 
 
+def chunk_profiles_by_policy(profiles, batch_size):
+    batches = []
+    batch_policies = []
+    for policy in (LEGACY_POLICY, GUARDED_POLICY, GUARDED_V2_POLICY):
+        policy_profiles = [
+            item for item in profiles
+            if item.get("evolution_policy", LEGACY_POLICY) == policy
+        ]
+        for batch in chunk_profiles(policy_profiles, batch_size):
+            batches.append(batch)
+            batch_policies.append(policy)
+    return batches, batch_policies
+
+
 def build_manifest(hermes_home, source_date, batch_size, message_limit):
     profiles = discover_profiles(hermes_home, source_date, batch_size, message_limit)
+    batches, batch_policies = chunk_profiles_by_policy(profiles, batch_size)
     return {
         "source_date": source_date,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -278,7 +335,8 @@ def build_manifest(hermes_home, source_date, batch_size, message_limit):
         "cursor": DEFAULT_BATCH_CURSOR,
         "total_profiles": len(profiles),
         "profile_ids": [item["profile_id"] for item in profiles],
-        "batches": chunk_profiles(profiles, batch_size),
+        "batches": batches,
+        "batch_policies": batch_policies,
     }
 
 
@@ -323,10 +381,19 @@ def eligible_profiles_for_batch(hermes_home, manifest):
     return profile_map
 
 
+def current_batch_policy(manifest):
+    cursor = manifest.get("cursor", 0)
+    batch_policies = manifest.get("batch_policies", [])
+    if cursor < 0 or cursor >= len(batch_policies):
+        return LEGACY_POLICY
+    return batch_policies[cursor]
+
+
 def batch_profiles(hermes_home, manifest):
     if manifest_complete(manifest):
         return []
     batch_ids = manifest["batches"][manifest["cursor"]]
+    expected_policy = current_batch_policy(manifest)
     start_ts, end_ts = business_day_bounds(manifest["source_date"])
     profile_map = eligible_profiles_for_batch(hermes_home, manifest)
     result = []
@@ -344,6 +411,15 @@ def batch_profiles(hermes_home, manifest):
         if not messages:
             continue
         last_active = messages[-1]["timestamp"]
+        current_policy = read_evolution_policy(profile_path)
+        if current_policy != expected_policy:
+            raise RuntimeError(
+                "batch policy drift for {0}: expected {1}, got {2}".format(
+                    profile_id,
+                    expected_policy,
+                    current_policy,
+                )
+            )
         result.append({
             "profile_id": profile_id,
             "profile_path": profile_path,
@@ -351,10 +427,19 @@ def batch_profiles(hermes_home, manifest):
             "soul_path": soul_path,
             "intimacy": parse_intimacy_score(soul_path),
             "evolved_persona": extract_evolved_persona(soul_path),
+            "evolution_policy": current_policy,
+            "base_soul": extract_base_soul(soul_path),
+            "soul_sha256": soul_sha256(soul_path),
             "last_active": last_active,
             "messages": messages,
         })
     result.sort(key=profile_sort_key)
+    if expected_policy in (GUARDED_POLICY, GUARDED_V2_POLICY) and len(result) != len(batch_ids):
+        live_ids = set(item["profile_id"] for item in result)
+        missing_ids = [profile_id for profile_id in batch_ids if profile_id not in live_ids]
+        raise RuntimeError(
+            "live profiles missing from guarded batch: " + ", ".join(missing_ids)
+        )
     return result
 
 
@@ -371,7 +456,145 @@ def format_message_content(content):
     return content
 
 
-def print_manifest_header(now_dt, manifest, current_batch_count):
+_QUALITY_CORRECTION_PATTERNS = (
+    re.compile(r"你.{0,6}说话.{0,4}(太)?机械"),
+    re.compile(r"你.{0,6}像程序"),
+    re.compile(r"(?:\bOOC\b|ooc).{0,4}出戏|出戏.{0,4}(?:\bOOC\b|ooc)"),
+    re.compile(r"你.{0,6}(?:出戏|ooc)"),
+    re.compile(r"不许把我叫成访客"),
+)
+
+
+def _is_quality_correction_message(content):
+    text = str(content or "")
+    for pattern in _QUALITY_CORRECTION_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
+
+
+def _load_turn_reviews(profile_path, turn_ids):
+    db_path = os.path.join(profile_path, "companion_guard.db")
+    filtered_turn_ids = [str(turn_id).strip() for turn_id in list(turn_ids or []) if str(turn_id).strip()]
+    if not os.path.exists(db_path) or not filtered_turn_ids:
+        return None
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        placeholders = ",".join("?" for unused_item in filtered_turn_ids)
+        cursor.execute(
+            """
+                SELECT turn_id, assistant_sha256, status, continuity_summary
+                FROM turn_reviews
+                WHERE turn_id IN ({0})
+            """.format(placeholders),
+            filtered_turn_ids,
+        )
+        reviews = {}
+        for turn_id, assistant_hash, status, continuity_summary in cursor.fetchall():
+            reviews[str(turn_id or "")] = {
+                "assistant_sha256": str(assistant_hash or ""),
+                "status": str(status or ""),
+                "continuity_summary": str(continuity_summary or ""),
+            }
+        return reviews
+    except Exception:
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def _normalize_summary_text(value):
+    return " ".join(str(value or "").split())
+
+
+def _summary_leaks_raw(summary, raw_text):
+    normalized_summary = _normalize_summary_text(summary)
+    normalized_raw = _normalize_summary_text(raw_text)
+    if normalized_raw in normalized_summary or normalized_summary in normalized_raw:
+        return True
+    if len(normalized_summary) < 8 or len(normalized_raw) < 8:
+        return False
+    match = SequenceMatcher(None, normalized_summary, normalized_raw).find_longest_match(
+        0,
+        len(normalized_summary),
+        0,
+        len(normalized_raw),
+    )
+    leaked = normalized_summary[match.a:match.a + match.size].strip()
+    return len(leaked) >= 8
+
+
+def _encode_guarded_report_content(value):
+    encoded = json.dumps(str(value or ""), ensure_ascii=False)[1:-1]
+    return (
+        encoded
+        .replace("\u0085", "\\u0085")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _print_guarded_v2_dialogue(chat):
+    print("\n### Dialogue History\n")
+    turn_ids = [
+        message.get("message_id")
+        for message in chat["messages"]
+        if message.get("role") == "user"
+    ]
+    reviews = _load_turn_reviews(chat["profile_path"], turn_ids)
+    previous_user = None
+    for message in chat["messages"]:
+        if message["role"] == "user":
+            previous_user = message
+            suffix = " [quality_correction_only]" if _is_quality_correction_message(message.get("content")) else ""
+            print("[evolution_evidence] USER: {0}{1}".format(
+                _encode_guarded_report_content(
+                    format_message_content(message.get("content") or "")
+                ),
+                suffix,
+            ))
+            print("")
+            continue
+        if message["role"] != "assistant":
+            continue
+        turn_id = str((previous_user or {}).get("message_id") or "")
+        record = reviews.get(turn_id) if reviews and turn_id else None
+        if (
+            not record
+            or record.get("status") not in ("clean", "drift")
+            or record.get("assistant_sha256") != assistant_sha256(message.get("content") or "")
+        ):
+            print("[context_only] ASSISTANT: [review unavailable]")
+            print("")
+            continue
+        if record.get("status") == "drift":
+            continuity_summary = record.get("continuity_summary") or ""
+            if not continuity_summary or _summary_leaks_raw(
+                continuity_summary,
+                message.get("content"),
+            ):
+                print("[context_only] ASSISTANT: [review unavailable]")
+                print("")
+                continue
+            print("[context_only] ASSISTANT SUMMARY: {0}".format(
+                _encode_guarded_report_content(
+                    continuity_summary
+                )
+            ))
+            print("")
+            continue
+        print("[context_only] ASSISTANT: {0}".format(
+            _encode_guarded_report_content(
+                format_message_content(message.get("content") or "")
+            )
+        ))
+        print("")
+
+
+def print_manifest_header(now_dt, manifest, current_batch_count, batch_policy):
     print("# Savana Characters Evolution Report")
     print("Generated at: {}\n".format(now_dt.strftime("%Y-%m-%d %H:%M:%S")))
     print("- Review Date: {}".format(manifest["source_date"]))
@@ -381,6 +604,16 @@ def print_manifest_header(now_dt, manifest, current_batch_count):
     ))
     print("- Batch Size: {}".format(manifest.get("batch_size", DEFAULT_BATCH_SIZE)))
     print("- Profiles Included In Batch: {}".format(current_batch_count))
+    if batch_policy in (GUARDED_POLICY, GUARDED_V2_POLICY):
+        print("- Evolution Batch Policy: {}".format(batch_policy))
+        print(
+            _SAVANA_BATCH_PROFILES_JSON_PREFIX
+            + json.dumps(
+                list(manifest["batches"][manifest["cursor"]]),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
     print("- Total Eligible Profiles Yesterday: {}".format(manifest.get("total_profiles", 0)))
     print("- Per-Profile Message Limit: {}\n".format(
         manifest.get("message_limit", DEFAULT_MESSAGE_LIMIT)
@@ -405,15 +638,24 @@ def print_profile_section(chat, now_ts):
     print("  ```markdown")
     print("  " + (chat["evolved_persona"] or "(暂无自主进化，人设遵循基础设定)"))
     print("  ```")
-    print("\n### Dialogue History\n")
-    for msg in chat["messages"]:
-        role_display = "User" if msg["role"] == "user" else chat["character_name"]
-        print("[{} ({})]: {}".format(
-            role_display,
-            display_time(msg["timestamp"]),
-            format_message_content(msg["content"] or "")
-        ))
-        print("")
+    if chat.get("evolution_policy") in (GUARDED_POLICY, GUARDED_V2_POLICY):
+        print("- SOUL.md SHA-256: {}".format(chat["soul_sha256"]))
+        print("\n### Base Persona Snapshot\n")
+        print("```markdown")
+        print(chat.get("base_soul") or "")
+        print("```")
+    if chat.get("evolution_policy") == GUARDED_V2_POLICY:
+        _print_guarded_v2_dialogue(chat)
+    else:
+        print("\n### Dialogue History\n")
+        for msg in chat["messages"]:
+            role_display = "User" if msg["role"] == "user" else chat["character_name"]
+            print("[{} ({})]: {}".format(
+                role_display,
+                display_time(msg["timestamp"]),
+                format_message_content(msg["content"] or "")
+            ))
+            print("")
     print("---\n")
 
 
@@ -448,7 +690,11 @@ def main():
         print("\nNo pending Savana evolution batches remain for the review date.")
         return
 
-    profiles = batch_profiles(hermes_home, manifest)
+    try:
+        profiles = batch_profiles(hermes_home, manifest)
+    except RuntimeError as exc:
+        sys.stderr.write(str(exc) + "\n")
+        raise
     if not profiles:
         print("# Savana Characters Evolution Report")
         print("Generated at: {}\n".format(now_dt.strftime("%Y-%m-%d %H:%M:%S")))
@@ -457,7 +703,8 @@ def main():
         print("\nCurrent batch resolved to zero live profiles. Advance cursor manually if needed.")
         return
 
-    print_manifest_header(now_dt, manifest, len(profiles))
+    batch_policy = current_batch_policy(manifest)
+    print_manifest_header(now_dt, manifest, len(profiles), batch_policy)
     for chat in profiles:
         print_profile_section(chat, now_ts)
 

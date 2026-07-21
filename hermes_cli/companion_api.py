@@ -1,20 +1,80 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import queue
 import shutil
 import threading
+import time
+from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Generator, List, Optional
 
+import anyio
 import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from starlette._utils import collapse_excgroups
+from starlette.requests import ClientDisconnect
+
+from hermes_cli.companion_profile_policy import (
+    STYLE_GUARD_V1_POLICY,
+    ensure_companion_profile,
+    profile_lock,
+    read_conversation_policy,
+)
+from hermes_cli.companion_prompt import build_companion_system_prompt
+from hermes_cli.config import load_config
+from hermes_cli.companion_turn_guard import (
+    TurnReviewStore,
+    assistant_sha256,
+    build_guarded_history,
+    review_turn,
+)
 
 router = APIRouter(prefix="/companion/v1")
 logger = logging.getLogger(__name__)
+_SESSION_LOCKS = {}
+_SESSION_LOCKS_GUARD = threading.Lock()
+_stream_event_hook = None
+
+
+def _style_guard_new_profiles_enabled() -> bool:
+    try:
+        config = load_config()
+    except Exception:
+        logger.exception("Failed to load companion profile feature flags")
+        return False
+    companion_config = config.get("companion") or {}
+    return bool(companion_config.get("style_guard_new_profiles_enabled", True))
+
+
+def _log_style_guard_event(
+    *,
+    profile_dir: str,
+    turn_id: str,
+    policy: str,
+    status: str,
+    elapsed_ms: int,
+    model: str,
+) -> None:
+    profile_hash = hashlib.sha256(
+        str(Path(profile_dir).resolve()).encode("utf-8")
+    ).hexdigest()[:16]
+    payload = {
+        "profile_hash": profile_hash,
+        "turn_id": str(turn_id or ""),
+        "policy": str(policy or ""),
+        "status": str(status or ""),
+        "elapsed_ms": max(0, int(elapsed_ms)),
+        "model": str(model or ""),
+    }
+    logger.info(
+        "savana_companion.style_guard %s",
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+    )
 
 class ChatRequest(BaseModel):
     user_id: str
@@ -28,6 +88,7 @@ class ChatRequest(BaseModel):
     api_key: Optional[str] = None
     api_base: Optional[str] = None
     directives: Optional[str] = None
+    companion_directives: Optional[str] = None
     request_overrides: Optional[Dict[str, Any]] = None
     reasoning_config: Optional[Dict[str, Any]] = None
 
@@ -362,6 +423,289 @@ def _load_companion_history(session_db, session_id: str, current_message_id: str
             continue
         history.append(msg)
     return history
+
+
+def _get_session_lock(session_id: str) -> threading.Lock:
+    with _SESSION_LOCKS_GUARD:
+        lock = _SESSION_LOCKS.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            _SESSION_LOCKS[session_id] = lock
+        return lock
+
+
+def _emit_stream_event(name: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    hook = _stream_event_hook
+    if callable(hook):
+        try:
+            hook(name, payload)
+        except Exception:
+            logger.exception("stream event hook failed for %s", name)
+
+
+def _start_background_thread(target) -> threading.Thread:
+    worker = threading.Thread(target=target)
+    worker.start()
+    return worker
+
+
+class _CompanionStreamResponse(StreamingResponse):
+    def __init__(
+        self,
+        *args,
+        final_marker_consumed: threading.Event,
+        producer_done: threading.Event,
+        session_lock: Optional[threading.Lock],
+        session_lock_released_ref: Dict[str, bool],
+        **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self._final_marker_consumed = final_marker_consumed
+        self._producer_done = producer_done
+        self._session_lock = session_lock
+        self._session_lock_released_ref = session_lock_released_ref
+
+    async def _cleanup_stream_resources(self) -> None:
+        self._final_marker_consumed.set()
+        _emit_stream_event("final_marker_set")
+        await asyncio.get_running_loop().run_in_executor(None, self._producer_done.wait)
+        if self._session_lock is not None and not self._session_lock_released_ref["released"]:
+            self._session_lock.release()
+            self._session_lock_released_ref["released"] = True
+            _emit_stream_event("lock_released")
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            spec_version = tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split(".")))
+
+            if spec_version >= (2, 4):
+                try:
+                    await self.stream_response(send)
+                except OSError:
+                    raise
+            else:
+                with collapse_excgroups():
+                    async with anyio.create_task_group() as task_group:
+
+                        async def wrap(func: Callable[[], Awaitable[None]]) -> None:
+                            await func()
+                            task_group.cancel_scope.cancel()
+
+                        task_group.start_soon(wrap, partial(self.stream_response, send))
+                        await wrap(partial(self.listen_for_disconnect, receive))
+
+            if self.background is not None:
+                await self.background()
+        except ClientDisconnect:
+            return
+        finally:
+            cleanup_task = asyncio.create_task(self._cleanup_stream_resources())
+            await asyncio.shield(cleanup_task)
+
+
+async def _acquire_session_lock_cancellation_safe(session_lock: threading.Lock) -> None:
+    loop = asyncio.get_running_loop()
+    acquire_future = loop.run_in_executor(None, session_lock.acquire)
+
+    def _release_if_acquired(future) -> None:
+        try:
+            acquired = bool(future.result())
+        except Exception:
+            logger.exception("session lock acquire future cleanup failed")
+            return
+        if acquired:
+            try:
+                session_lock.release()
+            except Exception:
+                logger.exception("session lock orphan acquire release failed")
+
+    try:
+        await asyncio.shield(acquire_future)
+    except asyncio.CancelledError:
+        if acquire_future.done():
+            _release_if_acquired(acquire_future)
+        else:
+            acquire_future.add_done_callback(_release_if_acquired)
+        raise
+
+
+def _build_style_guard_system_prompt(
+    soul_text: str,
+    memory_text: str,
+    user_profile_text: str,
+    companion_directives: Optional[str],
+) -> str:
+    prompt = build_companion_system_prompt(
+        soul_text,
+        memory_text,
+        user_profile_text,
+    )
+    directives_text = str(companion_directives or "").strip()
+    if not directives_text:
+        return prompt
+    return (
+        prompt
+        + "\n\n对话指引\n"
+        + directives_text
+    ).strip()
+
+
+def _index_history_turns(raw_history: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    indexed = {}
+    previous_user_turn = None
+    for idx, message in enumerate(list(raw_history or [])):
+        role = (message or {}).get("role")
+        if role == "user":
+            previous_user_turn = {
+                "turn_id": (message or {}).get("message_id"),
+                "user_message": (message or {}).get("content") or "",
+                "assistant_prefix_messages": list(raw_history[:idx]),
+            }
+            continue
+        if role == "assistant" and previous_user_turn and previous_user_turn.get("turn_id"):
+            indexed[previous_user_turn["turn_id"]] = {
+                "turn_id": previous_user_turn["turn_id"],
+                "user_message": previous_user_turn["user_message"],
+                "assistant_text": (message or {}).get("content") or "",
+                "messages": previous_user_turn["assistant_prefix_messages"],
+            }
+            previous_user_turn = None
+            continue
+        if role not in ("tool", "function"):
+            previous_user_turn = None
+    return indexed
+
+
+def _restore_unresolved_reviews(
+    *,
+    profile_dir: str,
+    raw_history: List[Dict[str, Any]],
+    provider: str,
+    model: str,
+    base_url: Optional[str],
+    api_key: Optional[str],
+    memory_store: Any,
+) -> None:
+    turn_store = TurnReviewStore(profile_dir)
+    unresolved = turn_store.list_unresolved()
+    if not unresolved:
+        return
+    indexed_turns = _index_history_turns(raw_history)
+    for item in unresolved:
+        turn_id = str(item.get("turn_id") or "")
+        history_turn = indexed_turns.get(turn_id)
+        if not history_turn:
+            continue
+        assistant_text = history_turn.get("assistant_text") or ""
+        if item.get("assistant_sha256") != assistant_sha256(assistant_text):
+            continue
+        try:
+            review_turn(
+                profile_dir=profile_dir,
+                turn_id=turn_id,
+                assistant_text=assistant_text,
+                user_message=history_turn.get("user_message") or "",
+                messages=history_turn.get("messages") or [],
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                memory_store=memory_store,
+                store=turn_store,
+            )
+        except Exception:
+            logger.exception("Failed to restore unresolved companion turn %s", turn_id)
+
+
+def _fallback_review_metadata(turn_id: str, error: Exception) -> Dict[str, Any]:
+    logger.exception("Companion style review failed for turn %s", turn_id)
+    return {
+        "turn_id": str(turn_id or ""),
+        "review_status": "pending",
+        "memory_status": "pending",
+        "memory_modifications": [],
+        "error": str(error),
+    }
+
+
+def _mark_companion_turn_pending(profile_dir: str, turn_id: str, assistant_text: str) -> None:
+    store = TurnReviewStore(profile_dir)
+    current = store.begin(turn_id, assistant_text)
+    if current and current.get("status") != "pending":
+        store._commit_status(
+            turn_id,
+            current["assistant_sha256"],
+            "pending",
+            "",
+            "",
+            {},
+            "pending",
+            "",
+        )
+
+
+def _review_companion_turn(
+    *,
+    style_guard_enabled: bool,
+    profile_dir: str,
+    turn_id: str,
+    assistant_text: str,
+    user_message: str,
+    raw_history: List[Dict[str, Any]],
+    provider: str,
+    model: str,
+    base_url: Optional[str],
+    api_key: Optional[str],
+    memory_store: Any,
+) -> Dict[str, Any]:
+    if not style_guard_enabled:
+        modifications = []
+        if memory_store is not None and hasattr(memory_store, "modifications"):
+            modifications = memory_store.modifications
+        return {
+            "turn_id": str(turn_id or ""),
+            "review_status": None,
+            "memory_status": None,
+            "memory_modifications": modifications,
+        }
+    started_at = time.monotonic()
+    try:
+        result = review_turn(
+            profile_dir=profile_dir,
+            turn_id=turn_id,
+            assistant_text=assistant_text,
+            user_message=user_message,
+            messages=raw_history,
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            memory_store=memory_store,
+        )
+        _log_style_guard_event(
+            profile_dir=profile_dir,
+            turn_id=turn_id,
+            policy=STYLE_GUARD_V1_POLICY,
+            status=result.get("review_status") or "completed",
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            model=model,
+        )
+        return result
+    except Exception as exc:
+        try:
+            _mark_companion_turn_pending(profile_dir, turn_id, assistant_text)
+        except Exception:
+            logger.exception("Failed to preserve pending companion turn %s", turn_id)
+        result = _fallback_review_metadata(turn_id, exc)
+        _log_style_guard_event(
+            profile_dir=profile_dir,
+            turn_id=turn_id,
+            policy=STYLE_GUARD_V1_POLICY,
+            status="pending",
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            model=model,
+        )
+        return result
 
 
 def _get_weixin_bridge_runtime():
@@ -699,6 +1043,11 @@ async def stop_weixin_bridge_worker():
     await _WEIXIN_BRIDGE_WORKER.stop()
 
 def sync_soul_file(profile_dir: str, profile_data: Dict[str, Any]) -> None:
+    with profile_lock(Path(profile_dir), "soul"):
+        _sync_soul_file_unlocked(profile_dir, profile_data)
+
+
+def _sync_soul_file_unlocked(profile_dir: str, profile_data: Dict[str, Any]) -> None:
     soul_path = os.path.join(profile_dir, "SOUL.md")
     evolved_persona = extract_evolved_persona(soul_path)
     if not evolved_persona or not evolved_persona.strip():
@@ -802,6 +1151,22 @@ def sync_soul_file(profile_dir: str, profile_data: Dict[str, Any]) -> None:
 async def chat_endpoint(req: ChatRequest):
     session_id = "savana_{}_{}".format(req.user_id.lower(), req.character_id.lower())
     profile_dir = get_profile_path(session_id)
+    profile_path = Path(profile_dir)
+    if not profile_path.exists() and not _style_guard_new_profiles_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="Companion profile initialization is temporarily unavailable; retry later.",
+            headers={"Retry-After": "5"},
+        )
+    ensure_companion_profile(profile_path)
+    conversation_policy = read_conversation_policy(profile_dir)
+    style_guard_enabled = conversation_policy == STYLE_GUARD_V1_POLICY
+    session_lock = None
+    if style_guard_enabled:
+        session_lock = _get_session_lock(session_id)
+        await _acquire_session_lock_cancellation_safe(session_lock)
+    session_lock_released_ref = {"released": False}
+    stream_lock_owned_by_response = False
     
     # 1. 动态物理隔离 Profile 目录 (使用线程安全的 ContextVar 覆盖)
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
@@ -823,18 +1188,28 @@ async def chat_endpoint(req: ChatRequest):
             session_db.create_session(session_id, "savana")
         except Exception:
             pass
-        conversation_history = _load_companion_history(
+        raw_history = _load_companion_history(
             session_db, session_id, req.message_id
         )
         soul_text = _read_text_if_exists(Path(profile_dir) / "SOUL.md")
         memory_snapshots = _load_companion_memory_snapshots(profile_dir)
         session_stats = _get_latest_session_stats(session_db, session_id)
+        conversation_history = raw_history
+        if style_guard_enabled:
+            conversation_history = build_guarded_history(raw_history, TurnReviewStore(profile_dir))
 
         # 动态解析模型及 API 配置
         api_key = req.api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
         base_url = req.api_base or os.environ.get("DEEPSEEK_API_BASE") or "https://api.deepseek.com"
         provider = req.provider or "deepseek"
         model = req.model or "deepseek-v4-flash"
+        effective_directives = ""
+        diagnostics_directives = req.companion_directives or ""
+        enabled_toolsets = []
+        if not style_guard_enabled:
+            effective_directives = req.directives
+            diagnostics_directives = req.directives
+            enabled_toolsets = ["memory"]
 
         # 3. 实例化 AI 代理 (硬编码工具限制为 memory，完全封死危险操作)
         agent = AIAgent(
@@ -843,18 +1218,36 @@ async def chat_endpoint(req: ChatRequest):
             api_key=api_key,
             base_url=base_url,
             api_mode="chat_completions",
-            enabled_toolsets=["memory"],
+            enabled_toolsets=enabled_toolsets,
             quiet_mode=True,
             platform="savana",
             session_db=session_db,
             session_id=session_id,
             load_soul_identity=True,
             skip_context_files=True,
-            ephemeral_system_prompt=req.directives,
+            ephemeral_system_prompt=effective_directives,
             request_overrides=req.request_overrides,
             reasoning_config=req.reasoning_config,
         )
         agent.suppress_status_output = True
+        if style_guard_enabled:
+            _restore_unresolved_reviews(
+                profile_dir=profile_dir,
+                raw_history=raw_history,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                memory_store=getattr(agent, "_memory_store", None),
+            )
+            conversation_history = build_guarded_history(raw_history, TurnReviewStore(profile_dir))
+            agent._system_prompt_override = _build_style_guard_system_prompt(
+                soul_text,
+                memory_snapshots.get("memory", ""),
+                memory_snapshots.get("user", ""),
+                req.companion_directives,
+            )
+            agent._cached_system_prompt = agent._system_prompt_override
 
         # Savana 伴侣场景：覆盖 memory 工具描述为角色扮演专用中文版本
         # 原始通用描述是面向开发者的英文，DeepSeek 在角色扮演模式下无法关联到"记住用户偏好"这一触发场景
@@ -868,7 +1261,7 @@ async def chat_endpoint(req: ChatRequest):
             "只写入 target='user'（用户档案），action='add' 新增，action='replace' 更新旧条目。"
             "content 用简短中文写明事实，例如：'用户最喜欢的运动是攀岩'、'用户讨厌吃芹菜和胡萝卜'。"
         )
-        if agent.tools:
+        if not style_guard_enabled and agent.tools:
             for _tool in agent.tools:
                 if isinstance(_tool, dict) and _tool.get("function", {}).get("name") == "memory":
                     _tool["function"]["description"] = _SAVANA_MEMORY_DESCRIPTION
@@ -881,35 +1274,65 @@ async def chat_endpoint(req: ChatRequest):
             getattr(agent, "skip_memory", None),
             getattr(agent, "_memory_enabled", None),
             agent._memory_store is not None,
-            repr(agent.ephemeral_system_prompt)
+            repr(getattr(agent, "ephemeral_system_prompt", None))
         ))
 
-        _log_companion_prompt_diagnostics(
-            session_id=session_id,
-            provider=provider,
-            model=model,
-            user_message=req.user_message,
-            conversation_history=conversation_history,
-            character_profile=req.character_profile,
-            directives=req.directives,
-            soul_text=soul_text,
-            memory_text=memory_snapshots.get("memory", ""),
-            user_profile_text=memory_snapshots.get("user", ""),
-            session_stats=session_stats,
-        )
+        if style_guard_enabled:
+            _log_style_guard_event(
+                profile_dir=profile_dir,
+                turn_id=req.message_id,
+                policy=conversation_policy,
+                status="started",
+                elapsed_ms=0,
+                model=model,
+            )
+        else:
+            _log_companion_prompt_diagnostics(
+                session_id=session_id,
+                provider=provider,
+                model=model,
+                user_message=req.user_message,
+                conversation_history=conversation_history,
+                character_profile=req.character_profile,
+                directives=diagnostics_directives,
+                soul_text=soul_text,
+                memory_text=memory_snapshots.get("memory", ""),
+                user_profile_text=memory_snapshots.get("user", ""),
+                session_stats=session_stats,
+            )
 
 
         if req.stream:
             q = queue.Queue()
+            review_metadata = {
+                "review_status": None,
+                "memory_status": None,
+                "memory_modifications": [],
+            }
+            final_marker_consumed = threading.Event()
+            producer_done = threading.Event()
+
+            def _build_stream_metadata():
+                modifications = review_metadata.get("memory_modifications", [])
+                if not style_guard_enabled and not modifications:
+                    memory_store = getattr(agent, "_memory_store", None)
+                    if memory_store is not None and hasattr(memory_store, "modifications"):
+                        modifications = memory_store.modifications
+                metadata = {
+                    "session_id": session_id,
+                    "status": "completed",
+                    "memory_modifications": modifications,
+                }
+                if style_guard_enabled:
+                    metadata["review_status"] = review_metadata.get("review_status")
+                    metadata["memory_status"] = review_metadata.get("memory_status")
+                return metadata
 
             def run_chat_thread():
                 token_thread = set_hermes_home_override(profile_dir)
                 try:
-                    collected_chunks = []
-                    
                     def stream_callback(delta: str) -> None:
-                        q.put(delta)
-                        collected_chunks.append(delta)
+                        q.put(("token", delta))
 
                     # 触发对话生成
                     result = agent.run_conversation(
@@ -919,37 +1342,74 @@ async def chat_endpoint(req: ChatRequest):
                         platform_message_id=req.message_id,
                     )
                     final_reply = result.get("final_response", "")
+                    q.put(("final", final_reply))
+                    final_marker_consumed.wait()
+                    review_metadata.update(
+                        _review_companion_turn(
+                            style_guard_enabled=style_guard_enabled,
+                            profile_dir=profile_dir,
+                            turn_id=req.message_id,
+                            assistant_text=final_reply,
+                            user_message=req.user_message,
+                            raw_history=raw_history,
+                            provider=provider,
+                            model=model,
+                            base_url=base_url,
+                            api_key=api_key,
+                            memory_store=getattr(agent, "_memory_store", None),
+                        )
+                    )
+                    q.put(("metadata", _build_stream_metadata()))
+                    q.put(("end", None))
                 except Exception as e:
-                    q.put(e)
+                    q.put(("error", e))
+                    q.put(("metadata", _build_stream_metadata()))
+                    q.put(("end", None))
                 finally:
-                    q.put(None)  # 哨兵标记，代表生成结束
-                    reset_hermes_home_override(token_thread)
+                    try:
+                        try:
+                            reset_hermes_home_override(token_thread)
+                        except Exception:
+                            logger.exception("Failed to reset Hermes home override for companion stream thread")
+                    finally:
+                        producer_done.set()
+                        _emit_stream_event("producer_done")
 
-            threading.Thread(target=run_chat_thread).start()
+            _start_background_thread(run_chat_thread)
 
             def sse_generator() -> Generator[str, None, None]:
                 while True:
-                    item = q.get()
-                    if item is None:
+                    item_type, item_value = q.get()
+                    if item_type == "error":
+                        _emit_stream_event("error")
+                        yield "event: error\ndata: {}\n\n".format(json.dumps({"detail": str(item_value)}))
+                        continue
+                    if item_type == "token":
+                        yield_data = {"delta": item_value}
+                        _emit_stream_event("token", yield_data)
+                        yield "event: token\ndata: {}\n\n".format(json.dumps(yield_data))
+                        continue
+                    if item_type == "final":
+                        final_marker_consumed.set()
+                        _emit_stream_event("final_marker_set")
+                        continue
+                    if item_type == "metadata":
+                        _emit_stream_event("metadata", item_value)
+                        yield "event: metadata\ndata: {}\n\n".format(json.dumps(item_value))
+                        continue
+                    if item_type == "end":
                         break
-                    if isinstance(item, Exception):
-                        # 如果出现异常，返回 error 事件，并中断
-                        yield "event: error\ndata: {}\n\n".format(json.dumps({"detail": str(item)}))
-                        break
-                    yield_data = {"delta": item}
-                    yield "event: token\ndata: {}\n\n".format(json.dumps(yield_data))
-                
-                modifications = []
-                if getattr(agent, "_memory_store", None) and hasattr(agent._memory_store, "modifications"):
-                    modifications = agent._memory_store.modifications
-                metadata = {
-                    "session_id": session_id,
-                    "status": "completed",
-                    "memory_modifications": modifications
-                }
-                yield "event: metadata\ndata: {}\n\n".format(json.dumps(metadata))
 
-            return StreamingResponse(sse_generator(), media_type="text/event-stream")
+            response = _CompanionStreamResponse(
+                sse_generator(),
+                media_type="text/event-stream",
+                final_marker_consumed=final_marker_consumed,
+                producer_done=producer_done,
+                session_lock=session_lock,
+                session_lock_released_ref=session_lock_released_ref,
+            )
+            stream_lock_owned_by_response = True
+            return response
         else:
             result = agent.run_conversation(
                 req.user_message,
@@ -957,16 +1417,33 @@ async def chat_endpoint(req: ChatRequest):
                 platform_message_id=req.message_id,
             )
             reply = result.get("final_response", "")
-            modifications = []
-            if getattr(agent, "_memory_store", None) and hasattr(agent._memory_store, "modifications"):
-                modifications = agent._memory_store.modifications
-            return JSONResponse({
+            review_metadata = _review_companion_turn(
+                style_guard_enabled=style_guard_enabled,
+                profile_dir=profile_dir,
+                turn_id=req.message_id,
+                assistant_text=reply,
+                user_message=req.user_message,
+                raw_history=raw_history,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                memory_store=getattr(agent, "_memory_store", None),
+            )
+            payload = {
                 "reply": reply,
                 "session_id": session_id,
-                "memory_modifications": modifications
-            })
+                "memory_modifications": review_metadata.get("memory_modifications", []),
+            }
+            if style_guard_enabled:
+                payload["review_status"] = review_metadata.get("review_status")
+                payload["memory_status"] = review_metadata.get("memory_status")
+            return JSONResponse(payload)
             
     finally:
+        if session_lock is not None and not session_lock_released_ref["released"] and not stream_lock_owned_by_response:
+            session_lock.release()
+            session_lock_released_ref["released"] = True
         reset_hermes_home_override(token)
 
 @router.delete("/sessions/{session_id}")
@@ -981,7 +1458,7 @@ async def delete_session(session_id: str):
 @router.post("/sessions/{session_id}/memories")
 async def sync_memory(session_id: str, req: MemorySyncRequest):
     profile_dir = get_profile_path(session_id)
-    os.makedirs(profile_dir, exist_ok=True)
+    ensure_companion_profile(Path(profile_dir))
     
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     token = set_hermes_home_override(profile_dir)
@@ -1015,7 +1492,7 @@ async def start_weixin_qr(req: WeixinQrStartRequest):
     try:
         if isinstance(req.character_profile, dict):
             profile_dir = get_profile_path(req.session_id)
-            os.makedirs(profile_dir, exist_ok=True)
+            ensure_companion_profile(Path(profile_dir))
             sync_soul_file(profile_dir, req.character_profile)
         result = await _start_weixin_qr_session(
             hermes_home=hermes_home,
@@ -1114,7 +1591,7 @@ async def update_message_endpoint(session_id: str, message_id: str, req: Message
         from hermes_state import SessionDB
         db_path = Path(profile_dir) / "state.db"
         session_db = SessionDB(db_path=db_path)
-        
+
         updated = session_db.update_message_content(
             session_id=session_id,
             platform_message_id=message_id,
@@ -1137,4 +1614,3 @@ async def update_message_endpoint(session_id: str, message_id: str, req: Message
             except Exception:
                 pass
         reset_hermes_home_override(token)
-

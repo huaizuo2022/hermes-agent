@@ -14,6 +14,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -133,6 +134,13 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 SILENT_MARKER = "[SILENT]"
 _SAVANA_EVOLUTION_JOB_NAME = "Savana-Self-Evolution"
 _SAVANA_EVOLUTION_CONTINUE_MINUTES = 5
+_SAVANA_GUARDED_SKILL = "savana-companion-evolution-guarded"
+_SAVANA_GUARDED_V2_SKILL = "savana-companion-evolution-guarded-v2"
+_SAVANA_POLICY_PREFIX = "- Evolution Batch Policy: "
+_SAVANA_GUARDED_REPORT_MARKER = "- Evolution Batch Policy: guarded_v1"
+_SAVANA_GUARDED_V2_REPORT_MARKER = "- Evolution Batch Policy: guarded_v2"
+_SAVANA_BATCH_PROFILES_JSON_PREFIX = "- Evolution Batch Profiles JSON: "
+_SAVANA_SUCCESS_STATUSES = frozenset(["committed", "no_change"])
 
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
@@ -246,6 +254,197 @@ def _is_savana_evolution_job(job: dict) -> bool:
         or job.get("skill") == "savana-companion-evolution"
         or "savana-companion-evolution" in skills
     )
+
+
+def _extract_savana_report_header_lines(value: str) -> List[str]:
+    header = []
+    for line in str(value or "").splitlines():
+        if line.startswith("## Character: "):
+            break
+        header.append(line.rstrip())
+    return header
+
+
+def _is_savana_report(value: str) -> bool:
+    lines = str(value or "").splitlines()
+    return bool(lines) and lines[0].strip() == "# Savana Characters Evolution Report"
+
+
+def _extract_savana_guarded_policy(value: str) -> Optional[str]:
+    markers = []
+    for line in _extract_savana_report_header_lines(value):
+        stripped = line.strip()
+        if stripped == _SAVANA_GUARDED_REPORT_MARKER:
+            markers.append("guarded_v1")
+        elif stripped == _SAVANA_GUARDED_V2_REPORT_MARKER:
+            markers.append("guarded_v2")
+    if len(markers) != 1:
+        return None
+    return markers[0]
+
+
+def _savana_header_is_malformed(value: str) -> bool:
+    policy_headers = []
+    json_headers = []
+    for line in _extract_savana_report_header_lines(value):
+        stripped = line.strip()
+        if stripped.startswith(_SAVANA_POLICY_PREFIX):
+            policy_headers.append(stripped)
+        if stripped.startswith(_SAVANA_BATCH_PROFILES_JSON_PREFIX):
+            json_headers.append(stripped)
+    if not policy_headers and not json_headers:
+        return False
+    if len(policy_headers) != 1 or len(json_headers) != 1:
+        return True
+    return policy_headers[0] not in (
+        _SAVANA_GUARDED_REPORT_MARKER,
+        _SAVANA_GUARDED_V2_REPORT_MARKER,
+    )
+
+
+def _extract_savana_expected_profile_ids(value: str) -> List[str]:
+    header_lines = _extract_savana_report_header_lines(value)
+    payloads = []
+    for line in header_lines:
+        stripped = line.strip()
+        if stripped.startswith(_SAVANA_BATCH_PROFILES_JSON_PREFIX):
+            payloads.append(stripped[len(_SAVANA_BATCH_PROFILES_JSON_PREFIX):].strip())
+    if not payloads:
+        return []
+    if len(payloads) != 1:
+        raise RuntimeError("guarded Savana report header has conflicting profile JSON metadata")
+    try:
+        parsed = json.loads(payloads[0])
+    except Exception as exc:
+        raise RuntimeError("guarded Savana report header has invalid profile JSON metadata: {0}".format(exc))
+    if not isinstance(parsed, list) or not parsed:
+        raise RuntimeError("guarded Savana report header profile JSON must be a non-empty array")
+    profile_ids = []
+    seen = set()
+    for item in parsed:
+        profile_id = str(item or "").strip()
+        if not re.match(r"^savana_[A-Za-z0-9_.-]+$", profile_id):
+            raise RuntimeError("guarded Savana report header has invalid profile id")
+        if profile_id in seen:
+            raise RuntimeError("guarded Savana report header has duplicate profile ids")
+        seen.add(profile_id)
+        profile_ids.append(profile_id)
+    return profile_ids
+
+
+def _require_savana_expected_profile_ids(value: str) -> List[str]:
+    profile_ids = _extract_savana_expected_profile_ids(value)
+    if not profile_ids:
+        raise RuntimeError("guarded Savana report header is missing profile JSON metadata")
+    return profile_ids
+
+
+def _validate_savana_evolution_results(report_text: str, results) -> None:
+    policy = _extract_savana_guarded_policy(report_text)
+    if policy is None:
+        if _savana_header_is_malformed(report_text):
+            raise RuntimeError("guarded Savana report header is malformed")
+        return
+    expected_profile_ids = _require_savana_expected_profile_ids(report_text)
+    issues = []
+    observed_profile_ids = set()
+    for result in list(results or []):
+        profile_id = str(result.get("profile_id") or "")
+        status = str(result.get("status") or "invalid")
+        detail = str(result.get("error") or "")
+        if profile_id:
+            observed_profile_ids.add(profile_id)
+        if status not in _SAVANA_SUCCESS_STATUSES:
+            issue = "{0}:{1}".format(profile_id or "<unknown>", status)
+            if detail:
+                issue += " ({0})".format(detail)
+            issues.append(issue)
+    for profile_id in expected_profile_ids:
+        if profile_id not in observed_profile_ids:
+            issues.append("{0}:missing".format(profile_id))
+    if issues:
+        raise RuntimeError("guarded Savana evolution writer failed: " + ", ".join(issues))
+
+
+def _build_savana_script_failure(job_name: str, job_id: str, output: str):
+    error_msg = "RuntimeError: Savana evolution source script failed"
+    safe_output = str(output or "")
+    doc = f"""# Cron Job: {job_name} (FAILED)
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** N/A
+
+## Error
+
+```
+{error_msg}
+```
+
+## Script Output
+
+{safe_output}
+"""
+    return False, doc, "", error_msg
+
+
+def _select_savana_evolution_skills(job: dict, skills, script_output: str):
+    policy = _extract_savana_guarded_policy(script_output)
+    if not _is_savana_evolution_job(job) or policy is None:
+        return skills
+    if policy == "guarded_v2":
+        return [_SAVANA_GUARDED_V2_SKILL]
+    if policy == "guarded_v1":
+        return [_SAVANA_GUARDED_SKILL]
+    return skills
+
+
+def _apply_savana_evolution_output(
+    job: dict,
+    report_text: str,
+    final_response: str,
+    model: str,
+    hermes_home: Path,
+):
+    policy = _extract_savana_guarded_policy(report_text)
+    if policy is None:
+        if _savana_header_is_malformed(report_text):
+            raise RuntimeError("guarded Savana report header is malformed")
+        return []
+    if not (_is_savana_evolution_job(job) and policy):
+        return []
+    from hermes_cli.savana_evolution_guard import apply_guarded_results
+    expected_profile_ids = _require_savana_expected_profile_ids(report_text)
+
+    if policy == "guarded_v2":
+        results = apply_guarded_results(
+            hermes_home,
+            final_response,
+            model,
+            policy=policy,
+            expected_profile_ids=expected_profile_ids,
+        )
+    else:
+        results = apply_guarded_results(
+            hermes_home,
+            final_response,
+            model,
+            expected_profile_ids=expected_profile_ids,
+        )
+    counts = {}
+    for result in results:
+        status = result.get("status", "invalid")
+        counts[status] = counts.get(status, 0) + 1
+    logger.info("Savana guarded evolution results: %s", counts)
+    missing_count = sum(
+        1 for result in results if result.get("error") == "missing structured result"
+    )
+    if missing_count:
+        logger.warning(
+            "Savana guarded evolution missed %d profile result(s)",
+            missing_count,
+        )
+    return results
 
 
 def _extract_savana_review_date(output: str) -> Optional[str]:
@@ -1036,6 +1235,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """
     prompt = str(job.get("prompt") or "")
     skills = job.get("skills")
+    script_output = ""
 
     # Run data-collection script if configured, inject output as context.
     script_path = job.get("script")
@@ -1063,6 +1263,8 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 f"```\n{script_output}\n```\n\n"
                 f"{prompt}"
             )
+
+    skills = _select_savana_evolution_skills(job, skills, script_output)
 
     # Inject output from referenced cron jobs as context.
     context_from = job.get("context_from")
@@ -1345,10 +1547,18 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # the whole agent run. We pass the result into _build_job_prompt so
     # the script is only executed once.
     prerun_script = None
+    savana_report = ""
     script_path = job.get("script")
     if script_path:
         prerun_script = _run_job_script(script_path)
         _ran_ok, _script_output = prerun_script
+        savana_report = _script_output if _ran_ok else ""
+        if _is_savana_evolution_job(job) and not _ran_ok:
+            logger.error(
+                "Job '%s' (ID: %s): Savana source script failed",
+                job_name, job_id,
+            )
+            return _build_savana_script_failure(job_name, job_id, _script_output)
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -1767,6 +1977,14 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             raise RuntimeError(_err_text)
 
         final_response = result.get("final_response", "") or ""
+        savana_results = _apply_savana_evolution_output(
+            job,
+            savana_report,
+            final_response,
+            getattr(agent, "model", model),
+            _get_hermes_home(),
+        )
+        _validate_savana_evolution_results(savana_report, savana_results)
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""

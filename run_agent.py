@@ -2245,6 +2245,9 @@ class AIAgent:
 
     def _build_system_prompt(self, system_message: str = None) -> str:
         """Forwarder — see ``agent.system_prompt.build_system_prompt``."""
+        _override = getattr(self, "_system_prompt_override", None)
+        if _override is not None:
+            return _override
         from agent.system_prompt import build_system_prompt
         return build_system_prompt(self, system_message=system_message)
 
