@@ -136,6 +136,7 @@ _SAVANA_EVOLUTION_JOB_NAME = "Savana-Self-Evolution"
 _SAVANA_EVOLUTION_CONTINUE_MINUTES = 5
 _SAVANA_GUARDED_SKILL = "savana-companion-evolution-guarded"
 _SAVANA_GUARDED_V2_SKILL = "savana-companion-evolution-guarded-v2"
+_SAVANA_POLICY_PREFIX = "- Evolution Batch Policy: "
 _SAVANA_GUARDED_REPORT_MARKER = "- Evolution Batch Policy: guarded_v1"
 _SAVANA_GUARDED_V2_REPORT_MARKER = "- Evolution Batch Policy: guarded_v2"
 _SAVANA_BATCH_PROFILES_JSON_PREFIX = "- Evolution Batch Profiles JSON: "
@@ -283,17 +284,22 @@ def _extract_savana_guarded_policy(value: str) -> Optional[str]:
 
 
 def _savana_header_is_malformed(value: str) -> bool:
-    if not _is_savana_report(value):
-        return False
-    markers = []
+    policy_headers = []
     json_headers = []
     for line in _extract_savana_report_header_lines(value):
         stripped = line.strip()
-        if stripped in (_SAVANA_GUARDED_REPORT_MARKER, _SAVANA_GUARDED_V2_REPORT_MARKER):
-            markers.append(stripped)
+        if stripped.startswith(_SAVANA_POLICY_PREFIX):
+            policy_headers.append(stripped)
         if stripped.startswith(_SAVANA_BATCH_PROFILES_JSON_PREFIX):
             json_headers.append(stripped)
-    return len(markers) > 1 or len(json_headers) > 1
+    if not policy_headers and not json_headers:
+        return False
+    if len(policy_headers) != 1 or len(json_headers) != 1:
+        return True
+    return policy_headers[0] not in (
+        _SAVANA_GUARDED_REPORT_MARKER,
+        _SAVANA_GUARDED_V2_REPORT_MARKER,
+    )
 
 
 def _extract_savana_expected_profile_ids(value: str) -> List[str]:

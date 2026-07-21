@@ -527,6 +527,16 @@ def _summary_leaks_raw(summary, raw_text):
     return len(leaked) >= 8
 
 
+def _encode_guarded_report_content(value):
+    encoded = json.dumps(str(value or ""), ensure_ascii=False)[1:-1]
+    return (
+        encoded
+        .replace("\u0085", "\\u0085")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
 def _print_guarded_v2_dialogue(chat):
     print("\n### Dialogue History\n")
     turn_ids = [
@@ -541,7 +551,9 @@ def _print_guarded_v2_dialogue(chat):
             previous_user = message
             suffix = " [quality_correction_only]" if _is_quality_correction_message(message.get("content")) else ""
             print("[evolution_evidence] USER: {0}{1}".format(
-                format_message_content(message.get("content") or ""),
+                _encode_guarded_report_content(
+                    format_message_content(message.get("content") or "")
+                ),
                 suffix,
             ))
             print("")
@@ -564,12 +576,16 @@ def _print_guarded_v2_dialogue(chat):
                 print("")
                 continue
             print("[context_only] ASSISTANT SUMMARY: {0}".format(
-                record.get("continuity_summary") or "[review unavailable]"
+                _encode_guarded_report_content(
+                    record.get("continuity_summary") or "[review unavailable]"
+                )
             ))
             print("")
             continue
         print("[context_only] ASSISTANT: {0}".format(
-            format_message_content(message.get("content") or "")
+            _encode_guarded_report_content(
+                format_message_content(message.get("content") or "")
+            )
         ))
         print("")
 

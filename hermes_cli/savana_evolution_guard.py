@@ -31,6 +31,7 @@ _RESULT_RE = re.compile(
     re.DOTALL,
 )
 _SUPPORTED_POLICIES = frozenset([GUARDED_POLICY, GUARDED_V2_POLICY])
+_RECOVERY_DIR_NAME = "savana_evolution_recovery"
 
 
 class InvalidEvolutionResult(ValueError):
@@ -42,6 +43,10 @@ class StaleEvolutionError(RuntimeError):
 
 
 class EvolutionPolicyError(RuntimeError):
+    pass
+
+
+class BatchRecoveryError(RuntimeError):
     pass
 
 
@@ -135,7 +140,17 @@ def _resolve_profile_dir(hermes_home, profile_id):
     return profile_dir
 
 
-def _write_pending_audit(profile_dir, original, updated, result, model, policy, action="evolution", source_audit_id=None):
+def _write_pending_audit(
+    profile_dir,
+    original,
+    updated,
+    result,
+    model,
+    policy,
+    action="evolution",
+    source_audit_id=None,
+    batch_id=None,
+):
     audit_dir = profile_dir / "evolution_audit"
     audit_dir.mkdir(parents=True, exist_ok=True)
     audit_id = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ-") + uuid.uuid4().hex
@@ -154,6 +169,8 @@ def _write_pending_audit(profile_dir, original, updated, result, model, policy, 
     }
     if source_audit_id:
         audit["source_audit_id"] = source_audit_id
+    if batch_id:
+        audit["batch_id"] = batch_id
     audit_path = audit_dir / (audit_id + ".json")
     _atomic_write_text(
         audit_path,
@@ -181,7 +198,182 @@ def _review_passes(result):
     )
 
 
+def _recovery_dir(hermes_home):
+    return Path(hermes_home) / _RECOVERY_DIR_NAME
+
+
+def _pending_recovery_journals(hermes_home):
+    recovery_dir = _recovery_dir(hermes_home)
+    if not recovery_dir.exists():
+        return []
+    return sorted(path for path in recovery_dir.glob("*.json") if path.is_file())
+
+
+def _require_no_pending_recovery(hermes_home):
+    for journal_path in _pending_recovery_journals(hermes_home):
+        try:
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise BatchRecoveryError(
+                "unreadable Savana evolution recovery journal blocks writes: {0} ({1})".format(
+                    journal_path,
+                    exc,
+                )
+            )
+        if journal.get("status") == "committed":
+            try:
+                journal_path.unlink()
+            except Exception as exc:
+                raise BatchRecoveryError(
+                    "completed Savana evolution journal could not be cleaned: {0} ({1})".format(
+                        journal_path,
+                        exc,
+                    )
+                )
+            continue
+        raise BatchRecoveryError(
+            "unresolved Savana evolution recovery journal blocks writes: {0}".format(
+                journal_path
+            )
+        )
+
+
+def _write_recovery_journal(journal_path, journal):
+    _atomic_write_text(
+        journal_path,
+        json.dumps(journal, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def _create_recovery_journal(hermes_home, prepared, model, policy):
+    recovery_dir = _recovery_dir(hermes_home)
+    recovery_dir.mkdir(parents=True, exist_ok=True)
+    batch_id = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ-") + uuid.uuid4().hex
+    journal_path = recovery_dir / (batch_id + ".json")
+    journal = {
+        "id": batch_id,
+        "status": "committing",
+        "created_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "policy": policy,
+        "model": str(model or ""),
+        "entries": [],
+    }
+    for item in prepared:
+        if item["status"] != "committable":
+            continue
+        journal["entries"].append({
+            "profile_id": item["profile_id"],
+            "profile_dir": str(item["profile_dir"]),
+            "soul_path": str(item["soul_path"]),
+            "original_sha256": _sha256_text(item["original"]),
+            "candidate_sha256": _sha256_text(item["updated"]),
+            "soul_state": "original",
+            "audit_path": "",
+            "audit_state": "not_created",
+        })
+    _write_recovery_journal(journal_path, journal)
+    return journal_path, journal
+
+
+def _journal_entry(journal, profile_id):
+    for entry in journal["entries"]:
+        if entry["profile_id"] == profile_id:
+            return entry
+    raise KeyError(profile_id)
+
+
+def _record_recovery_journal(journal_path, journal, recovery_errors):
+    try:
+        _write_recovery_journal(journal_path, journal)
+    except Exception as exc:
+        recovery_errors.append("journal update failed: {0}".format(exc))
+
+
+def _raise_recovery_error(original_error, recovery_errors, journal_path):
+    message = (
+        "Savana evolution batch recovery incomplete after {0}: {1}; journal: {2}"
+        .format(
+            original_error,
+            "; ".join(recovery_errors),
+            journal_path,
+        )
+    )
+    raise BatchRecoveryError(message) from original_error
+
+
+def _compensate_guarded_batch(
+    journal_path,
+    journal,
+    prepared,
+    written_profile_ids,
+    original_error,
+):
+    recovery_errors = []
+    journal["status"] = "recovering"
+    journal["original_error"] = repr(original_error)
+    _record_recovery_journal(journal_path, journal, recovery_errors)
+
+    for item in reversed(prepared):
+        if item["status"] != "committable":
+            continue
+        entry = _journal_entry(journal, item["profile_id"])
+        if item["profile_id"] not in written_profile_ids:
+            entry["soul_state"] = "original"
+            continue
+        try:
+            _atomic_write_text(item["soul_path"], item["original"])
+            entry["soul_state"] = "restored"
+        except Exception as exc:
+            entry["soul_state"] = "rollback_failed"
+            entry["rollback_error"] = repr(exc)
+            recovery_errors.append(
+                "{0} SOUL rollback failed: {1}".format(item["profile_id"], exc)
+            )
+        _record_recovery_journal(journal_path, journal, recovery_errors)
+
+    for entry in journal["entries"]:
+        audit_path_value = entry.get("audit_path")
+        if not audit_path_value:
+            continue
+        audit_path = Path(audit_path_value)
+        if entry["soul_state"] == "rollback_failed":
+            entry["audit_state"] = "retained_for_recovery"
+            continue
+        try:
+            audit_path.unlink()
+            entry["audit_state"] = "cleaned"
+        except FileNotFoundError:
+            entry["audit_state"] = "cleaned"
+        except Exception as exc:
+            entry["audit_state"] = "cleanup_failed"
+            entry["audit_cleanup_error"] = repr(exc)
+            recovery_errors.append(
+                "{0} audit cleanup failed: {1}".format(entry["profile_id"], exc)
+            )
+        _record_recovery_journal(journal_path, journal, recovery_errors)
+
+    if recovery_errors:
+        journal["status"] = "recovery_required"
+        journal["recovery_errors"] = list(recovery_errors)
+        _record_recovery_journal(journal_path, journal, recovery_errors)
+        _raise_recovery_error(original_error, recovery_errors, journal_path)
+
+    journal["status"] = "recovered"
+    _write_recovery_journal(journal_path, journal)
+    try:
+        journal_path.unlink()
+    except Exception as exc:
+        journal["status"] = "recovery_required"
+        journal["recovery_errors"] = ["recovery journal cleanup failed: {0}".format(exc)]
+        try:
+            _write_recovery_journal(journal_path, journal)
+        except Exception:
+            pass
+        _raise_recovery_error(original_error, journal["recovery_errors"], journal_path)
+
+
 def apply_guarded_result(hermes_home, result, model, policy=GUARDED_POLICY):
+    _require_no_pending_recovery(hermes_home)
     _validate_result_shape(result)
     if policy not in _SUPPORTED_POLICIES:
         raise EvolutionPolicyError("unsupported evolution policy")
@@ -218,12 +410,11 @@ def apply_guarded_result(hermes_home, result, model, policy=GUARDED_POLICY):
         }
 
 
-def _prepare_guarded_result(hermes_home, result, policy):
+def _prepare_guarded_result(profile_dir, result, policy):
     _validate_result_shape(result)
     if policy not in _SUPPORTED_POLICIES:
         raise EvolutionPolicyError("unsupported evolution policy")
     profile_id = result["profile_id"]
-    profile_dir = _resolve_profile_dir(hermes_home, profile_id)
     if read_evolution_policy(profile_dir) != policy:
         raise EvolutionPolicyError("profile is not {0}".format(policy))
     soul_path = profile_dir / "SOUL.md"
@@ -252,6 +443,7 @@ def _prepare_guarded_result(hermes_home, result, policy):
 
 
 def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY, expected_profile_ids=None):
+    _require_no_pending_recovery(hermes_home)
     matches = list(_RESULT_RE.finditer(str(output or "")))
     parsed = []
     responses = []
@@ -268,7 +460,30 @@ def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY, exp
         profile_id = result["profile_id"]
         counts[profile_id] = counts.get(profile_id, 0) + 1
 
-    expected = [str(item).strip() for item in list(expected_profile_ids or []) if str(item).strip()]
+    expected = None
+    if expected_profile_ids is not None:
+        expected = [str(item).strip() for item in list(expected_profile_ids)]
+        if not expected:
+            return [{
+                "profile_id": "",
+                "status": "invalid",
+                "error": "expected_profile_ids must not be empty",
+            }]
+        expected_seen = set()
+        for profile_id in expected:
+            if not _PROFILE_ID_RE.match(profile_id):
+                return [{
+                    "profile_id": profile_id,
+                    "status": "invalid",
+                    "error": "invalid expected profile id",
+                }]
+            if profile_id in expected_seen:
+                return [{
+                    "profile_id": profile_id,
+                    "status": "invalid",
+                    "error": "duplicate expected profile id",
+                }]
+            expected_seen.add(profile_id)
     for result in parsed:
         profile_id = result["profile_id"]
         if counts[profile_id] > 1:
@@ -279,14 +494,14 @@ def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY, exp
                     "error": "duplicate profile result",
                 })
             continue
-        if expected and profile_id not in expected:
+        if expected is not None and profile_id not in expected:
             responses.append({
                 "profile_id": profile_id,
                 "status": "invalid",
                 "error": "unexpected profile result",
             })
     observed_profile_ids = set(item.get("profile_id") for item in responses if item.get("profile_id"))
-    if expected:
+    if expected is not None:
         for profile_id in expected:
             if profile_id not in counts:
                 responses.append({
@@ -300,30 +515,38 @@ def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY, exp
     parsed_by_id = {}
     for result in parsed:
         parsed_by_id[result["profile_id"]] = result
-    ordered_profile_ids = sorted(expected or parsed_by_id.keys())
+    profile_dirs = {}
+    canonical_owners = {}
+    for profile_id in parsed_by_id:
+        try:
+            profile_dir = _resolve_profile_dir(hermes_home, profile_id)
+        except InvalidEvolutionResult as exc:
+            return [{"profile_id": profile_id, "status": "invalid", "error": str(exc)}]
+        canonical_path = str(profile_dir)
+        if canonical_path in canonical_owners:
+            return [{
+                "profile_id": profile_id,
+                "status": "invalid",
+                "error": "profile ids resolve to the same canonical directory",
+            }]
+        canonical_owners[canonical_path] = profile_id
+        profile_dirs[profile_id] = profile_dir
+    ordered_profile_ids = sorted(parsed_by_id, key=lambda item: str(profile_dirs[item]))
 
     with ExitStack() as stack:
-        locked_dirs = {}
         for profile_id in ordered_profile_ids:
-            result = parsed_by_id.get(profile_id)
-            if result is None:
-                continue
-            profile_dir = _resolve_profile_dir(hermes_home, profile_id)
-            stack.enter_context(profile_lock(profile_dir, "soul"))
-            locked_dirs[profile_id] = profile_dir
+            stack.enter_context(profile_lock(profile_dirs[profile_id], "soul"))
 
         prepared = []
         preflight = []
         for profile_id in ordered_profile_ids:
-            result = parsed_by_id.get(profile_id)
-            if result is None:
-                continue
+            result = parsed_by_id[profile_id]
             try:
-                profile_dir = locked_dirs[profile_id]
+                profile_dir = profile_dirs[profile_id]
                 current_policy = read_evolution_policy(profile_dir)
                 if current_policy != policy:
                     raise EvolutionPolicyError("profile is not {0}".format(policy))
-                prepared_result = _prepare_guarded_result(hermes_home, result, policy)
+                prepared_result = _prepare_guarded_result(profile_dir, result, policy)
                 prepared.append(prepared_result)
                 preflight.append({"profile_id": profile_id, "status": prepared_result["status"]})
             except StaleEvolutionError as exc:
@@ -336,8 +559,19 @@ def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY, exp
         if any(item.get("status") not in ("no_change", "committable") for item in preflight):
             return preflight
 
-        audit_paths = []
-        written = []
+        committable = [item for item in prepared if item["status"] == "committable"]
+        if not committable:
+            return [
+                {"profile_id": item["profile_id"], "status": item["status"]}
+                for item in prepared
+            ]
+        journal_path, journal = _create_recovery_journal(
+            hermes_home,
+            prepared,
+            model,
+            policy,
+        )
+        written_profile_ids = set()
         try:
             for item in prepared:
                 if item["status"] != "committable":
@@ -356,30 +590,46 @@ def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY, exp
                     item["result"],
                     model,
                     policy,
+                    batch_id=journal["id"],
                 )
-                audit_paths.append(audit_path)
+                entry = _journal_entry(journal, item["profile_id"])
+                entry["audit_path"] = str(audit_path)
+                entry["audit_state"] = "pending"
+                _write_recovery_journal(journal_path, journal)
                 _atomic_write_text(item["soul_path"], item["updated"])
-                written.append(item)
+                written_profile_ids.add(item["profile_id"])
+                entry["soul_state"] = "candidate"
+                _write_recovery_journal(journal_path, journal)
                 _mark_audit_committed(audit_path)
+                entry["audit_state"] = "committed"
+                _write_recovery_journal(journal_path, journal)
                 responses.append({
                     "profile_id": item["profile_id"],
                     "status": "committed",
                     "audit_id": audit_path.stem,
                 })
+            journal["status"] = "committed"
+            _write_recovery_journal(journal_path, journal)
+            try:
+                journal_path.unlink()
+            except Exception as exc:
+                raise BatchRecoveryError(
+                    "committed Savana evolution journal cleanup failed: {0} ({1})".format(
+                        journal_path,
+                        exc,
+                    )
+                )
             return responses
-        except Exception:
-            for item in reversed(written):
-                try:
-                    _atomic_write_text(item["soul_path"], item["original"])
-                except Exception:
-                    pass
-            for audit_path in audit_paths:
-                try:
-                    audit_path.unlink()
-                except FileNotFoundError:
-                    pass
-                except Exception:
-                    pass
+        except BatchRecoveryError:
+            raise
+        except Exception as exc:
+            _compensate_guarded_batch(
+                journal_path,
+                journal,
+                prepared,
+                written_profile_ids,
+                exc,
+            )
             raise
 
 
