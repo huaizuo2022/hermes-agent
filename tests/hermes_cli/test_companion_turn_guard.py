@@ -81,6 +81,35 @@ def test_assistant_sha256_matches_standard():
     assert assistant_sha256("hello") == hashlib.sha256(b"hello").hexdigest()
 
 
+@pytest.mark.parametrize(
+    "raw_output",
+    [
+        "prefix " + _marked(_valid_result()),
+        _marked(_valid_result()) + " suffix",
+        _marked(_valid_result()) + "\n" + _marked(_valid_result(turn_id="turn-2")),
+    ],
+)
+def test_review_turn_rejects_marker_noise_or_multiple_markers(tmp_path, raw_output):
+    profile_dir = _profile_dir(tmp_path)
+    store = TurnReviewStore(profile_dir)
+
+    review = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text="她轻声回应。",
+        user_message="抱抱我。",
+        messages=[{"role": "user", "content": "抱抱我。"}],
+        provider="openai",
+        model="gpt-test",
+        memory_store=DummyMemoryStore(),
+        store=store,
+        call_llm_fn=lambda **kwargs: raw_output,
+    )
+
+    assert review["review_status"] == "invalid"
+    assert store.get("turn-1")["status"] == "invalid"
+
+
 def test_begin_is_idempotent_for_same_hash_and_replaces_pending_for_new_hash(tmp_path):
     store = TurnReviewStore(_profile_dir(tmp_path))
     first = store.begin("turn-1", "reply-a")
@@ -180,6 +209,8 @@ def test_validate_review_result_accepts_clean_and_drift_without_keyword_override
 @pytest.mark.parametrize(
     "mutator, expected",
     [
+        (lambda result: result.pop("continuity_summary"), "continuity_summary"),
+        (lambda result: result.pop("memory_operations"), "memory_operations"),
         (lambda result: result.update({"continuity_summary": ""}), "continuity_summary"),
         (lambda result: result.update({"turn_id": "wrong"}), "turn_id"),
         (lambda result: result.update({"assistant_sha256": "0" * 64}), "assistant_sha256"),

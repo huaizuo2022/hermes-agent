@@ -277,8 +277,6 @@ def _require_non_empty(value, field_name):
 
 
 def _normalize_memory_operations(memory_operations, user_message):
-    if memory_operations is None:
-        return []
     if not isinstance(memory_operations, list):
         raise ValueError("memory_operations must be a list")
     normalized = []
@@ -338,7 +336,11 @@ def validate_review_result(
     if style_decision not in _ALLOWED_DECISION:
         raise ValueError("style_decision must be clean|drift")
     style_reason = _require_non_empty(result.get("style_reason"), "style_reason")
-    continuity_summary = str(result.get("continuity_summary") or "").strip()
+    if "continuity_summary" not in result:
+        raise ValueError("continuity_summary is required")
+    if not isinstance(result.get("continuity_summary"), str):
+        raise ValueError("continuity_summary must be a string")
+    continuity_summary = result.get("continuity_summary").strip()
     if style_decision == "drift" and not continuity_summary:
         raise ValueError("continuity_summary is required for drift")
     self_review = result.get("self_review")
@@ -364,7 +366,10 @@ def validate_review_result(
         "style_decision": style_decision,
         "style_reason": style_reason,
         "continuity_summary": continuity_summary,
-        "memory_operations": _normalize_memory_operations(result.get("memory_operations"), str(user_message or "")),
+        "memory_operations": _normalize_memory_operations(
+            result["memory_operations"] if "memory_operations" in result else None,
+            str(user_message or ""),
+        ),
         "self_review": normalized_review,
         "verdict": verdict,
     }
@@ -374,9 +379,13 @@ def validate_review_result(
 
 
 def _extract_review_payload(raw_output):
-    match = _RESULT_RE.search(str(raw_output or ""))
-    if match is None:
+    raw_text = str(raw_output or "")
+    matches = list(_RESULT_RE.finditer(raw_text))
+    if len(matches) != 1:
         raise ValueError("missing structured result marker")
+    match = matches[0]
+    if raw_text.strip() != match.group(0):
+        raise ValueError("structured result must be the only non-whitespace content")
     try:
         parsed = json.loads(match.group(1))
     except Exception as exc:
