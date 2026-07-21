@@ -257,8 +257,9 @@ def apply_guarded_results(hermes_home, output, model, policy=GUARDED_POLICY):
 
 def rollback_guarded_evolution(hermes_home, profile_id, audit_id):
     profile_dir = _resolve_profile_dir(hermes_home, profile_id)
-    if read_evolution_policy(profile_dir) != GUARDED_POLICY:
-        raise EvolutionPolicyError("profile is not guarded_v1")
+    policy = read_evolution_policy(profile_dir)
+    if policy not in _SUPPORTED_POLICIES:
+        raise EvolutionPolicyError("profile is not guarded")
     if not _AUDIT_ID_RE.match(str(audit_id or "")):
         raise InvalidEvolutionResult("invalid audit_id")
     audit_path = profile_dir / "evolution_audit" / (audit_id + ".json")
@@ -282,7 +283,7 @@ def rollback_guarded_evolution(hermes_home, profile_id, audit_id):
             updated,
             rollback_result,
             "operator",
-            read_evolution_policy(profile_dir),
+            policy,
             action="rollback",
             source_audit_id=audit_id,
         )
