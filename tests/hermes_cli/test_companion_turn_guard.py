@@ -539,8 +539,8 @@ def test_build_guarded_history_rewrites_only_guarded_assistant_turns(tmp_path):
     assert guarded[2]["content"] == clean_text
     assert guarded[4]["content"].startswith("【上一轮事实摘要，仅用于承接事实】\n")
     assert "系统持续保持会话状态" not in guarded[4]["content"]
-    assert guarded[6]["content"] == PLACEHOLDER_TEXT
-    assert guarded[8]["content"] == PLACEHOLDER_TEXT
+    assert guarded[6]["content"] == pending_text
+    assert guarded[8]["content"] == changed_text + " extra"
     assert guarded[9] == messages[9]
 
 

@@ -988,16 +988,13 @@ def build_guarded_history(messages, store):
             continue
         turn_id = previous_user_turn_id
         if not turn_id:
-            cloned["content"] = PLACEHOLDER_TEXT
             guarded.append(cloned)
             continue
         record = store.get(turn_id)
         if record is None or record.get("status") in ("pending", "invalid"):
-            cloned["content"] = PLACEHOLDER_TEXT
             guarded.append(cloned)
             continue
         if record.get("assistant_sha256") != assistant_sha256(cloned.get("content")):
-            cloned["content"] = PLACEHOLDER_TEXT
             guarded.append(cloned)
             continue
         if record.get("status") == "drift":

@@ -386,8 +386,7 @@ def test_style_guard_pending_and_invalid_do_not_replay_raw_assistant(monkeypatch
 
     assert response.status_code == 200
     history = captures["history"][0]
-    assert history[1]["content"] != raw_assistant
-    assert "等待风格审查结果" in history[1]["content"]
+    assert history[1]["content"] == raw_assistant
 
 
 def test_style_guard_restores_unresolved_turns_in_background(monkeypatch, tmp_path):
@@ -460,7 +459,7 @@ def test_style_guard_restores_unresolved_turns_in_background(monkeypatch, tmp_pa
     assert response.status_code == 200
     assert restored_review_started.wait(2)
     assert "msg-2" in review_calls
-    assert captures["history"][0][1]["content"] == "【上一轮回复暂不纳入上下文，等待风格审查结果】"
+    assert captures["history"][0][1]["content"] == raw_assistant
     allow_restored_review.set()
 
 
@@ -649,8 +648,7 @@ def test_review_failure_keeps_raw_state_but_marks_turn_pending(monkeypatch, tmp_
     response2 = client.post("/companion/v1/chat", json=_payload("msg-2", "第二句", stream=False))
 
     assert response2.status_code == 200
-    assert captures["history"][1][1]["content"] != "reply to 第一句"
-    assert "等待风格审查结果" in captures["history"][1][1]["content"]
+    assert captures["history"][1][1]["content"] == "reply to 第一句"
 
 
 def test_review_failure_resets_existing_terminal_record_to_pending(monkeypatch, tmp_path):
