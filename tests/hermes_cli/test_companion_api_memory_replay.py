@@ -163,3 +163,45 @@ def test_companion_chat_does_not_double_write_current_user(monkeypatch, tmp_path
         {"role": "user", "content": "只发一轮", "message_id": "msg-1"},
         {"role": "assistant", "content": "single reply"},
     ]
+
+
+def test_companion_prompt_history_keeps_recent_30_turns_with_early_summary():
+    from hermes_cli import companion_api
+
+    history = []
+    for turn in range(1, 33):
+        history.append(
+            {
+                "role": "user",
+                "content": "用户第{}轮".format(turn),
+                "message_id": "msg-{}".format(turn),
+            }
+        )
+        history.append({"role": "assistant", "content": "助手第{}轮".format(turn)})
+
+    compacted = companion_api._compact_companion_history_for_prompt(history)
+
+    assert compacted[0]["role"] == "user"
+    assert "早期对话摘要" in compacted[0]["content"]
+    assert "此前省略了 4 条历史消息，其中用户轮次 2 个" in compacted[0]["content"]
+    assert compacted[1] == {"role": "assistant", "content": "收到，我会基于这份早期摘要承接当前对话。"}
+    assert len([msg for msg in compacted if msg.get("role") == "user"]) == 31
+    assert compacted[2] == {"role": "user", "content": "用户第3轮", "message_id": "msg-3"}
+    assert compacted[-1] == {"role": "assistant", "content": "助手第32轮"}
+
+
+def test_companion_prompt_history_under_recent_window_is_unchanged():
+    from hermes_cli import companion_api
+
+    history = []
+    for turn in range(1, 31):
+        history.append(
+            {
+                "role": "user",
+                "content": "用户第{}轮".format(turn),
+                "message_id": "msg-{}".format(turn),
+            }
+        )
+        history.append({"role": "assistant", "content": "助手第{}轮".format(turn)})
+
+    assert companion_api._compact_companion_history_for_prompt(history) == history

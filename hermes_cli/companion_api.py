@@ -41,6 +41,9 @@ _SESSION_LOCKS_GUARD = threading.Lock()
 _UNRESOLVED_REVIEW_TASKS = {}
 _UNRESOLVED_REVIEW_TASKS_GUARD = threading.Lock()
 _stream_event_hook = None
+_COMPANION_HISTORY_RECENT_USER_TURNS = 30
+_COMPANION_EARLY_SUMMARY_EDGE_MESSAGES = 4
+_COMPANION_EARLY_SUMMARY_CONTENT_CHARS = 160
 
 
 def _style_guard_new_profiles_enabled() -> bool:
@@ -425,6 +428,81 @@ def _load_companion_history(session_db, session_id: str, current_message_id: str
             continue
         history.append(msg)
     return history
+
+
+def _count_user_turns(messages: List[Dict[str, Any]]) -> int:
+    return sum(1 for msg in messages or [] if (msg or {}).get("role") == "user")
+
+
+def _truncate_text_for_summary(value: Any, limit: int = _COMPANION_EARLY_SUMMARY_CONTENT_CHARS) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _summarize_early_companion_history(omitted: List[Dict[str, Any]]) -> str:
+    omitted = list(omitted or [])
+    omitted_count = len(omitted)
+    omitted_user_turns = _count_user_turns(omitted)
+    if not omitted_count:
+        return ""
+
+    edge = _COMPANION_EARLY_SUMMARY_EDGE_MESSAGES
+    sample_messages = omitted[:edge]
+    if omitted_count > edge:
+        sample_messages = sample_messages + omitted[-edge:]
+
+    lines = [
+        "【早期对话摘要（自动压缩，仅用于承接事实）】",
+        "此前省略了 {0} 条历史消息，其中用户轮次 {1} 个。".format(
+            omitted_count,
+            omitted_user_turns,
+        ),
+    ]
+    for msg in sample_messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "unknown")
+        content = _truncate_text_for_summary(msg.get("content"))
+        if not content:
+            continue
+        lines.append("- {0}: {1}".format(role, content))
+    return "\n".join(lines)
+
+
+def _compact_companion_history_for_prompt(
+    messages: List[Dict[str, Any]],
+    recent_user_turns: int = _COMPANION_HISTORY_RECENT_USER_TURNS,
+) -> List[Dict[str, Any]]:
+    messages = list(messages or [])
+    if recent_user_turns <= 0:
+        return messages
+    if _count_user_turns(messages) <= recent_user_turns:
+        return messages
+
+    seen_user_turns = 0
+    recent_start = 0
+    for index in range(len(messages) - 1, -1, -1):
+        msg = messages[index]
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            seen_user_turns += 1
+            if seen_user_turns == recent_user_turns:
+                recent_start = index
+                break
+
+    omitted = messages[:recent_start]
+    recent = messages[recent_start:]
+    summary = _summarize_early_companion_history(omitted)
+    if not summary:
+        return recent
+    return [
+        {"role": "user", "content": summary},
+        {"role": "assistant", "content": "收到，我会基于这份早期摘要承接当前对话。"},
+    ] + recent
 
 
 def _get_session_lock(session_id: str) -> threading.Lock:
@@ -1230,9 +1308,7 @@ async def chat_endpoint(req: ChatRequest):
         soul_text = _read_text_if_exists(Path(profile_dir) / "SOUL.md")
         memory_snapshots = _load_companion_memory_snapshots(profile_dir)
         session_stats = _get_latest_session_stats(session_db, session_id)
-        conversation_history = raw_history
-        if style_guard_enabled:
-            conversation_history = build_guarded_history(raw_history, TurnReviewStore(profile_dir))
+        conversation_history = _compact_companion_history_for_prompt(raw_history)
 
         # 动态解析模型及 API 配置
         api_key = req.api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -1278,7 +1354,7 @@ async def chat_endpoint(req: ChatRequest):
                 api_key=api_key,
                 memory_store=getattr(agent, "_memory_store", None),
             )
-            conversation_history = build_guarded_history(raw_history, TurnReviewStore(profile_dir))
+            conversation_history = build_guarded_history(conversation_history, TurnReviewStore(profile_dir))
             agent._system_prompt_override = _build_style_guard_system_prompt(
                 soul_text,
                 memory_snapshots.get("memory", ""),
