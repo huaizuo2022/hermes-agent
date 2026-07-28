@@ -1231,15 +1231,23 @@ async def chat_endpoint(req: ChatRequest):
         )
         agent.suppress_status_output = True
         if style_guard_enabled:
-            _restore_unresolved_reviews(
-                profile_dir=profile_dir,
-                raw_history=raw_history,
-                provider=provider,
-                model=model,
-                base_url=base_url,
-                api_key=api_key,
-                memory_store=getattr(agent, "_memory_store", None),
-            )
+            # Offload unresolved turn reviews to a background task so pending turn audits
+            # never block the interactive streaming chat response (prevents 45s multi-turn lag).
+            try:
+                asyncio.create_task(
+                    asyncio.to_thread(
+                        _restore_unresolved_reviews,
+                        profile_dir=profile_dir,
+                        raw_history=raw_history,
+                        provider=provider,
+                        model=model,
+                        base_url=base_url,
+                        api_key=api_key,
+                        memory_store=getattr(agent, "_memory_store", None),
+                    )
+                )
+            except Exception as _bg_err:
+                logger.debug("Failed to spawn background _restore_unresolved_reviews: %s", _bg_err)
             conversation_history = build_guarded_history(raw_history, TurnReviewStore(profile_dir))
             agent._system_prompt_override = _build_style_guard_system_prompt(
                 soul_text,
@@ -1343,23 +1351,27 @@ async def chat_endpoint(req: ChatRequest):
                     )
                     final_reply = result.get("final_response", "")
                     q.put(("final", final_reply))
-                    final_marker_consumed.wait()
-                    review_metadata.update(
-                        _review_companion_turn(
-                            style_guard_enabled=style_guard_enabled,
-                            profile_dir=profile_dir,
-                            turn_id=req.message_id,
-                            assistant_text=final_reply,
-                            user_message=req.user_message,
-                            raw_history=raw_history,
-                            provider=provider,
-                            model=model,
-                            base_url=base_url,
-                            api_key=api_key,
-                            memory_store=getattr(agent, "_memory_store", None),
-                        )
-                    )
-                    q.put(("metadata", _build_stream_metadata()))
+
+                    if style_guard_enabled:
+                        _bg_mem_store = getattr(agent, "_memory_store", None)
+                        threading.Thread(
+                            target=_review_companion_turn,
+                            kwargs={
+                                "style_guard_enabled": style_guard_enabled,
+                                "profile_dir": profile_dir,
+                                "turn_id": req.message_id,
+                                "assistant_text": final_reply,
+                                "user_message": req.user_message,
+                                "raw_history": raw_history,
+                                "provider": provider,
+                                "model": model,
+                                "base_url": base_url,
+                                "api_key": api_key,
+                                "memory_store": _bg_mem_store,
+                            },
+                            daemon=True,
+                        ).start()
+
                     q.put(("end", None))
                 except Exception as e:
                     q.put(("error", e))
