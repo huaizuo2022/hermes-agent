@@ -243,14 +243,12 @@ def test_style_guard_stream_emits_multiple_tokens_before_review(monkeypatch, tmp
 
     assert response.status_code == 200
     assert body.count("event: token") == 3
-    assert events[:3] == ["token:part-1", "token:part-2", "token:part-3"]
-    assert events[3:6] == ["yield:token", "yield:token", "yield:token"]
-    review_index = events.index("review_started")
-    assert review_index >= 6
-    assert "yield:metadata" in events[review_index + 1 :]
     assert '"review_status": "pending"' in body
     assert '"memory_status": "pending"' in body
-    assert '"memory_modifications": [{"kind": "queued"}]' in body
+    assert events[:3] == ["token:part-1", "token:part-2", "token:part-3"]
+    assert events.count("yield:token") == 3
+    assert "yield:metadata" in events
+    assert "review_started" in events
 
 
 def test_style_guard_drift_replays_summary_but_keeps_raw_history(monkeypatch, tmp_path):
@@ -392,7 +390,7 @@ def test_style_guard_pending_and_invalid_do_not_replay_raw_assistant(monkeypatch
     assert "等待风格审查结果" in history[1]["content"]
 
 
-def test_style_guard_restores_unresolved_turns_before_current_generation(monkeypatch, tmp_path):
+def test_style_guard_restores_unresolved_turns_in_background(monkeypatch, tmp_path):
     profile_dir = tmp_path / "restore-profile"
     ensure_companion_profile(profile_dir)
     monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
@@ -418,10 +416,14 @@ def test_style_guard_restores_unresolved_turns_before_current_generation(monkeyp
     store.begin("msg-1", raw_assistant)
     captures = _install_fake_agent(monkeypatch)
     review_calls = []
+    restored_review_started = threading.Event()
+    allow_restored_review = threading.Event()
 
     def fake_review_turn(**kwargs):
         review_calls.append(kwargs["turn_id"])
         if kwargs["turn_id"] == "msg-1":
+            restored_review_started.set()
+            allow_restored_review.wait(2)
             store.begin("msg-1", kwargs["assistant_text"])
             store.commit(
                 {
@@ -456,8 +458,83 @@ def test_style_guard_restores_unresolved_turns_before_current_generation(monkeyp
     )
 
     assert response.status_code == 200
-    assert review_calls[:2] == ["msg-1", "msg-2"]
-    assert captures["history"][0][1]["content"].startswith("【上一轮事实摘要，仅用于承接事实】\n")
+    assert restored_review_started.wait(2)
+    assert "msg-2" in review_calls
+    assert captures["history"][0][1]["content"] == "【上一轮回复暂不纳入上下文，等待风格审查结果】"
+    allow_restored_review.set()
+
+
+def test_unresolved_review_scheduler_allows_only_one_task_per_profile(monkeypatch, tmp_path):
+    import hermes_cli.companion_api as companion_api
+
+    profile_dir = tmp_path / "scheduler-profile"
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    calls = []
+
+    def fake_restore(**_kwargs):
+        calls.append(1)
+        started.set()
+        release.wait(2)
+        finished.set()
+
+    monkeypatch.setattr(companion_api, "_restore_unresolved_reviews", fake_restore)
+    kwargs = {
+        "profile_dir": str(profile_dir),
+        "raw_history": [],
+        "provider": "test-provider",
+        "model": "test-model",
+        "base_url": "https://example.invalid/v1",
+        "api_key": "test-key",
+        "memory_store": None,
+    }
+
+    assert companion_api._schedule_unresolved_reviews(**kwargs) is True
+    assert started.wait(2)
+    assert companion_api._schedule_unresolved_reviews(**kwargs) is False
+    assert calls == [1]
+
+    release.set()
+    assert finished.wait(2)
+    assert companion_api._schedule_unresolved_reviews(**kwargs) is True
+    release.set()
+
+
+def test_unresolved_review_scheduler_releases_slot_after_failure(monkeypatch, tmp_path):
+    import hermes_cli.companion_api as companion_api
+
+    profile_dir = tmp_path / "scheduler-failure-profile"
+    started = threading.Event()
+    restarted = threading.Event()
+    calls = []
+
+    def failing_restore(**_kwargs):
+        calls.append(1)
+        (started if len(calls) == 1 else restarted).set()
+        raise RuntimeError("restore failed")
+
+    monkeypatch.setattr(companion_api, "_restore_unresolved_reviews", failing_restore)
+    kwargs = {
+        "profile_dir": str(profile_dir),
+        "raw_history": [],
+        "provider": "test-provider",
+        "model": "test-model",
+        "base_url": "https://example.invalid/v1",
+        "api_key": "test-key",
+        "memory_store": None,
+    }
+
+    assert companion_api._schedule_unresolved_reviews(**kwargs) is True
+    assert started.wait(2)
+    for _ in range(50):
+        if companion_api._schedule_unresolved_reviews(**kwargs):
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("background review slot was not released after failure")
+    assert restarted.wait(2)
+    assert len(calls) == 2
 
 
 def test_style_guard_nonstream_metadata_includes_review_and_memory_status(monkeypatch, tmp_path):

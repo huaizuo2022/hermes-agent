@@ -38,6 +38,8 @@ router = APIRouter(prefix="/companion/v1")
 logger = logging.getLogger(__name__)
 _SESSION_LOCKS = {}
 _SESSION_LOCKS_GUARD = threading.Lock()
+_UNRESOLVED_REVIEW_TASKS = {}
+_UNRESOLVED_REVIEW_TASKS_GUARD = threading.Lock()
 _stream_event_hook = None
 
 
@@ -615,6 +617,40 @@ def _restore_unresolved_reviews(
             )
         except Exception:
             logger.exception("Failed to restore unresolved companion turn %s", turn_id)
+
+
+def _schedule_unresolved_reviews(**kwargs) -> bool:
+    profile_key = str(Path(kwargs["profile_dir"]).resolve())
+    with _UNRESOLVED_REVIEW_TASKS_GUARD:
+        current = _UNRESOLVED_REVIEW_TASKS.get(profile_key)
+        if current is not None and current.is_alive():
+            return False
+
+        def run_restore():
+            try:
+                _restore_unresolved_reviews(**kwargs)
+            except Exception:
+                logger.exception("Failed to run unresolved companion review task for %s", profile_key)
+            finally:
+                with _UNRESOLVED_REVIEW_TASKS_GUARD:
+                    if _UNRESOLVED_REVIEW_TASKS.get(profile_key) is threading.current_thread():
+                        _UNRESOLVED_REVIEW_TASKS.pop(profile_key, None)
+
+        worker = threading.Thread(
+            target=run_restore,
+            name="companion-review-restore",
+            daemon=True,
+        )
+        _UNRESOLVED_REVIEW_TASKS[profile_key] = worker
+    try:
+        worker.start()
+    except Exception:
+        with _UNRESOLVED_REVIEW_TASKS_GUARD:
+            if _UNRESOLVED_REVIEW_TASKS.get(profile_key) is worker:
+                _UNRESOLVED_REVIEW_TASKS.pop(profile_key, None)
+        logger.exception("Failed to start unresolved companion review task for %s", profile_key)
+        return False
+    return True
 
 
 def _fallback_review_metadata(turn_id: str, error: Exception) -> Dict[str, Any]:
@@ -1233,21 +1269,15 @@ async def chat_endpoint(req: ChatRequest):
         if style_guard_enabled:
             # Offload unresolved turn reviews to a background task so pending turn audits
             # never block the interactive streaming chat response (prevents 45s multi-turn lag).
-            try:
-                asyncio.create_task(
-                    asyncio.to_thread(
-                        _restore_unresolved_reviews,
-                        profile_dir=profile_dir,
-                        raw_history=raw_history,
-                        provider=provider,
-                        model=model,
-                        base_url=base_url,
-                        api_key=api_key,
-                        memory_store=getattr(agent, "_memory_store", None),
-                    )
-                )
-            except Exception as _bg_err:
-                logger.debug("Failed to spawn background _restore_unresolved_reviews: %s", _bg_err)
+            _schedule_unresolved_reviews(
+                profile_dir=profile_dir,
+                raw_history=raw_history,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                memory_store=getattr(agent, "_memory_store", None),
+            )
             conversation_history = build_guarded_history(raw_history, TurnReviewStore(profile_dir))
             agent._system_prompt_override = _build_style_guard_system_prompt(
                 soul_text,
@@ -1313,8 +1343,8 @@ async def chat_endpoint(req: ChatRequest):
         if req.stream:
             q = queue.Queue()
             review_metadata = {
-                "review_status": None,
-                "memory_status": None,
+                "review_status": "pending" if style_guard_enabled else None,
+                "memory_status": "pending" if style_guard_enabled else None,
                 "memory_modifications": [],
             }
             final_marker_consumed = threading.Event()
@@ -1372,6 +1402,7 @@ async def chat_endpoint(req: ChatRequest):
                             daemon=True,
                         ).start()
 
+                    q.put(("metadata", _build_stream_metadata()))
                     q.put(("end", None))
                 except Exception as e:
                     q.put(("error", e))

@@ -3,9 +3,11 @@ import hashlib
 import json
 import sqlite3
 import threading
+from datetime import datetime, timedelta
 
 import pytest
 
+import hermes_cli.companion_turn_guard as companion_turn_guard
 from hermes_cli.companion_turn_guard import (
     RESULT_END,
     RESULT_START,
@@ -430,6 +432,56 @@ def test_review_turn_marks_invalid_when_call_raises(tmp_path):
     assert review["review_status"] == "invalid"
     assert "boom" in review["error"]
     assert store.get("turn-1")["status"] == "invalid"
+
+
+def test_invalid_review_is_cooled_down_and_bounded(tmp_path, monkeypatch):
+    profile_dir = _profile_dir(tmp_path)
+    store = TurnReviewStore(profile_dir)
+    now = [datetime(2026, 7, 28, 0, 0, 0)]
+    llm_calls = []
+
+    def fake_now():
+        return now[0].strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    monkeypatch.setattr(companion_turn_guard, "_utc_now", fake_now)
+
+    def failing_call(**_kwargs):
+        llm_calls.append(1)
+        raise RuntimeError("review backend unavailable")
+
+    def run_review():
+        return review_turn(
+            profile_dir=profile_dir,
+            turn_id="turn-1",
+            assistant_text="她轻声回应。",
+            user_message="抱抱我。",
+            messages=[{"role": "user", "content": "抱抱我。"}],
+            provider="openai",
+            model="gpt-test",
+            memory_store=DummyMemoryStore(),
+            store=store,
+            call_llm_fn=failing_call,
+        )
+
+    assert run_review()["review_status"] == "invalid"
+    assert store.get("turn-1")["review_attempts"] == 1
+    assert run_review()["review_status"] == "invalid"
+    assert len(llm_calls) == 1
+
+    now[0] += timedelta(seconds=301)
+    assert run_review()["review_status"] == "invalid"
+    assert store.get("turn-1")["review_attempts"] == 2
+    assert len(llm_calls) == 2
+
+    now[0] += timedelta(seconds=301)
+    assert run_review()["review_status"] == "invalid"
+    assert store.get("turn-1")["review_attempts"] == 3
+    assert len(llm_calls) == 3
+
+    now[0] += timedelta(seconds=301)
+    assert run_review()["review_status"] == "invalid"
+    assert store.get("turn-1")["review_attempts"] == 3
+    assert len(llm_calls) == 3
 
 
 def test_build_guarded_history_rewrites_only_guarded_assistant_turns(tmp_path):

@@ -3,7 +3,7 @@ import hashlib
 import json
 import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from agent.auxiliary_client import call_llm
@@ -27,6 +27,8 @@ _SELF_REVIEW_KEYS = (
 )
 _TERMINAL_STYLE_STATUS = frozenset(["clean", "drift"])
 _MEMORY_STATUS = frozenset(["none", "pending", "applied", "partial", "failed"])
+_MAX_REVIEW_ATTEMPTS = 3
+_REVIEW_RETRY_COOLDOWN_SECONDS = 300
 
 
 class StaleTurnReviewError(RuntimeError):
@@ -45,6 +47,26 @@ def assistant_sha256(text):
 
 def _utc_now():
     return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _parse_utc(value):
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%S.%fZ")
+    except (TypeError, ValueError):
+        return None
+
+
+def _utc_after(seconds):
+    current = _parse_utc(_utc_now()) or datetime.utcnow()
+    return (current + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _retry_is_due(retry_after):
+    if not retry_after:
+        return True
+    retry_at = _parse_utc(retry_after)
+    current = _parse_utc(_utc_now())
+    return retry_at is None or current is None or retry_at <= current
 
 
 def _stringify_json(value):
@@ -107,7 +129,9 @@ class TurnReviewStore(object):
                         memory_status TEXT NOT NULL DEFAULT '',
                         model TEXT NOT NULL DEFAULT '',
                         created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
+                        updated_at TEXT NOT NULL,
+                        review_attempts INTEGER NOT NULL DEFAULT 0,
+                        retry_after_at TEXT NOT NULL DEFAULT ''
                     )
                     """
                 )
@@ -126,6 +150,18 @@ class TurnReviewStore(object):
                     )
                     """
                 )
+                columns = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(turn_reviews)").fetchall()
+                }
+                if "review_attempts" not in columns:
+                    conn.execute(
+                        "ALTER TABLE turn_reviews ADD COLUMN review_attempts INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "retry_after_at" not in columns:
+                    conn.execute(
+                        "ALTER TABLE turn_reviews ADD COLUMN retry_after_at TEXT NOT NULL DEFAULT ''"
+                    )
             finally:
                 conn.close()
 
@@ -155,8 +191,9 @@ class TurnReviewStore(object):
                         INSERT INTO turn_reviews (
                             turn_id, assistant_sha256, status, style_reason,
                             continuity_summary, review_json, memory_status,
-                            model, created_at, updated_at
-                        ) VALUES (?, ?, 'pending', '', '', '', '', '', ?, ?)
+                            model, created_at, updated_at, review_attempts,
+                            retry_after_at
+                        ) VALUES (?, ?, 'pending', '', '', '', '', '', ?, ?, 0, '')
                         """,
                         (turn_id, assistant_hash, now, now),
                     )
@@ -171,6 +208,8 @@ class TurnReviewStore(object):
                                review_json = '',
                                memory_status = '',
                                model = '',
+                               review_attempts = 0,
+                               retry_after_at = '',
                                updated_at = ?
                          WHERE turn_id = ?
                         """,
@@ -194,6 +233,8 @@ class TurnReviewStore(object):
         review_json,
         memory_status,
         model,
+        review_attempts=None,
+        retry_after_at=None,
     ):
         if status not in _ALLOWED_STATUS:
             raise ValueError("invalid status")
@@ -217,6 +258,8 @@ class TurnReviewStore(object):
                            review_json = ?,
                            memory_status = ?,
                            model = ?,
+                           review_attempts = COALESCE(?, review_attempts),
+                           retry_after_at = COALESCE(?, retry_after_at),
                            updated_at = ?
                      WHERE turn_id = ? AND assistant_sha256 = ?
                     """,
@@ -227,6 +270,8 @@ class TurnReviewStore(object):
                         _normalize_review_json(review_json),
                         str(memory_status or ""),
                         str(model or ""),
+                        review_attempts,
+                        retry_after_at,
                         now,
                         turn_id,
                         assistant_hash,
@@ -241,6 +286,42 @@ class TurnReviewStore(object):
             finally:
                 conn.close()
         return self.get(turn_id)
+
+    def claim_review(self, turn_id, assistant_hash):
+        now = _utc_now()
+        retry_after = _utc_after(_REVIEW_RETRY_COOLDOWN_SECONDS)
+        with profile_lock(self.profile_dir, "companion_turn_guard_write"):
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM turn_reviews WHERE turn_id = ?",
+                    (turn_id,),
+                ).fetchone()
+                if row is None or row["assistant_sha256"] != assistant_hash:
+                    raise StaleTurnReviewError("turn review is stale")
+                attempts = int(row["review_attempts"] or 0)
+                if row["status"] in _TERMINAL_STYLE_STATUS:
+                    outcome = "terminal"
+                elif attempts >= _MAX_REVIEW_ATTEMPTS or not _retry_is_due(row["retry_after_at"]):
+                    outcome = "skipped"
+                else:
+                    conn.execute(
+                        """
+                        UPDATE turn_reviews
+                           SET review_attempts = ?, retry_after_at = ?, updated_at = ?
+                         WHERE turn_id = ? AND assistant_sha256 = ?
+                        """,
+                        (attempts + 1, retry_after, now, turn_id, assistant_hash),
+                    )
+                    outcome = "claimed"
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+        return outcome, self.get(turn_id)
 
     def _set_memory_status(self, turn_id, assistant_hash, memory_status):
         if memory_status not in _MEMORY_STATUS:
@@ -298,6 +379,7 @@ class TurnReviewStore(object):
                            review_json = ?,
                            memory_status = ?,
                            model = ?,
+                           retry_after_at = '',
                            updated_at = ?
                      WHERE turn_id = ? AND assistant_sha256 = ?
                     """,
@@ -349,6 +431,7 @@ class TurnReviewStore(object):
 
     def mark_invalid(self, turn_id, assistant_hash, reason, review_json, model):
         try:
+            current = self.get(turn_id)
             return self._commit_status(
                 turn_id,
                 assistant_hash,
@@ -358,6 +441,8 @@ class TurnReviewStore(object):
                 review_json,
                 "none",
                 model,
+                review_attempts=int((current or {}).get("review_attempts") or 0),
+                retry_after_at=_utc_after(_REVIEW_RETRY_COOLDOWN_SECONDS),
             )
         except StaleTurnReviewError:
             return None
@@ -455,14 +540,24 @@ class TurnReviewStore(object):
         return memory_status
 
     def list_unresolved(self):
+        now = _utc_now()
         conn = self._connect()
         try:
             rows = conn.execute(
                 """
                 SELECT * FROM turn_reviews
-                 WHERE status IN ('pending', 'invalid')
+                 WHERE (
+                         status = 'pending'
+                         AND (retry_after_at = '' OR retry_after_at <= ?)
+                       )
+                    OR (
+                         status = 'invalid'
+                         AND review_attempts < ?
+                         AND (retry_after_at = '' OR retry_after_at <= ?)
+                       )
                  ORDER BY created_at ASC, turn_id ASC
-                """
+                """,
+                (now, _MAX_REVIEW_ATTEMPTS, now),
             ).fetchall()
         finally:
             conn.close()
@@ -781,6 +876,27 @@ def review_turn(
             "memory_modifications": modifications,
             "review_result": existing,
         }
+    try:
+        claim_status, current = turn_store.claim_review(turn_id, assistant_hash)
+    except StaleTurnReviewError:
+        return {
+            "turn_id": str(turn_id),
+            "review_status": "stale",
+            "memory_status": "pending",
+            "memory_modifications": [],
+        }
+    if claim_status != "claimed":
+        existing = current.get("review_json") if isinstance(current.get("review_json"), dict) else {}
+        result = {
+            "turn_id": str(turn_id),
+            "review_status": current.get("status") or "pending",
+            "memory_status": current.get("memory_status") or "none",
+            "memory_modifications": [],
+            "review_result": existing,
+        }
+        if current.get("status") == "invalid" and isinstance(existing, dict):
+            result["error"] = str(existing.get("error") or current.get("style_reason") or "")
+        return result
     review_messages = copy.deepcopy(list(messages or []))
     review_messages.append(
         {
