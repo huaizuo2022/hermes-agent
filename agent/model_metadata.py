@@ -1480,6 +1480,16 @@ def get_model_context_length(
         except Exception:
             pass  # fall through to probing
 
+    # 0c. Hardcoded defaults fast-path match for known models (DeepSeek, Claude, GPT, etc.)
+    # If the model key matches a known entry in DEFAULT_CONTEXT_LENGTHS, return it
+    # immediately to avoid expensive / timing-out network probes (e.g. models.dev 15s timeout).
+    model_lower = model.lower()
+    for default_model, length in sorted(
+        DEFAULT_CONTEXT_LENGTHS.items(), key=lambda x: len(x[0]), reverse=True
+    ):
+        if default_model in model_lower:
+            return length
+
     # Normalise provider-prefixed model names (e.g. "local:model-name" →
     # "model-name") so cache lookups and server queries use the bare ID that
     # local servers actually know about.  Ollama "model:tag" colons are preserved.
