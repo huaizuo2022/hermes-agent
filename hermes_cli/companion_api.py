@@ -1306,6 +1306,7 @@ async def chat_endpoint(req: ChatRequest):
         await _acquire_session_lock_cancellation_safe(session_lock)
     session_lock_released_ref = {"released": False}
     stream_lock_owned_by_response = False
+    agent = None  # 在 try 前占位,供 finally 中安全关闭(非流式路径)
     
     # 1. 动态物理隔离 Profile 目录 (使用线程安全的 ContextVar 覆盖)
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
@@ -1516,6 +1517,11 @@ async def chat_endpoint(req: ChatRequest):
                         except Exception:
                             logger.exception("Failed to reset Hermes home override for companion stream thread")
                     finally:
+                        # 对话已跑完,关闭 agent 释放 OpenAI/httpx 连接池,防止连接泄漏累积
+                        try:
+                            agent.close()
+                        except Exception:
+                            logger.exception("Failed to close AIAgent after companion stream")
                         producer_done.set()
                         _emit_stream_event("producer_done")
 
@@ -1588,6 +1594,13 @@ async def chat_endpoint(req: ChatRequest):
         if session_lock is not None and not session_lock_released_ref["released"] and not stream_lock_owned_by_response:
             session_lock.release()
             session_lock_released_ref["released"] = True
+        # 非流式路径:对话已同步跑完,在此关闭 agent 释放连接池。
+        # 流式路径的 agent 由后台线程 run_chat_thread 的 finally 负责关闭(此处 return 时线程可能仍在跑,不能在此关)。
+        if agent is not None and not stream_lock_owned_by_response:
+            try:
+                agent.close()
+            except Exception:
+                logger.exception("Failed to close AIAgent after companion chat")
         reset_hermes_home_override(token)
 
 @router.delete("/sessions/{session_id}")
