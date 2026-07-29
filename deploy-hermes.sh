@@ -275,9 +275,10 @@ Environment=DEEPSEEK_API_BASE=https://api.deepseek.com/v1
 Environment="SAVANA_WECHAT_BRIDGE_ENABLED=${WECHAT_BRIDGE_ENABLED}"
 Environment="SAVANA_WECHAT_BRIDGE_URL=${WECHAT_BRIDGE_URL}"
 Environment="SAVANA_WECHAT_BRIDGE_SECRET=${WECHAT_BRIDGE_SECRET}"
-ExecStart=/var/www/hermes-agent/venv/bin/python -m uvicorn hermes_cli.web_server:app --port 8009 --host 127.0.0.1
+ExecStart=/var/www/hermes-agent/venv/bin/python -m uvicorn hermes_cli.web_server:app --port 8009 --host 127.0.0.1 --workers 4
 Restart=always
-RestartSec=5
+RestartSec=2
+WatchdogSec=30
 
 [Install]
 WantedBy=multi-user.target
