@@ -42,20 +42,20 @@ def _read_profile_payload(profile_dir):
 def read_conversation_policy(profile_dir):
     payload = _read_profile_payload(profile_dir)
     if payload is None:
-        return LEGACY_POLICY
-    if payload.get("conversation_policy") == STYLE_GUARD_V1_POLICY:
         return STYLE_GUARD_V1_POLICY
-    return LEGACY_POLICY
+    if payload.get("conversation_policy") == LEGACY_POLICY:
+        return LEGACY_POLICY
+    return STYLE_GUARD_V1_POLICY
 
 
 def read_evolution_policy(profile_dir):
     payload = _read_profile_payload(profile_dir)
     if payload is None:
-        return LEGACY_POLICY
+        return GUARDED_V2_POLICY
     evolution_policy = payload.get("evolution_policy")
     if evolution_policy in (GUARDED_V1_POLICY, GUARDED_V2_POLICY):
         return evolution_policy
-    return LEGACY_POLICY
+    return GUARDED_V2_POLICY
 
 
 def _atomic_write_yaml(path, payload):
@@ -128,6 +128,15 @@ def ensure_companion_profile(profile_dir):
         if profile_dir.exists():
             if not profile_dir.is_dir():
                 raise IOError("companion profile path is not a directory: {0}".format(profile_dir))
+            meta_path = profile_dir / PROFILE_META_FILE
+            if not meta_path.is_file():
+                _atomic_write_yaml(
+                    meta_path,
+                    {
+                        "conversation_policy": STYLE_GUARD_V1_POLICY,
+                        "evolution_policy": GUARDED_V2_POLICY,
+                    },
+                )
             return read_evolution_policy(profile_dir)
 
         profile_dir.mkdir()

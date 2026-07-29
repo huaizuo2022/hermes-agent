@@ -6,14 +6,14 @@ import yaml
 from hermes_cli import companion_profile_policy as policy
 
 
-def test_existing_profile_without_policy_stays_legacy(tmp_path):
+def test_existing_profile_without_policy_gets_default_style_guard(tmp_path):
     profile_dir = tmp_path / "profiles" / "savana_u_c"
     profile_dir.mkdir(parents=True)
 
-    assert policy.ensure_companion_profile(profile_dir) == policy.LEGACY_POLICY
-    assert policy.read_evolution_policy(profile_dir) == policy.LEGACY_POLICY
-    assert policy.read_conversation_policy(profile_dir) == policy.LEGACY_POLICY
-    assert not (profile_dir / "profile.yaml").exists()
+    assert policy.ensure_companion_profile(profile_dir) == policy.GUARDED_V2_POLICY
+    assert policy.read_evolution_policy(profile_dir) == policy.GUARDED_V2_POLICY
+    assert policy.read_conversation_policy(profile_dir) == policy.STYLE_GUARD_V1_POLICY
+    assert (profile_dir / "profile.yaml").exists()
 
 
 def test_existing_guarded_v1_profile_keeps_file_unchanged(tmp_path):
@@ -25,7 +25,7 @@ def test_existing_guarded_v1_profile_keeps_file_unchanged(tmp_path):
 
     assert policy.ensure_companion_profile(profile_dir) == policy.GUARDED_V1_POLICY
     assert policy.read_evolution_policy(profile_dir) == policy.GUARDED_V1_POLICY
-    assert policy.read_conversation_policy(profile_dir) == policy.LEGACY_POLICY
+    assert policy.read_conversation_policy(profile_dir) == policy.STYLE_GUARD_V1_POLICY
     assert profile_file.read_text(encoding="utf-8") == original
 
 
