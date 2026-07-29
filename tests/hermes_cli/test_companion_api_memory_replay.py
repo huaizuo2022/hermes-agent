@@ -165,11 +165,14 @@ def test_companion_chat_does_not_double_write_current_user(monkeypatch, tmp_path
     ]
 
 
-def test_companion_prompt_history_keeps_recent_30_turns_with_early_summary():
+def test_companion_prompt_history_keeps_recent_window_with_early_summary():
     from hermes_cli import companion_api
 
+    recent_turns = companion_api._COMPANION_HISTORY_RECENT_USER_TURNS
+    # 构造刚好超过窗口 2 轮的历史，验证压缩触发与边界
+    total_turns = recent_turns + 2
     history = []
-    for turn in range(1, 33):
+    for turn in range(1, total_turns + 1):
         history.append(
             {
                 "role": "user",
@@ -181,20 +184,26 @@ def test_companion_prompt_history_keeps_recent_30_turns_with_early_summary():
 
     compacted = companion_api._compact_companion_history_for_prompt(history)
 
+    # 被压缩的早期部分 = 全部 - 最近窗口；其中用户轮次 = 2 个
+    omitted_count = 2 * 2  # 2 个用户轮 + 2 个助手回复
     assert compacted[0]["role"] == "user"
     assert "早期对话摘要" in compacted[0]["content"]
-    assert "此前省略了 4 条历史消息，其中用户轮次 2 个" in compacted[0]["content"]
+    assert "此前省略了 {} 条历史消息，其中用户轮次 2 个".format(omitted_count) in compacted[0]["content"]
     assert compacted[1] == {"role": "assistant", "content": "收到，我会基于这份早期摘要承接当前对话。"}
-    assert len([msg for msg in compacted if msg.get("role") == "user"]) == 31
+    # 摘要占 1 个 user + 1 个 assistant，加上最近窗口 recent_turns 个 user 轮
+    assert len([msg for msg in compacted if msg.get("role") == "user"]) == recent_turns + 1
+    # 最早保留的原文用户轮 = 第 3 轮
     assert compacted[2] == {"role": "user", "content": "用户第3轮", "message_id": "msg-3"}
-    assert compacted[-1] == {"role": "assistant", "content": "助手第32轮"}
+    assert compacted[-1] == {"role": "assistant", "content": "助手第{}轮".format(total_turns)}
 
 
 def test_companion_prompt_history_under_recent_window_is_unchanged():
     from hermes_cli import companion_api
 
+    recent_turns = companion_api._COMPANION_HISTORY_RECENT_USER_TURNS
+    # 刚好等于窗口轮次时，不触发压缩，原样返回
     history = []
-    for turn in range(1, 31):
+    for turn in range(1, recent_turns + 1):
         history.append(
             {
                 "role": "user",

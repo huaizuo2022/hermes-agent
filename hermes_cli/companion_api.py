@@ -41,9 +41,12 @@ _SESSION_LOCKS_GUARD = threading.Lock()
 _UNRESOLVED_REVIEW_TASKS = {}
 _UNRESOLVED_REVIEW_TASKS_GUARD = threading.Lock()
 _stream_event_hook = None
-_COMPANION_HISTORY_RECENT_USER_TURNS = 30
-_COMPANION_EARLY_SUMMARY_EDGE_MESSAGES = 4
-_COMPANION_EARLY_SUMMARY_CONTENT_CHARS = 160
+# 上下文压缩阈值：保留最近 N 个用户轮次的原文，更早的压成摘要。
+# 原 30/4/160 过于激进，长聊（单日 200+ 轮）会把关键剧情设定压成 160 字片段，
+# 导致 AI "记不得前面说过的"。放宽以保留更多早期细节。
+_COMPANION_HISTORY_RECENT_USER_TURNS = 80
+_COMPANION_EARLY_SUMMARY_EDGE_MESSAGES = 8
+_COMPANION_EARLY_SUMMARY_CONTENT_CHARS = 500
 
 
 def _style_guard_new_profiles_enabled() -> bool:
