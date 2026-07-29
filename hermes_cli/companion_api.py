@@ -532,6 +532,18 @@ def _start_background_thread(target) -> threading.Thread:
     return worker
 
 
+def _safe_acquire_lock(lock: Optional[threading.Lock], timeout: float = 5.0) -> bool:
+    if lock is None:
+        return True
+    try:
+        return lock.acquire(timeout=timeout)
+    except TypeError:
+        try:
+            return lock.acquire(True, timeout)
+        except TypeError:
+            return lock.acquire()
+
+
 class _CompanionStreamResponse(StreamingResponse):
     def __init__(
         self,
@@ -553,7 +565,10 @@ class _CompanionStreamResponse(StreamingResponse):
         _emit_stream_event("final_marker_set")
         await asyncio.get_running_loop().run_in_executor(None, self._producer_done.wait)
         if self._session_lock is not None and not self._session_lock_released_ref["released"]:
-            self._session_lock.release()
+            try:
+                self._session_lock.release()
+            except RuntimeError:
+                pass
             self._session_lock_released_ref["released"] = True
             _emit_stream_event("lock_released")
 
@@ -586,9 +601,9 @@ class _CompanionStreamResponse(StreamingResponse):
             await asyncio.shield(cleanup_task)
 
 
-async def _acquire_session_lock_cancellation_safe(session_lock: threading.Lock) -> None:
+async def _acquire_session_lock_cancellation_safe(session_lock: threading.Lock, timeout: float = 5.0) -> None:
     loop = asyncio.get_running_loop()
-    acquire_future = loop.run_in_executor(None, session_lock.acquire)
+    acquire_future = loop.run_in_executor(None, lambda: _safe_acquire_lock(session_lock, timeout=timeout))
 
     def _release_if_acquired(future) -> None:
         try:
@@ -603,7 +618,14 @@ async def _acquire_session_lock_cancellation_safe(session_lock: threading.Lock) 
                 logger.exception("session lock orphan acquire release failed")
 
     try:
-        await asyncio.shield(acquire_future)
+        acquired = await asyncio.shield(acquire_future)
+        if not acquired:
+            logger.warning("session_lock.acquire_timeout_exceeded_breaking_stale_lock")
+            try:
+                session_lock.release()
+            except Exception:
+                pass
+            _safe_acquire_lock(session_lock, timeout=0.1)
     except asyncio.CancelledError:
         if acquire_future.done():
             _release_if_acquired(acquire_future)
