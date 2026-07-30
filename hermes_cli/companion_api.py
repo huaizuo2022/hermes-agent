@@ -9,7 +9,7 @@ import threading
 import time
 from functools import partial
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Generator, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Generator, List, Optional, Tuple
 
 import anyio
 import httpx
@@ -47,6 +47,17 @@ _stream_event_hook = None
 _COMPANION_HISTORY_RECENT_USER_TURNS = 80
 _COMPANION_EARLY_SUMMARY_EDGE_MESSAGES = 8
 _COMPANION_EARLY_SUMMARY_CONTENT_CHARS = 500
+
+# DeepSeek 前缀缓存友好的追加式压缩预算。
+# deepseek-v4-flash 上下文窗口为 1M tokens（agent/model_metadata.py），
+# 预算取 60%：扣除 system prompt 与预留输出后仍有充足余量。
+# history 采用"追加式增长 + 持久化检查点"：一旦在某切点压成固定摘要，
+# 之后只在末尾追加新轮次、前缀逐字节稳定，DeepSeek 前缀缓存可一路命中到
+# history 末尾；仅当追加段 token 估算超过本预算时才做一次"重锚定"压缩。
+_COMPANION_PROMPT_TOKEN_BUDGET = 600000
+
+# checkpoint 文件名（落在每个 companion 会话独立的 profile_dir 下）。
+_COMPANION_CHECKPOINT_FILENAME = "companion_checkpoint.json"
 
 
 def _style_guard_new_profiles_enabled() -> bool:
@@ -454,10 +465,10 @@ def _summarize_early_companion_history(omitted: List[Dict[str, Any]]) -> str:
     if not omitted_count:
         return ""
 
+    # 采样只锚定开头 edge 条，去掉 omitted[-edge:] 滑动尾：
+    # 切点固定后采样集合即固定，摘要文本逐字节稳定，DeepSeek 前缀缓存可持续命中。
     edge = _COMPANION_EARLY_SUMMARY_EDGE_MESSAGES
     sample_messages = omitted[:edge]
-    if omitted_count > edge:
-        sample_messages = sample_messages + omitted[-edge:]
 
     lines = [
         "【早期对话摘要（自动压缩，仅用于承接事实）】",
@@ -477,35 +488,184 @@ def _summarize_early_companion_history(omitted: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _compact_companion_history_for_prompt(
-    messages: List[Dict[str, Any]],
-    recent_user_turns: int = _COMPANION_HISTORY_RECENT_USER_TURNS,
-) -> List[Dict[str, Any]]:
-    messages = list(messages or [])
-    if recent_user_turns <= 0:
-        return messages
-    if _count_user_turns(messages) <= recent_user_turns:
-        return messages
+def _estimate_messages_tokens(messages: List[Dict[str, Any]]) -> int:
+    """保守估算 messages 的 token 数（中文按 ~2 字符 1 token 的上界）。
 
+    只用于决定"何时重锚定"，不影响正确性，故取偏保守（偏大）的上界即可。
+    """
+    total_chars = 0
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            total_chars += len(content)
+    return total_chars // 2
+
+
+def _read_companion_checkpoint(profile_dir: str) -> Optional[Dict[str, Any]]:
+    """读取持久化的压缩检查点；不存在或损坏时返回 None（安全降级为重建）。"""
+    path = Path(profile_dir) / _COMPANION_CHECKPOINT_FILENAME
+    text = _read_text_if_exists(path)
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    summary_text = data.get("summary_text")
+    cut_index = data.get("cut_index")
+    if not summary_text or not isinstance(cut_index, int):
+        return None
+    return data
+
+
+def _write_companion_checkpoint(profile_dir: str, checkpoint: Dict[str, Any]) -> None:
+    """原子写入压缩检查点（写临时文件 + rename），避免无锁路径下写坏文件。"""
+    path = Path(profile_dir) / _COMPANION_CHECKPOINT_FILENAME
+    tmp_path = Path(profile_dir) / (_COMPANION_CHECKPOINT_FILENAME + ".tmp")
+    try:
+        payload = json.dumps(checkpoint, ensure_ascii=False, sort_keys=True)
+        tmp_path.write_text(payload, encoding="utf-8")
+        os.replace(str(tmp_path), str(path))
+    except Exception:
+        logger.exception("Failed to write companion checkpoint for %s", profile_dir)
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+
+
+def _resolve_checkpoint_cut_index(
+    checkpoint: Dict[str, Any],
+    messages: List[Dict[str, Any]],
+) -> Optional[int]:
+    """把 checkpoint 的切点重新定位到当前 messages 的下标。
+
+    优先按 anchor_message_id 定位（防历史被编辑/删除时下标漂移）；
+    找不到则回退到持久化的 cut_index（raw_history 只增不减时稳定）；
+    越界则返回 None（调用方降级为重建 checkpoint）。
+    """
+    anchor_message_id = checkpoint.get("anchor_message_id")
+    if anchor_message_id:
+        for index, msg in enumerate(messages):
+            if isinstance(msg, dict) and msg.get("message_id") == anchor_message_id:
+                # anchor 是切点前最后一条，切点下标 = 其后一位
+                return index + 1
+
+    cut_index = checkpoint.get("cut_index")
+    if isinstance(cut_index, int) and 0 <= cut_index <= len(messages):
+        return cut_index
+    return None
+
+
+def _build_compaction_checkpoint(
+    messages: List[Dict[str, Any]],
+    recent_user_turns: int,
+) -> Optional[Dict[str, Any]]:
+    """在"保留最近 recent_user_turns 个用户轮次"的切点处构建固定摘要检查点。
+
+    返回 None 表示无需压缩（轮次未超阈值或切点为 0）。
+    """
+    total = len(messages)
     seen_user_turns = 0
     recent_start = 0
-    for index in range(len(messages) - 1, -1, -1):
+    found = False
+    for index in range(total - 1, -1, -1):
         msg = messages[index]
         if isinstance(msg, dict) and msg.get("role") == "user":
             seen_user_turns += 1
             if seen_user_turns == recent_user_turns:
                 recent_start = index
+                found = True
                 break
 
+    if not found or recent_start <= 0:
+        return None
+
     omitted = messages[:recent_start]
-    recent = messages[recent_start:]
     summary = _summarize_early_companion_history(omitted)
     if not summary:
-        return recent
+        return None
+
+    # 锚点 = 切点前最后一条消息的 message_id（可能缺失，则为 None）。
+    anchor_message_id = None
+    if recent_start - 1 >= 0:
+        anchor_msg = messages[recent_start - 1]
+        if isinstance(anchor_msg, dict):
+            anchor_message_id = anchor_msg.get("message_id")
+
+    return {
+        "summary_text": summary,
+        "cut_index": recent_start,
+        "anchor_message_id": anchor_message_id,
+        "created_at_turn": _count_user_turns(messages),
+    }
+
+
+def _render_compacted_history(
+    messages: List[Dict[str, Any]],
+    checkpoint: Dict[str, Any],
+    cut_index: int,
+) -> List[Dict[str, Any]]:
+    """按检查点渲染追加式 history：固定摘要 + 固定应答 + 切点后的追加段。"""
     return [
-        {"role": "user", "content": summary},
+        {"role": "user", "content": checkpoint["summary_text"]},
         {"role": "assistant", "content": "收到，我会基于这份早期摘要承接当前对话。"},
-    ] + recent
+    ] + list(messages[cut_index:])
+
+
+def _compact_companion_history_for_prompt(
+    messages: List[Dict[str, Any]],
+    checkpoint: Optional[Dict[str, Any]] = None,
+    recent_user_turns: int = _COMPANION_HISTORY_RECENT_USER_TURNS,
+    max_prompt_tokens: int = _COMPANION_PROMPT_TOKEN_BUDGET,
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """把 history 压缩为 DeepSeek 前缀缓存友好的"追加式"结构。
+
+    返回 (compacted_messages, new_checkpoint)。
+
+    设计要点（区别于旧的每轮滑动窗口）：
+    - 一旦在某切点压成固定摘要并持久化为 checkpoint，之后每轮复用同一
+      summary_text 与同一切点，history 前缀逐字节稳定、只在末尾追加新轮次，
+      DeepSeek 前缀缓存可一路命中到 history 末尾；
+    - 仅当追加段 token 估算超过 max_prompt_tokens 时才做一次"重锚定"
+      （切点前移、摘要重建），牺牲本轮缓存换之后 N 轮的稳定前缀。
+    """
+    messages = list(messages or [])
+    if recent_user_turns <= 0:
+        return messages, checkpoint
+
+    # 分支 1：已有 checkpoint —— 复用固定摘要与切点（绝大多数轮次走这里）。
+    if checkpoint:
+        cut_index = _resolve_checkpoint_cut_index(checkpoint, messages)
+        if cut_index is not None:
+            appended = messages[cut_index:]
+            # 追加段未超预算：直接复用，前缀稳定。
+            if _estimate_messages_tokens(appended) <= max_prompt_tokens:
+                return (
+                    _render_compacted_history(messages, checkpoint, cut_index),
+                    checkpoint,
+                )
+            # 追加段超预算：落到下面的重锚定逻辑（切点前移）。
+        # 切点无法定位（历史被编辑/删除）：降级为重建 checkpoint。
+
+    # 分支 2：窗口内不压缩（保持原契约，原样返回）。
+    if _count_user_turns(messages) <= recent_user_turns:
+        return messages, checkpoint
+
+    # 分支 3：首次压缩或重锚定 —— 在新切点构建固定摘要检查点。
+    new_checkpoint = _build_compaction_checkpoint(messages, recent_user_turns)
+    if not new_checkpoint:
+        return messages, checkpoint
+
+    return (
+        _render_compacted_history(messages, new_checkpoint, new_checkpoint["cut_index"]),
+        new_checkpoint,
+    )
 
 
 def _get_session_lock(session_id: str) -> threading.Lock:
@@ -1334,7 +1494,16 @@ async def chat_endpoint(req: ChatRequest):
         soul_text = _read_text_if_exists(Path(profile_dir) / "SOUL.md")
         memory_snapshots = _load_companion_memory_snapshots(profile_dir)
         session_stats = _get_latest_session_stats(session_db, session_id)
-        conversation_history = _compact_companion_history_for_prompt(raw_history)
+        # 追加式前缀压缩：读入持久化检查点，复用固定摘要与同一切点，
+        # 使 history 前缀逐字节稳定（DeepSeek 前缀缓存一路命中到 history 末尾）；
+        # 仅在首次超阈值或追加段超 token 预算时重锚定并写回新检查点。
+        compaction_checkpoint = _read_companion_checkpoint(profile_dir)
+        conversation_history, new_compaction_checkpoint = _compact_companion_history_for_prompt(
+            raw_history,
+            checkpoint=compaction_checkpoint,
+        )
+        if new_compaction_checkpoint is not compaction_checkpoint:
+            _write_companion_checkpoint(profile_dir, new_compaction_checkpoint)
 
         # 动态解析模型及 API 配置
         api_key = req.api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")

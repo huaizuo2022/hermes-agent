@@ -165,12 +165,8 @@ def test_companion_chat_does_not_double_write_current_user(monkeypatch, tmp_path
     ]
 
 
-def test_companion_prompt_history_keeps_recent_window_with_early_summary():
-    from hermes_cli import companion_api
-
-    recent_turns = companion_api._COMPANION_HISTORY_RECENT_USER_TURNS
-    # 构造刚好超过窗口 2 轮的历史，验证压缩触发与边界
-    total_turns = recent_turns + 2
+def _build_turns(total_turns):
+    """构造 total_turns 个用户轮次的历史（user 带 message_id，assistant 不带）。"""
     history = []
     for turn in range(1, total_turns + 1):
         history.append(
@@ -181,11 +177,28 @@ def test_companion_prompt_history_keeps_recent_window_with_early_summary():
             }
         )
         history.append({"role": "assistant", "content": "助手第{}轮".format(turn)})
+    return history
 
-    compacted = companion_api._compact_companion_history_for_prompt(history)
 
-    # 被压缩的早期部分 = 全部 - 最近窗口；其中用户轮次 = 2 个
-    omitted_count = 2 * 2  # 2 个用户轮 + 2 个助手回复
+def test_companion_prompt_history_first_reanchor_builds_checkpoint():
+    from hermes_cli import companion_api
+
+    recent_turns = companion_api._COMPANION_HISTORY_RECENT_USER_TURNS
+    # 构造刚好超过窗口 2 轮的历史，验证首次重锚定触发与切点边界
+    total_turns = recent_turns + 2
+    history = _build_turns(total_turns)
+
+    compacted, checkpoint = companion_api._compact_companion_history_for_prompt(
+        history, checkpoint=None
+    )
+
+    # 生成了 checkpoint，切点 = 全部 - 最近窗口 = 前 2 轮（4 条）
+    assert checkpoint is not None
+    assert checkpoint["cut_index"] == 2 * 2
+    assert checkpoint["summary_text"]
+
+    # 被压缩的早期部分 = 前 2 个用户轮 + 2 个助手回复 = 4 条
+    omitted_count = 2 * 2
     assert compacted[0]["role"] == "user"
     assert "早期对话摘要" in compacted[0]["content"]
     assert "此前省略了 {} 条历史消息，其中用户轮次 2 个".format(omitted_count) in compacted[0]["content"]
@@ -197,20 +210,76 @@ def test_companion_prompt_history_keeps_recent_window_with_early_summary():
     assert compacted[-1] == {"role": "assistant", "content": "助手第{}轮".format(total_turns)}
 
 
+def test_companion_prompt_history_checkpoint_reuse_keeps_prefix_byte_stable():
+    """核心不变量：复用 checkpoint 后，history 前缀逐字节稳定，只在末尾追加新轮次。"""
+    from hermes_cli import companion_api
+
+    recent_turns = companion_api._COMPANION_HISTORY_RECENT_USER_TURNS
+    history = _build_turns(recent_turns + 2)
+
+    # 第一次：首次重锚定，拿到 checkpoint
+    compacted1, checkpoint = companion_api._compact_companion_history_for_prompt(
+        history, checkpoint=None
+    )
+    assert checkpoint is not None
+
+    # 追加一轮（user + assistant），传入 checkpoint 复用
+    appended = history + [
+        {"role": "user", "content": "用户第{}轮".format(recent_turns + 3), "message_id": "msg-{}".format(recent_turns + 3)},
+        {"role": "assistant", "content": "助手第{}轮".format(recent_turns + 3)},
+    ]
+    compacted2, checkpoint2 = companion_api._compact_companion_history_for_prompt(
+        appended, checkpoint=checkpoint
+    )
+
+    # checkpoint 原样复用（同一对象，未触发重锚定）
+    assert checkpoint2 is checkpoint
+    # 摘要逐字节相等
+    assert compacted2[0]["content"] == compacted1[0]["content"]
+    # 前缀逐字节稳定：第二次的输出 = 第一次的输出 + 末尾新增的一轮
+    assert compacted2[:-2] == compacted1
+    assert compacted2[-2:] == appended[-2:]
+
+
+def test_companion_prompt_history_reanchor_when_appended_exceeds_budget():
+    """追加段 token 估算超预算时，触发重锚定：切点前移、摘要更新、保留最近窗口。"""
+    from hermes_cli import companion_api
+
+    recent_turns = companion_api._COMPANION_HISTORY_RECENT_USER_TURNS
+    history = _build_turns(recent_turns + 2)
+
+    _, checkpoint = companion_api._compact_companion_history_for_prompt(
+        history, checkpoint=None
+    )
+    first_cut = checkpoint["cut_index"]
+
+    # 追加大量内容，使追加段 token 估算超过一个极小的预算
+    big = list(history)
+    for turn in range(recent_turns + 3, recent_turns + 40):
+        big.append({"role": "user", "content": "用户第{}轮".format(turn) + "y" * 400, "message_id": "msg-{}".format(turn)})
+        big.append({"role": "assistant", "content": "助手第{}轮".format(turn) + "y" * 400})
+
+    compacted, checkpoint2 = companion_api._compact_companion_history_for_prompt(
+        big, checkpoint=checkpoint, max_prompt_tokens=100
+    )
+
+    # 触发了重锚定：新 checkpoint、切点前移、摘要变化
+    assert checkpoint2 is not checkpoint
+    assert checkpoint2["cut_index"] > first_cut
+    assert checkpoint2["summary_text"] != checkpoint["summary_text"]
+    # 重锚定后仍保留最近 recent_turns 个用户轮次
+    assert len([msg for msg in compacted if msg.get("role") == "user"]) == recent_turns + 1
+
+
 def test_companion_prompt_history_under_recent_window_is_unchanged():
     from hermes_cli import companion_api
 
     recent_turns = companion_api._COMPANION_HISTORY_RECENT_USER_TURNS
-    # 刚好等于窗口轮次时，不触发压缩，原样返回
-    history = []
-    for turn in range(1, recent_turns + 1):
-        history.append(
-            {
-                "role": "user",
-                "content": "用户第{}轮".format(turn),
-                "message_id": "msg-{}".format(turn),
-            }
-        )
-        history.append({"role": "assistant", "content": "助手第{}轮".format(turn)})
+    # 刚好等于窗口轮次时，不触发压缩，原样返回，且不生成 checkpoint
+    history = _build_turns(recent_turns)
 
-    assert companion_api._compact_companion_history_for_prompt(history) == history
+    compacted, checkpoint = companion_api._compact_companion_history_for_prompt(
+        history, checkpoint=None
+    )
+    assert compacted == history
+    assert checkpoint is None
