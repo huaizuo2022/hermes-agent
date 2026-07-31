@@ -465,10 +465,16 @@ def _summarize_early_companion_history(omitted: List[Dict[str, Any]]) -> str:
     if not omitted_count:
         return ""
 
-    # 采样只锚定开头 edge 条，去掉 omitted[-edge:] 滑动尾：
-    # 切点固定后采样集合即固定，摘要文本逐字节稳定，DeepSeek 前缀缓存可持续命中。
-    edge = _COMPANION_EARLY_SUMMARY_EDGE_MESSAGES
-    sample_messages = omitted[:edge]
+    # 如果省略的消息较少（<= 16 条），直接完整放入摘要；
+    # 否则保留开头的 4 条（对话起始设定）和结尾的 8 条（切点前紧邻剧情），
+    # 避免单向切片抛弃中间数十轮关键事实。切点固定后集合同样逐字节稳定。
+    if omitted_count <= 16:
+        sample_messages = omitted
+    else:
+        head = omitted[:4]
+        tail = omitted[-8:]
+        middle_notice = {"role": "system", "content": "...(中间省略了 {0} 条对话)...".format(omitted_count - 12)}
+        sample_messages = head + [middle_notice] + tail
 
     lines = [
         "【早期对话摘要（自动压缩，仅用于承接事实）】",
@@ -481,6 +487,9 @@ def _summarize_early_companion_history(omitted: List[Dict[str, Any]]) -> str:
         if not isinstance(msg, dict):
             continue
         role = str(msg.get("role") or "unknown")
+        if role == "system" and "中间省略了" in str(msg.get("content") or ""):
+            lines.append(str(msg.get("content")))
+            continue
         content = _truncate_text_for_summary(msg.get("content"))
         if not content:
             continue
