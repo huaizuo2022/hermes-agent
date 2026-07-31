@@ -24,6 +24,71 @@ def _payload(message_id, user_message, stream=False):
     }
 
 
+def test_style_guard_keeps_memory_tool_enabled_and_uses_savana_description(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+            self.session_db = kwargs["session_db"]
+            self.session_id = kwargs["session_id"]
+            self._memory_store = None
+            self.tools = []
+            if "memory" in (kwargs.get("enabled_toolsets") or []):
+                self.tools = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "memory",
+                            "description": "generic memory tool description",
+                        },
+                    }
+                ]
+            self.suppress_status_output = False
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.base_url = kwargs["base_url"]
+            self.ephemeral_system_prompt = kwargs.get("ephemeral_system_prompt")
+
+        def run_conversation(
+            self,
+            user_message,
+            system_message=None,
+            conversation_history=None,
+            task_id=None,
+            stream_callback=None,
+            persist_user_message=None,
+            platform_message_id=None,
+        ):
+            captured["tool_description"] = self.tools[0]["function"]["description"]
+            return {"final_response": "收到"}
+
+        def close(self):
+            pass
+
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+    monkeypatch.setattr("hermes_cli.companion_api._schedule_unresolved_reviews", lambda **kwargs: None)
+    monkeypatch.setattr(
+        "hermes_cli.companion_api._review_companion_turn",
+        lambda **kwargs: {"memory_modifications": [], "review_status": "skipped", "memory_status": "skipped"},
+    )
+
+    import run_agent
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+
+    client = TestClient(app)
+    response = client.post("/companion/v1/chat", json=_payload("msg-memory", "以后叫我小鱼，记住哦"))
+
+    assert response.status_code == 200
+    assert captured["enabled_toolsets"] == ["memory"]
+    assert "将用户的个人信息永久写入记忆" in captured["tool_description"]
+    assert "用户说\"记住\"" in captured["tool_description"]
+
+
+
 def test_companion_chat_replays_prior_turns_via_run_agent_patch_only(monkeypatch, tmp_path):
     call_history = []
 

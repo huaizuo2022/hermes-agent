@@ -1521,11 +1521,10 @@ async def chat_endpoint(req: ChatRequest):
         model = req.model or "deepseek-v4-flash"
         effective_directives = ""
         diagnostics_directives = req.companion_directives or ""
-        enabled_toolsets = []
+        enabled_toolsets = ["memory"]
         if not style_guard_enabled:
             effective_directives = req.directives
             diagnostics_directives = req.directives
-            enabled_toolsets = ["memory"]
 
         # 3. 实例化 AI 代理 (硬编码工具限制为 memory，完全封死危险操作)
         agent = AIAgent(
@@ -1579,7 +1578,7 @@ async def chat_endpoint(req: ChatRequest):
             "只写入 target='user'（用户档案），action='add' 新增，action='replace' 更新旧条目。"
             "content 用简短中文写明事实，例如：'用户最喜欢的运动是攀岩'、'用户讨厌吃芹菜和胡萝卜'。"
         )
-        if not style_guard_enabled and agent.tools:
+        if agent.tools:
             for _tool in agent.tools:
                 if isinstance(_tool, dict) and _tool.get("function", {}).get("name") == "memory":
                     _tool["function"]["description"] = _SAVANA_MEMORY_DESCRIPTION
