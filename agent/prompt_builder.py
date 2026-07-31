@@ -170,6 +170,25 @@ MEMORY_GUIDANCE = (
     "workflows belong in skills, not memory."
 )
 
+# Savana 伴侣场景专用记忆引导（中文，角色扮演导向）。
+# 替代通用英文 MEMORY_GUIDANCE，让 DeepSeek 在沉浸式角色扮演中能关联到
+# "该调 memory tool 记住用户"这一触发场景。只在 platform == "savana" 时注入。
+SAVANA_MEMORY_GUIDANCE = (
+    "## 跨会话记忆（重要）\n"
+    "你拥有跨会话的持久记忆能力。为了让角色在后续对话中真正'认识'用户、"
+    "记住用户的喜好与经历，当用户在对话中透露以下信息时，"
+    "必须在当前回复中同时调用 memory 工具保存（不要只用台词敷衍）：\n"
+    "- 用户的个人偏好：喜欢/讨厌的食物、音乐、运动、颜色等\n"
+    "- 用户的身份信息：职业、年龄、所在城市、作息习惯、生日\n"
+    "- 用户提到的重要的人或事：宠物、家人、朋友、回忆、经历\n"
+    "- 用户明确要求你记住的任何内容（'记住'、'别忘了'）\n\n"
+    "保存方式：target='user'，action='add' 新增，action='replace' 更新已记住的内容。"
+    "用简短中文写明事实，例如'用户最喜欢的运动是攀岩'。\n"
+    "注意：日常闲聊和剧情推进不需要调用 memory；只在用户透露真实个人信息时才调用。"
+    "不要保存临时剧情状态（那些在对话历史里）。"
+)
+
+
 SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect "
     "relevant cross-session context exists, use session_search to recall it before "
