@@ -142,18 +142,20 @@ class MemoryStore:
     Maintains two parallel states:
       - _system_prompt_snapshot: frozen at load time, used for system prompt injection.
         Never mutated mid-session. Keeps prefix cache stable.
-      - memory_entries / user_entries: live state, mutated by tool calls, persisted to disk.
-        Tool responses always reflect this live state.
+      - memory_entries / user_entries / continuity_entries: live state, mutated by tool calls,
+        persisted to disk. Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, continuity_char_limit: int = 4000):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
+        self.continuity_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.continuity_char_limit = continuity_char_limit
         self.modifications: List[Dict[str, Any]] = []
         # Frozen snapshot for system prompt -- set once at load_from_disk()
-        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": "", "continuity": ""}
 
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
@@ -162,6 +164,7 @@ class MemoryStore:
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")
+        self.continuity_entries = self._read_file(mem_dir / "CONTINUITY.md")
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
@@ -171,6 +174,7 @@ class MemoryStore:
         self._system_prompt_snapshot = {
             "memory": self._render_block("memory", self.memory_entries),
             "user": self._render_block("user", self.user_entries),
+            "continuity": self._render_block("continuity", self.continuity_entries),
         }
 
     @staticmethod
@@ -215,6 +219,8 @@ class MemoryStore:
         mem_dir = get_memory_dir()
         if target == "user":
             return mem_dir / "USER.md"
+        if target == "continuity":
+            return mem_dir / "CONTINUITY.md"
         return mem_dir / "MEMORY.md"
 
     def _reload_target(self, target: str) -> Optional[str]:
@@ -243,11 +249,15 @@ class MemoryStore:
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
             return self.user_entries
+        if target == "continuity":
+            return self.continuity_entries
         return self.memory_entries
 
     def _set_entries(self, target: str, entries: List[str]):
         if target == "user":
             self.user_entries = entries
+        elif target == "continuity":
+            self.continuity_entries = entries
         else:
             self.memory_entries = entries
 
@@ -260,6 +270,8 @@ class MemoryStore:
     def _char_limit(self, target: str) -> int:
         if target == "user":
             return self.user_char_limit
+        if target == "continuity":
+            return self.continuity_char_limit
         return self.memory_char_limit
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
@@ -468,6 +480,8 @@ class MemoryStore:
 
         if target == "user":
             header = f"USER PROFILE (who the user is) [{pct}% — {current:,}/{limit:,} chars]"
+        elif target == "continuity":
+            header = f"CONTINUITY (story facts and commitments) [{pct}% — {current:,}/{limit:,} chars]"
         else:
             header = f"MEMORY (your personal notes) [{pct}% — {current:,}/{limit:,} chars]"
 
@@ -598,8 +612,8 @@ def memory_tool(
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
-    if target not in {"memory", "user"}:
-        return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+    if target not in {"memory", "user", "continuity"}:
+        return tool_error(f"Invalid target '{target}'. Use 'memory', 'user', or 'continuity'.", success=False)
 
     if action == "add":
         if not content:
@@ -668,8 +682,8 @@ MEMORY_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "enum": ["memory", "user"],
-                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile."
+                "enum": ["memory", "user", "continuity"],
+                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile, 'continuity' for long-term story facts."
             },
             "content": {
                 "type": "string",
