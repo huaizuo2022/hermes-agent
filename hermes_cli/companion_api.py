@@ -42,9 +42,9 @@ _UNRESOLVED_REVIEW_TASKS = {}
 _UNRESOLVED_REVIEW_TASKS_GUARD = threading.Lock()
 _stream_event_hook = None
 # 上下文压缩阈值：保留最近 N 个用户轮次的原文，更早的压成摘要。
-# 原 30/4/160 过于激进，长聊（单日 200+ 轮）会把关键剧情设定压成 160 字片段，
-# 导致 AI "记不得前面说过的"。放宽以保留更多早期细节。
-_COMPANION_HISTORY_RECENT_USER_TURNS = 80
+# 长期偏好/称呼/用户资料交给 memory 持久化；prompt 里只保留足够承接当前剧情的短期上下文，
+# 避免每轮携带过长历史导致 token 消耗失控。
+_COMPANION_HISTORY_RECENT_USER_TURNS = 20
 _COMPANION_EARLY_SUMMARY_EDGE_MESSAGES = 8
 _COMPANION_EARLY_SUMMARY_CONTENT_CHARS = 500
 
