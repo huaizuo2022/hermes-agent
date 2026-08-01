@@ -1112,11 +1112,8 @@ class TestBuildSystemPrompt:
             prompt = agent._build_system_prompt()
 
         assert "角色和故事的长期事实、承诺、关系变化" in prompt
+        assert "CONTINUITY (story facts and commitments)" in prompt
         assert "角色已答应下周陪用户去看展" in prompt
-        assert (
-            "角色连续性记忆" in prompt
-            or "CONTINUITY (story facts and commitments)" in prompt
-        )
 
     def test_savana_prompt_skips_empty_continuity_snapshot(self, monkeypatch, tmp_path):
         from tools.memory_tool import MemoryStore
@@ -1153,6 +1150,7 @@ class TestBuildSystemPrompt:
             agent._user_profile_enabled = True
             prompt = agent._build_system_prompt()
 
+        assert "CONTINUITY (story facts and commitments)" not in prompt
         assert "角色连续性记忆" not in prompt
 
     def test_no_memory_guidance_without_tool(self, agent):
