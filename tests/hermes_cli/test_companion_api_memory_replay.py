@@ -88,6 +88,86 @@ def test_style_guard_keeps_memory_tool_enabled_and_uses_savana_description(monke
     assert "用户说\"记住\"" in captured["tool_description"]
 
 
+def test_style_guard_memory_snapshots_include_continuity(monkeypatch, tmp_path):
+    from hermes_cli import companion_api
+
+    profile_dir = tmp_path / "profile"
+    memories_dir = profile_dir / "memories"
+    memories_dir.mkdir(parents=True)
+    (memories_dir / "MEMORY.md").write_text("已有长期记忆", encoding="utf-8")
+    (memories_dir / "USER.md").write_text("用户叫小鱼", encoding="utf-8")
+    (memories_dir / "CONTINUITY.md").write_text("角色已答应下周陪用户去看展", encoding="utf-8")
+
+    snapshots = companion_api._load_companion_memory_snapshots(str(profile_dir))
+
+    assert snapshots == {
+        "memory": "已有长期记忆",
+        "user": "用户叫小鱼",
+        "continuity": "角色已答应下周陪用户去看展",
+    }
+
+
+def test_style_guard_system_prompt_includes_continuity_block(monkeypatch, tmp_path):
+    from hermes_cli import companion_api
+
+    profile_dir = tmp_path / "profile"
+    memories_dir = profile_dir / "memories"
+    memories_dir.mkdir(parents=True)
+    (profile_dir / "SOUL.md").write_text("角色 SOUL\n测试角色", encoding="utf-8")
+    (memories_dir / "MEMORY.md").write_text("已有长期记忆", encoding="utf-8")
+    (memories_dir / "USER.md").write_text("用户叫小鱼", encoding="utf-8")
+    (memories_dir / "CONTINUITY.md").write_text("角色已答应下周陪用户去看展", encoding="utf-8")
+
+    captures = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.session_db = kwargs["session_db"]
+            self.session_id = kwargs["session_id"]
+            self._memory_store = None
+            self.tools = []
+            self.suppress_status_output = False
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.base_url = kwargs["base_url"]
+            self.ephemeral_system_prompt = kwargs.get("ephemeral_system_prompt")
+            self._system_prompt_override = None
+
+        def run_conversation(
+            self,
+            user_message,
+            system_message=None,
+            conversation_history=None,
+            task_id=None,
+            stream_callback=None,
+            persist_user_message=None,
+            platform_message_id=None,
+        ):
+            captures["override"] = self._system_prompt_override
+            return {"final_response": "收到"}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+    monkeypatch.setattr("hermes_cli.companion_api._schedule_unresolved_reviews", lambda **kwargs: None)
+    monkeypatch.setattr(
+        "hermes_cli.companion_api._review_companion_turn",
+        lambda **kwargs: {"memory_modifications": [], "review_status": "skipped", "memory_status": "skipped"},
+    )
+
+    import run_agent
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+
+    client = TestClient(app)
+    response = client.post("/companion/v1/chat", json=_payload("msg-continuity", "继续吧"))
+
+    assert response.status_code == 200
+    assert "角色连续性记忆" in captures["override"]
+    assert "角色已答应下周陪用户去看展" in captures["override"]
+
+
 
 def test_companion_chat_replays_prior_turns_via_run_agent_patch_only(monkeypatch, tmp_path):
     call_history = []

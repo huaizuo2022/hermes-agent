@@ -5,12 +5,14 @@ def build_companion_system_prompt(
     soul_text: str,
     memory_text: str = "",
     user_profile_text: str = "",
+    continuity_text: str = "",
 ) -> str:
     sections = []
 
     soul = str(soul_text or "").strip()
     memory = str(memory_text or "").strip()
     user_profile = str(user_profile_text or "").strip()
+    continuity = str(continuity_text or "").strip()
 
     if soul:
         sections.append("角色 SOUL\n{0}".format(soul))
@@ -18,6 +20,8 @@ def build_companion_system_prompt(
         sections.append("共享记忆\n{0}".format(memory))
     if user_profile:
         sections.append("用户上下文\n{0}".format(user_profile))
+    if continuity:
+        sections.append("角色连续性记忆\n{0}".format(continuity))
 
     sections.append(
         "连续性规则\n"

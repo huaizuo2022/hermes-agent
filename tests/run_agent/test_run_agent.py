@@ -1075,6 +1075,86 @@ class TestBuildSystemPrompt:
         prompt = agent_with_memory_tool._build_system_prompt()
         assert MEMORY_GUIDANCE in prompt
 
+    def test_savana_prompt_includes_continuity_guidance_and_snapshot(self, monkeypatch, tmp_path):
+        from tools.memory_tool import MemoryStore
+
+        memories_dir = tmp_path / "memories"
+        memories_dir.mkdir()
+        (memories_dir / "CONTINUITY.md").write_text("角色已答应下周陪用户去看展", encoding="utf-8")
+
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "memory"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"memory": {"memory_enabled": True, "user_profile_enabled": True}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="savana",
+            )
+            agent.client = MagicMock()
+            store = MemoryStore()
+            monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: memories_dir)
+            store.load_from_disk()
+            agent._memory_store = store
+            agent._memory_enabled = True
+            agent._user_profile_enabled = True
+            prompt = agent._build_system_prompt()
+
+        assert "角色和故事的长期事实、承诺、关系变化" in prompt
+        assert "角色已答应下周陪用户去看展" in prompt
+        assert (
+            "角色连续性记忆" in prompt
+            or "CONTINUITY (story facts and commitments)" in prompt
+        )
+
+    def test_savana_prompt_skips_empty_continuity_snapshot(self, monkeypatch, tmp_path):
+        from tools.memory_tool import MemoryStore
+
+        memories_dir = tmp_path / "memories"
+        memories_dir.mkdir()
+
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "memory"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"memory": {"memory_enabled": True, "user_profile_enabled": True}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="savana",
+            )
+            agent.client = MagicMock()
+            store = MemoryStore()
+            monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: memories_dir)
+            store.load_from_disk()
+            agent._memory_store = store
+            agent._memory_enabled = True
+            agent._user_profile_enabled = True
+            prompt = agent._build_system_prompt()
+
+        assert "角色连续性记忆" not in prompt
+
     def test_no_memory_guidance_without_tool(self, agent):
         from agent.prompt_builder import MEMORY_GUIDANCE
 

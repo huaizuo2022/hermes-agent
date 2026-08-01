@@ -160,6 +160,7 @@ def _load_companion_memory_snapshots(profile_dir: str) -> Dict[str, str]:
     return {
         "memory": _read_text_if_exists(memories_dir / "MEMORY.md"),
         "user": _read_text_if_exists(memories_dir / "USER.md"),
+        "continuity": _read_text_if_exists(memories_dir / "CONTINUITY.md"),
     }
 
 
@@ -239,6 +240,7 @@ def _log_companion_prompt_diagnostics(
     soul_text: str,
     memory_text: str,
     user_profile_text: str,
+    continuity_text: str,
     session_stats: Dict[str, Any],
 ) -> None:
     history_user_messages = 0
@@ -279,6 +281,7 @@ def _log_companion_prompt_diagnostics(
         "soul_sections": _build_soul_section_stats(soul_text),
         "memory_chars": _safe_char_len(memory_text),
         "user_profile_chars": _safe_char_len(user_profile_text),
+        "continuity_chars": _safe_char_len(continuity_text),
         "profile_name": str(character_profile.get("name") or ""),
         "profile_personality_chars": _safe_char_len(character_profile.get("personality") or ""),
         "profile_background_chars": _safe_char_len(character_profile.get("background") or ""),
@@ -807,12 +810,14 @@ def _build_style_guard_system_prompt(
     soul_text: str,
     memory_text: str,
     user_profile_text: str,
+    continuity_text: str,
     companion_directives: Optional[str],
 ) -> str:
     prompt = build_companion_system_prompt(
         soul_text,
         memory_text,
         user_profile_text,
+        continuity_text,
     )
     directives_text = str(companion_directives or "").strip()
     if not directives_text:
@@ -1562,6 +1567,7 @@ async def chat_endpoint(req: ChatRequest):
                 soul_text,
                 memory_snapshots.get("memory", ""),
                 memory_snapshots.get("user", ""),
+                memory_snapshots.get("continuity", ""),
                 req.companion_directives,
             )
             agent._cached_system_prompt = agent._system_prompt_override
@@ -1615,6 +1621,7 @@ async def chat_endpoint(req: ChatRequest):
                 soul_text=soul_text,
                 memory_text=memory_snapshots.get("memory", ""),
                 user_profile_text=memory_snapshots.get("user", ""),
+                continuity_text=memory_snapshots.get("continuity", ""),
                 session_stats=session_stats,
             )
 

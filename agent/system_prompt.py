@@ -288,6 +288,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             user_block = agent._memory_store.format_for_system_prompt("user")
             if user_block:
                 volatile_parts.append(user_block)
+            continuity_block = agent._memory_store.format_for_system_prompt("continuity")
+            if continuity_block and getattr(agent, "platform", "") == "savana":
+                volatile_parts.append(continuity_block)
 
     # External memory provider system prompt block (additive to built-in)
     if agent._memory_manager:
