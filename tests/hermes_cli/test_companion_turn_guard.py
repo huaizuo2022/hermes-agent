@@ -155,6 +155,30 @@ def test_assistant_sha256_matches_standard():
     assert assistant_sha256("hello") == hashlib.sha256(b"hello").hexdigest()
 
 
+def test_review_turn_accepts_response_object(tmp_path):
+    class Message(object):
+        content = _marked(_valid_result(assistant_text="她轻声回应。"))
+
+    class Choice(object):
+        message = Message()
+
+    class Response(object):
+        choices = [Choice()]
+
+    review = review_turn(
+        profile_dir=_profile_dir(tmp_path),
+        turn_id="turn-1",
+        assistant_text="她轻声回应。",
+        user_message="抱抱我。",
+        messages=[{"role": "user", "content": "抱抱我。"}],
+        provider="openai",
+        model="gpt-test",
+        memory_store=DummyMemoryStore(),
+        call_llm_fn=lambda **kwargs: Response(),
+    )
+    assert review["review_status"] == "drift"
+
+
 def test_review_turn_accepts_plain_or_fenced_json(tmp_path):
     for index, raw_output in enumerate(
         [

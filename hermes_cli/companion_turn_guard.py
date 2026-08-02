@@ -776,6 +776,11 @@ def validate_review_result(
 
 
 def _extract_review_payload(raw_output):
+    if not isinstance(raw_output, str):
+        try:
+            raw_output = raw_output.choices[0].message.content
+        except (AttributeError, TypeError, IndexError):
+            pass
     raw_text = str(raw_output or "").strip()
     matches = list(_RESULT_RE.finditer(raw_text))
     if matches:
