@@ -278,7 +278,6 @@ Environment="SAVANA_WECHAT_BRIDGE_SECRET=${WECHAT_BRIDGE_SECRET}"
 ExecStart=/var/www/hermes-agent/venv/bin/python -m uvicorn hermes_cli.web_server:app --port 8009 --host 127.0.0.1 --workers 1
 Restart=always
 RestartSec=2
-WatchdogSec=30
 
 [Install]
 WantedBy=multi-user.target
