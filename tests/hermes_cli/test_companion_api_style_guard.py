@@ -586,7 +586,6 @@ def test_style_guard_drift_replays_summary_but_keeps_raw_history(monkeypatch, tm
                     "style_reason": "drift",
                     "continuity_summary": "她答应会留下，继续把剧情说完。",
                     "memory_operations": [],
-                "continuity_operations": [],
                     "continuity_operations": [],
                     "self_review": {
                         "fits_character_and_scene": "pass",
@@ -751,7 +750,6 @@ def test_style_guard_restores_unresolved_turns_in_background(monkeypatch, tmp_pa
                     "style_reason": "restored",
                     "continuity_summary": "她答应会留下，继续把剧情说完。",
                     "memory_operations": [],
-                "continuity_operations": [],
                     "continuity_operations": [],
                     "self_review": {
                         "fits_character_and_scene": "pass",
