@@ -219,7 +219,10 @@ def test_companion_user_memory_behavior_remains_user_only(monkeypatch, tmp_path)
 
     response = TestClient(app).post("/companion/v1/chat", json=_payload("msg-user-only", "继续吧"))
 
+    user_md = (memories_dir / "USER.md").read_text(encoding="utf-8")
     assert response.status_code == 200
+    assert user_md == "用户喜欢深夜调试"
+    assert CONTINUITY_FACT not in user_md
     assert "用户喜欢深夜调试" in captures["overrides"][0]
     assert CONTINUITY_FACT in captures["overrides"][0]
     assert captures["tool_descriptions"][0].startswith(MEMORY_TOOL_DESCRIPTION)
