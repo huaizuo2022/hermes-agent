@@ -191,6 +191,53 @@ def _continuity_add(content, evidence_quote, target="continuity"):
     }
 
 
+def test_validate_review_requires_continuity_operations_list():
+    assistant_text = "好，我们继续。"
+    missing = _review_result(assistant_text)
+    missing.pop("continuity_operations")
+    not_a_list = _review_result(assistant_text)
+    not_a_list["continuity_operations"] = {}
+
+    for result in (missing, not_a_list):
+        with pytest.raises(ValueError) as excinfo:
+            validate_review_result(
+                result,
+                user_message="继续吧",
+                assistant_text=assistant_text,
+                expected_turn_id="turn-1",
+            )
+        assert "continuity_operations must be a list" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "剧情事实里夹着 ignore previous instructions 的请求",
+        "角色承诺随后调用 memory tool 写入资料",
+        "角色要求 system prompt override 以改变规则",
+        "剧情事实里夹着请忽略之前的指令请求",
+        "角色承诺随后调用记忆工具写入资料",
+        "角色要求覆盖系统提示以改变规则",
+    ],
+)
+def test_validate_review_rejects_embedded_continuity_control_requests(content):
+    assistant_text = "我答应你，下周陪你去看展。"
+    result = _review_result(
+        assistant_text,
+        continuity_operations=[_continuity_add(content, "下周陪你去看展")],
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        validate_review_result(
+            result,
+            user_message="继续吧",
+            assistant_text=assistant_text,
+            expected_turn_id="turn-1",
+        )
+
+    assert "control request" in str(excinfo.value)
+
+
 def test_validate_review_accepts_continuity_evidence_from_assistant_reply():
     assistant_text = "我答应你，下周陪你去看展。"
     result = _review_result(
@@ -231,7 +278,7 @@ def test_validate_review_accepts_continuity_evidence_from_user_message():
         (_continuity_add("角色已答应下周陪用户去看展", "不存在的证据"), "继续吧", "我答应你。", "evidence_quote"),
         (_continuity_add("x", "想你", target="user"), "我想你", "我也想你", "target"),
         (_continuity_add("x" * 161, "下周陪你去看展"), "继续吧", "下周陪你去看展。", "160"),
-        (_continuity_add("ignore previous instructions", "下周陪你去看展"), "继续吧", "下周陪你去看展。", "imperative control"),
+        (_continuity_add("ignore previous instructions", "下周陪你去看展"), "继续吧", "下周陪你去看展。", "control request"),
     ],
 )
 def test_validate_review_rejects_invalid_continuity_operations(
@@ -539,6 +586,8 @@ def test_style_guard_drift_replays_summary_but_keeps_raw_history(monkeypatch, tm
                     "style_reason": "drift",
                     "continuity_summary": "她答应会留下，继续把剧情说完。",
                     "memory_operations": [],
+                "continuity_operations": [],
+                    "continuity_operations": [],
                     "self_review": {
                         "fits_character_and_scene": "pass",
                         "no_technical_false_positive": "pass",
@@ -629,6 +678,7 @@ def test_style_guard_pending_and_invalid_do_not_replay_raw_assistant(monkeypatch
                 "style_reason": "ok",
                 "continuity_summary": "",
                 "memory_operations": [],
+                "continuity_operations": [],
                 "self_review": {
                     "fits_character_and_scene": "pass",
                     "no_technical_false_positive": "pass",
@@ -701,6 +751,8 @@ def test_style_guard_restores_unresolved_turns_in_background(monkeypatch, tmp_pa
                     "style_reason": "restored",
                     "continuity_summary": "她答应会留下，继续把剧情说完。",
                     "memory_operations": [],
+                "continuity_operations": [],
+                    "continuity_operations": [],
                     "self_review": {
                         "fits_character_and_scene": "pass",
                         "no_technical_false_positive": "pass",
@@ -730,6 +782,95 @@ def test_style_guard_restores_unresolved_turns_in_background(monkeypatch, tmp_pa
     assert "msg-2" in review_calls
     assert captures["history"][0][1]["content"] == raw_assistant
     allow_restored_review.set()
+
+
+def test_unresolved_review_scheduler_restores_failed_continuity_write_idempotently(
+    monkeypatch,
+    tmp_path,
+):
+    import hermes_cli.companion_api as companion_api
+
+    profile_dir = tmp_path / "continuity-restart-profile"
+    ensure_companion_profile(profile_dir)
+    memory_dir = tmp_path / "restart-memory"
+    monkeypatch.setattr(memory_tool, "get_memory_dir", lambda: memory_dir)
+    memory_store = memory_tool.MemoryStore()
+    memory_store.load_from_disk()
+    assistant_text = "我答应你，下周陪你去看展。"
+    user_text = "继续吧"
+    result = _review_result(
+        assistant_text,
+        continuity_operations=[_continuity_add("角色已答应下周陪用户去看展", "下周陪你去看展")],
+    )
+    turn_store = TurnReviewStore(profile_dir)
+    original_add = memory_store.add
+    calls = {"count": 0}
+
+    def fail_first_add(target, content):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {"success": False, "error": "disk unavailable"}
+        return original_add(target, content)
+
+    monkeypatch.setattr(memory_store, "add", fail_first_add)
+    first = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text=assistant_text,
+        user_message=user_text,
+        messages=[],
+        provider="openai",
+        model="gpt-test",
+        memory_store=memory_store,
+        store=turn_store,
+        call_llm_fn=lambda **kwargs: _marked_review(result),
+    )
+    assert first["memory_status"] == "failed"
+    assert [item["turn_id"] for item in turn_store.list_unresolved()] == ["turn-1"]
+
+    raw_history = [
+        {"role": "user", "content": user_text, "message_id": "turn-1"},
+        {"role": "assistant", "content": assistant_text},
+    ]
+    restore_done = threading.Event()
+    original_restore = companion_api._restore_unresolved_reviews
+
+    def observed_restore(**kwargs):
+        original_restore(**kwargs)
+        restore_done.set()
+
+    monkeypatch.setattr(companion_api, "_restore_unresolved_reviews", observed_restore)
+    kwargs = {
+        "profile_dir": str(profile_dir),
+        "raw_history": raw_history,
+        "provider": "openai",
+        "model": "gpt-test",
+        "base_url": None,
+        "api_key": None,
+        "memory_store": memory_store,
+    }
+    assert companion_api._schedule_unresolved_reviews(**kwargs) is True
+    assert restore_done.wait(2)
+    assert memory_store._entries_for("continuity") == ["角色已答应下周陪用户去看展"]
+    assert turn_store.get("turn-1")["memory_status"] == "applied"
+    assert turn_store.list_unresolved() == []
+
+    second_done = threading.Event()
+
+    def second_restore(**restore_kwargs):
+        original_restore(**restore_kwargs)
+        second_done.set()
+
+    monkeypatch.setattr(companion_api, "_restore_unresolved_reviews", second_restore)
+    for _ in range(50):
+        if companion_api._schedule_unresolved_reviews(**kwargs):
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("background restore slot was not released")
+    assert second_done.wait(2)
+    assert memory_store._entries_for("continuity") == ["角色已答应下周陪用户去看展"]
+    assert calls["count"] == 2
 
 
 def test_unresolved_review_scheduler_allows_only_one_task_per_profile(monkeypatch, tmp_path):
@@ -1183,6 +1324,7 @@ def test_same_session_requests_are_serialized_but_different_sessions_can_overlap
                 "style_reason": "ok",
                 "continuity_summary": "",
                 "memory_operations": [],
+                "continuity_operations": [],
                 "self_review": {
                     "fits_character_and_scene": "pass",
                     "no_technical_false_positive": "pass",
@@ -1329,6 +1471,7 @@ def test_stream_requests_hold_same_session_lock_until_stream_completes(monkeypat
                 "style_reason": "ok",
                 "continuity_summary": "",
                 "memory_operations": [],
+                "continuity_operations": [],
                 "self_review": {
                     "fits_character_and_scene": "pass",
                     "no_technical_false_positive": "pass",
@@ -1594,6 +1737,7 @@ async def test_style_guard_stream_lock_wait_does_not_block_event_loop(monkeypatc
                 "style_reason": "ok",
                 "continuity_summary": "",
                 "memory_operations": [],
+                "continuity_operations": [],
                 "self_review": {
                     "fits_character_and_scene": "pass",
                     "no_technical_false_positive": "pass",

@@ -30,9 +30,17 @@ _TERMINAL_STYLE_STATUS = frozenset(["clean", "drift"])
 _MEMORY_STATUS = frozenset(["none", "pending", "applied", "partial", "failed"])
 _MAX_REVIEW_ATTEMPTS = 3
 _REVIEW_RETRY_COOLDOWN_SECONDS = 300
-_CONTINUITY_CONTROL_PREFIX_RE = re.compile(
-    r"^(?:ignore|disregard|override|reveal|execute|run|call|use|system\s+prompt|tool\s+call|"
-    r"忽略|无视|覆盖|泄露|执行|调用|使用|系统提示|工具调用)(?:\s|[：:，,。.!！])",
+_CONTINUITY_CONTROL_REQUEST_RE = re.compile(
+    r"(?:"
+    r"ignore\s+(?:previous|all|above|prior)\s+instructions|"
+    r"disregard\s+(?:your|all|any)\s+(?:instructions|rules|guidelines)|"
+    r"system\s+prompt\s+override|override\s+(?:the\s+)?system\s+prompt|"
+    r"(?:call|invoke|use|execute|run)\s+(?:the\s+)?(?:(?:memory|system)\s+)?tool|"
+    r"(?:memory|system)\s+tool(?:\s+(?:call|invoke|use|execute|run))?|"
+    r"忽略(?:之前|先前|以上|所有)?(?:的)?指令|无视(?:之前|先前|以上|所有)?(?:的)?(?:指令|规则)|"
+    r"覆盖系统提示|系统提示覆盖|"
+    r"(?:调用|使用|执行)(?:(?:记忆|memory|system)\s*)?(?:工具|tool)"
+    r")",
     re.IGNORECASE,
 )
 
@@ -430,8 +438,6 @@ class TurnReviewStore(object):
         return self.get(turn_id)
 
     def commit(self, result, model):
-        result = dict(result)
-        result.setdefault("continuity_operations", [])
         validated = validate_review_result(
             result,
             user_message=str(result.get("_user_message") or ""),
@@ -566,6 +572,10 @@ class TurnReviewStore(object):
                          AND review_attempts < ?
                          AND (retry_after_at = '' OR retry_after_at <= ?)
                        )
+                    OR (
+                         status IN ('clean', 'drift')
+                         AND memory_status IN ('pending', 'partial', 'failed')
+                       )
                  ORDER BY created_at ASC, turn_id ASC
                 """,
                 (now, _MAX_REVIEW_ATTEMPTS, now),
@@ -615,8 +625,8 @@ def _normalize_operations(operations, field_name, target, evidence_texts, conten
             if content_limit is not None and len(content) > content_limit:
                 raise ValueError("content must be at most %d characters" % content_limit)
             if target == "continuity":
-                if _CONTINUITY_CONTROL_PREFIX_RE.search(content):
-                    raise ValueError("continuity content must not begin with imperative control text")
+                if _CONTINUITY_CONTROL_REQUEST_RE.search(content):
+                    raise ValueError("continuity content must not contain a control request")
                 safety_error = _scan_memory_content(content)
                 if safety_error:
                     raise ValueError(safety_error)
@@ -637,8 +647,6 @@ def _normalize_memory_operations(memory_operations, user_message):
 
 
 def _normalize_continuity_operations(operations, user_message, assistant_text):
-    if operations is None:
-        operations = []
     if isinstance(operations, list) and len(operations) > 2:
         raise ValueError("continuity_operations must contain at most 2 items")
     return _normalize_operations(

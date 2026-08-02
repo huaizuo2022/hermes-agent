@@ -40,6 +40,7 @@ def _valid_result(turn_id="turn-1", assistant_text="她轻轻握住你的手。"
         "style_reason": "保持角色口吻并承接场景。",
         "continuity_summary": summary,
         "memory_operations": [],
+        "continuity_operations": [],
         "self_review": {
             "fits_character_and_scene": "pass",
             "no_technical_false_positive": "pass",
@@ -200,6 +201,7 @@ def test_begin_is_idempotent_for_same_hash_and_replaces_pending_for_new_hash(tmp
             "style_reason": "ok",
             "continuity_summary": "",
             "memory_operations": [],
+        "continuity_operations": [],
             "self_review": {
                 "fits_character_and_scene": "pass",
                 "no_technical_false_positive": "pass",
@@ -502,6 +504,7 @@ def test_build_guarded_history_rewrites_only_guarded_assistant_turns(tmp_path):
             "style_reason": "ok",
             "continuity_summary": "",
             "memory_operations": [],
+        "continuity_operations": [],
             "self_review": {
                 "fits_character_and_scene": "pass",
                 "no_technical_false_positive": "pass",
