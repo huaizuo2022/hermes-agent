@@ -30,6 +30,8 @@ _TERMINAL_STYLE_STATUS = frozenset(["clean", "drift"])
 _MEMORY_STATUS = frozenset(["none", "pending", "applied", "partial", "failed"])
 _MAX_REVIEW_ATTEMPTS = 3
 _REVIEW_RETRY_COOLDOWN_SECONDS = 300
+_MAX_MEMORY_OPERATION_ATTEMPTS = 3
+_MEMORY_OPERATION_RETRY_COOLDOWN_SECONDS = 300
 _CONTINUITY_CONTROL_REQUEST_RE = re.compile(
     r"(?:"
     r"ignore\s+(?:previous|all|above|prior)\s+instructions|"
@@ -159,6 +161,8 @@ class TurnReviewStore(object):
                         operation_json TEXT NOT NULL DEFAULT '',
                         status TEXT NOT NULL,
                         result_json TEXT NOT NULL DEFAULT '',
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        retry_after_at TEXT NOT NULL DEFAULT '',
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
                         PRIMARY KEY (turn_id, assistant_sha256, operation_index)
@@ -176,6 +180,18 @@ class TurnReviewStore(object):
                 if "retry_after_at" not in columns:
                     conn.execute(
                         "ALTER TABLE turn_reviews ADD COLUMN retry_after_at TEXT NOT NULL DEFAULT ''"
+                    )
+                operation_columns = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(memory_operations)").fetchall()
+                }
+                if "attempts" not in operation_columns:
+                    conn.execute(
+                        "ALTER TABLE memory_operations ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "retry_after_at" not in operation_columns:
+                    conn.execute(
+                        "ALTER TABLE memory_operations ADD COLUMN retry_after_at TEXT NOT NULL DEFAULT ''"
                     )
             finally:
                 conn.close()
@@ -484,7 +500,8 @@ class TurnReviewStore(object):
         try:
             rows = conn.execute(
                 """
-                SELECT operation_index, operation_json, status, result_json
+                SELECT operation_index, operation_json, status, result_json,
+                       attempts, retry_after_at
                   FROM memory_operations
                  WHERE turn_id = ? AND assistant_sha256 = ?
                  ORDER BY operation_index ASC
@@ -501,11 +518,22 @@ class TurnReviewStore(object):
                     "operation_json": _parse_review_json(row["operation_json"]),
                     "status": row["status"],
                     "result_json": _parse_review_json(row["result_json"]),
+                    "attempts": int(row["attempts"] or 0),
+                    "retry_after_at": row["retry_after_at"],
                 }
             )
         return items
 
-    def update_memory_operation(self, turn_id, assistant_hash, operation_index, status, result_json):
+    def update_memory_operation(
+        self,
+        turn_id,
+        assistant_hash,
+        operation_index,
+        status,
+        result_json,
+        attempts=None,
+        retry_after_at=None,
+    ):
         now = _utc_now()
         with profile_lock(self.profile_dir, "companion_turn_guard_write"):
             conn = self._connect()
@@ -520,12 +548,17 @@ class TurnReviewStore(object):
                 conn.execute(
                     """
                     UPDATE memory_operations
-                       SET status = ?, result_json = ?, updated_at = ?
+                       SET status = ?, result_json = ?,
+                           attempts = COALESCE(?, attempts),
+                           retry_after_at = COALESCE(?, retry_after_at),
+                           updated_at = ?
                      WHERE turn_id = ? AND assistant_sha256 = ? AND operation_index = ?
                     """,
                     (
                         status,
                         _normalize_review_json(result_json),
+                        attempts,
+                        retry_after_at,
                         now,
                         turn_id,
                         assistant_hash,
@@ -547,7 +580,7 @@ class TurnReviewStore(object):
             statuses = [item["status"] for item in operations]
             if all(status == "applied" for status in statuses):
                 memory_status = "applied"
-            elif all(status == "failed" for status in statuses):
+            elif all(status in ("failed", "abandoned") for status in statuses):
                 memory_status = "failed"
             elif all(status == "pending" for status in statuses):
                 memory_status = "pending"
@@ -575,10 +608,19 @@ class TurnReviewStore(object):
                     OR (
                          status IN ('clean', 'drift')
                          AND memory_status IN ('pending', 'partial', 'failed')
+                         AND EXISTS (
+                             SELECT 1 FROM memory_operations AS mo
+                              WHERE mo.turn_id = turn_reviews.turn_id
+                                AND mo.assistant_sha256 = turn_reviews.assistant_sha256
+                                AND mo.status != 'applied'
+                                AND mo.status != 'abandoned'
+                                AND mo.attempts < ?
+                                AND (mo.retry_after_at = '' OR mo.retry_after_at <= ?)
+                         )
                        )
                  ORDER BY created_at ASC, turn_id ASC
                 """,
-                (now, _MAX_REVIEW_ATTEMPTS, now),
+                (now, _MAX_REVIEW_ATTEMPTS, now, _MAX_MEMORY_OPERATION_ATTEMPTS, now),
             ).fetchall()
         finally:
             conn.close()
@@ -791,6 +833,19 @@ def _memory_store_has_exact(memory_store, target, text):
     return False
 
 
+def _memory_store_matches(memory_store, target, text):
+    if not _supports_exact_lookup(memory_store):
+        return []
+    if hasattr(memory_store, "_entries_for"):
+        try:
+            return [entry for entry in list(memory_store._entries_for(target)) if text in entry]
+        except Exception:
+            return []
+    if _memory_store_has_exact(memory_store, target, text):
+        return [text]
+    return []
+
+
 def _operation_already_applied(memory_store, operation):
     if not _supports_exact_lookup(memory_store):
         return False
@@ -799,10 +854,10 @@ def _operation_already_applied(memory_store, operation):
     if action == "add":
         return _memory_store_has_exact(memory_store, target, operation["content"])
     if action == "replace":
-        has_old = _memory_store_has_exact(memory_store, target, operation["old_text"])
+        old_matches = _memory_store_matches(memory_store, target, operation["old_text"])
         has_new = _memory_store_has_exact(memory_store, target, operation["content"])
-        return has_new and not has_old
-    return not _memory_store_has_exact(memory_store, target, operation["old_text"])
+        return has_new and not old_matches
+    return not _memory_store_matches(memory_store, target, operation["old_text"])
 
 
 def _memory_call_succeeded(result):
@@ -815,14 +870,28 @@ def _execute_memory_operation(memory_store, operation):
         return memory_store.add(operation["target"], operation["content"])
     if action == "replace":
         if _supports_exact_lookup(memory_store):
-            has_old = _memory_store_has_exact(memory_store, operation["target"], operation["old_text"])
+            old_matches = _memory_store_matches(memory_store, operation["target"], operation["old_text"])
             has_new = _memory_store_has_exact(memory_store, operation["target"], operation["content"])
-            if not has_old and has_new:
+            if not old_matches and has_new:
                 return {"operation": "replace", "status": "already_applied", "content": operation["content"]}
-            if not has_old and not has_new:
+            if not old_matches and not has_new:
                 raise RuntimeError("replace target missing")
         return memory_store.replace(operation["target"], operation["old_text"], operation["content"])
     return memory_store.remove(operation["target"], operation["old_text"])
+
+
+def _record_memory_failure(turn_store, turn_id, assistant_hash, row, result, attempts):
+    status = "abandoned" if attempts >= _MAX_MEMORY_OPERATION_ATTEMPTS else "failed"
+    retry_after = ""
+    turn_store.update_memory_operation(
+        turn_id,
+        assistant_hash,
+        row["operation_index"],
+        status,
+        result,
+        attempts=attempts,
+        retry_after_at=retry_after,
+    )
 
 
 def _resume_memory_operations(
@@ -837,8 +906,23 @@ def _resume_memory_operations(
     modifications = []
     for row in ledger:
         operation = row["operation_json"]
-        if row["status"] == "applied":
+        if row["status"] in ("applied", "abandoned"):
             continue
+        attempts = int(row.get("attempts") or 0)
+        if attempts >= _MAX_MEMORY_OPERATION_ATTEMPTS:
+            continue
+        if row.get("retry_after_at") and not _retry_is_due(row["retry_after_at"]):
+            continue
+        attempts += 1
+        turn_store.update_memory_operation(
+            turn_id,
+            assistant_hash,
+            row["operation_index"],
+            "pending",
+            row.get("result_json") or {},
+            attempts=attempts,
+            retry_after_at="",
+        )
         if _operation_already_applied(memory_store, operation):
             turn_store.update_memory_operation(
                 turn_id,
@@ -846,26 +930,30 @@ def _resume_memory_operations(
                 row["operation_index"],
                 "applied",
                 {"status": "already_applied"},
+                attempts=attempts,
+                retry_after_at="",
             )
             continue
         try:
             result = _execute_memory_operation(memory_store, operation)
         except Exception as exc:
-            turn_store.update_memory_operation(
+            _record_memory_failure(
+                turn_store,
                 turn_id,
                 assistant_hash,
-                row["operation_index"],
-                "failed",
+                row,
                 {"error": str(exc)},
+                attempts,
             )
             continue
         if not _memory_call_succeeded(result):
-            turn_store.update_memory_operation(
+            _record_memory_failure(
+                turn_store,
                 turn_id,
                 assistant_hash,
-                row["operation_index"],
-                "failed",
+                row,
                 result,
+                attempts,
             )
             continue
         modifications.append(result)
@@ -886,6 +974,8 @@ def _resume_memory_operations(
             row["operation_index"],
             "applied",
             result,
+            attempts=attempts,
+            retry_after_at="",
         )
     memory_status = turn_store.refresh_memory_status(turn_id, assistant_hash)
     return modifications, memory_status

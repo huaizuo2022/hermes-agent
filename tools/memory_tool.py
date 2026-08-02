@@ -612,8 +612,13 @@ def memory_tool(
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
-    if target not in {"memory", "user", "continuity"}:
-        return tool_error(f"Invalid target '{target}'. Use 'memory', 'user', or 'continuity'.", success=False)
+    if target == "continuity":
+        return tool_error(
+            "Continuity memory is managed by the Savana style guard and cannot be written through the public memory tool.",
+            success=False,
+        )
+    if target not in {"memory", "user"}:
+        return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
     if action == "add":
         if not content:
@@ -682,8 +687,8 @@ MEMORY_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "enum": ["memory", "user", "continuity"],
-                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile, 'continuity' for long-term story facts."
+                "enum": ["memory", "user"],
+                "description": "Which memory store: 'memory' for personal notes or 'user' for user profile. Savana continuity is reviewed and written separately by the style guard."
             },
             "content": {
                 "type": "string",

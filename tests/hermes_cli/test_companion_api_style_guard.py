@@ -344,6 +344,219 @@ def test_user_memory_evidence_still_must_come_from_user_message():
     assert "user_message" in str(excinfo.value)
 
 
+def _continuity_operation(action, evidence_quote, content=None, old_text=None):
+    operation = {
+        "target": "continuity",
+        "action": action,
+        "evidence_quote": evidence_quote,
+    }
+    if content is not None:
+        operation["content"] = content
+    if old_text is not None:
+        operation["old_text"] = old_text
+    return operation
+
+
+def test_review_turn_continuity_replace_uses_old_text_substring(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "continuity-replace-profile"
+    ensure_companion_profile(profile_dir)
+    memory_dir = tmp_path / "replace-memory"
+    monkeypatch.setattr(memory_tool, "get_memory_dir", lambda: memory_dir)
+    memory_store = memory_tool.MemoryStore()
+    memory_store.load_from_disk()
+    memory_store.add("continuity", "角色答应周五晚上陪用户看展")
+    assistant_text = "改到周六，我会陪你去看展。"
+    result = _review_result(
+        assistant_text,
+        continuity_operations=[
+            _continuity_operation(
+                "replace",
+                "周六，我会陪你去看展",
+                content="角色答应周六陪用户看展",
+                old_text="周五晚上",
+            )
+        ],
+    )
+
+    review = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text=assistant_text,
+        user_message="继续吧",
+        messages=[],
+        provider="openai",
+        model="gpt-test",
+        memory_store=memory_store,
+        call_llm_fn=lambda **kwargs: _marked_review(result),
+    )
+
+    assert review["memory_status"] == "applied"
+    assert memory_store._entries_for("continuity") == ["角色答应周六陪用户看展"]
+
+
+def test_review_turn_continuity_remove_substring_recovers_after_post_write_crash(
+    monkeypatch,
+    tmp_path,
+):
+    profile_dir = tmp_path / "continuity-remove-retry-profile"
+    ensure_companion_profile(profile_dir)
+    memory_dir = tmp_path / "remove-retry-memory"
+    monkeypatch.setattr(memory_tool, "get_memory_dir", lambda: memory_dir)
+    memory_store = memory_tool.MemoryStore()
+    memory_store.load_from_disk()
+    memory_store.add("continuity", "角色曾答应周五晚上陪用户看展")
+    assistant_text = "周五的约定取消了。"
+    result = _review_result(
+        assistant_text,
+        continuity_operations=[
+            _continuity_operation("remove", "约定取消", old_text="周五晚上")
+        ],
+    )
+
+    def crash_after_write(**_kwargs):
+        raise RuntimeError("sidecar apply crash")
+
+    with pytest.raises(RuntimeError):
+        review_turn(
+            profile_dir=profile_dir,
+            turn_id="turn-1",
+            assistant_text=assistant_text,
+            user_message="继续吧",
+            messages=[],
+            provider="openai",
+            model="gpt-test",
+            memory_store=memory_store,
+            call_llm_fn=lambda **kwargs: _marked_review(result),
+            _after_memory_write_hook=crash_after_write,
+        )
+
+    reloaded = memory_tool.MemoryStore()
+    reloaded.load_from_disk()
+    retried = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text=assistant_text,
+        user_message="继续吧",
+        messages=[],
+        provider="openai",
+        model="gpt-test",
+        memory_store=reloaded,
+        call_llm_fn=lambda **kwargs: (_ for _ in ()).throw(AssertionError("review should not rerun")),
+    )
+
+    assert retried["memory_status"] == "applied"
+    assert reloaded._entries_for("continuity") == []
+
+
+def test_review_turn_continuity_partial_success_retries_only_failed_substring_operation(
+    monkeypatch,
+    tmp_path,
+):
+    profile_dir = tmp_path / "continuity-partial-profile"
+    ensure_companion_profile(profile_dir)
+    memory_dir = tmp_path / "partial-memory"
+    monkeypatch.setattr(memory_tool, "get_memory_dir", lambda: memory_dir)
+    memory_store = memory_tool.MemoryStore()
+    memory_store.load_from_disk()
+    memory_store.add("continuity", "角色答应周五晚上陪用户看展")
+    memory_store.add("continuity", "角色曾有电话约定")
+    assistant_text = "改到周六看展，旧电话约定取消。"
+    result = _review_result(
+        assistant_text,
+        continuity_operations=[
+            _continuity_operation(
+                "replace",
+                "周六看展",
+                content="角色答应周六陪用户看展",
+                old_text="周五晚上",
+            ),
+            _continuity_operation("remove", "电话约定取消", old_text="电话约定"),
+        ],
+    )
+    original_remove = memory_store.remove
+    remove_calls = {"count": 0}
+
+    def fail_first_remove(target, old_text):
+        remove_calls["count"] += 1
+        if remove_calls["count"] == 1:
+            return {"success": False, "error": "temporary failure"}
+        return original_remove(target, old_text)
+
+    monkeypatch.setattr(memory_store, "remove", fail_first_remove)
+
+    first = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text=assistant_text,
+        user_message="继续吧",
+        messages=[],
+        provider="openai",
+        model="gpt-test",
+        memory_store=memory_store,
+        call_llm_fn=lambda **kwargs: _marked_review(result),
+    )
+    assert first["memory_status"] == "partial"
+    monkeypatch.setattr(memory_store, "remove", original_remove)
+
+    second = review_turn(
+        profile_dir=profile_dir,
+        turn_id="turn-1",
+        assistant_text=assistant_text,
+        user_message="继续吧",
+        messages=[],
+        provider="openai",
+        model="gpt-test",
+        memory_store=memory_store,
+        call_llm_fn=lambda **kwargs: (_ for _ in ()).throw(AssertionError("review should not rerun")),
+    )
+
+    assert second["memory_status"] == "applied"
+    assert memory_store._entries_for("continuity") == ["角色答应周六陪用户看展"]
+
+
+def test_continuity_operation_stops_retrying_after_max_failures(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "continuity-permanent-failure-profile"
+    ensure_companion_profile(profile_dir)
+    memory_dir = tmp_path / "permanent-failure-memory"
+    monkeypatch.setattr(memory_tool, "get_memory_dir", lambda: memory_dir)
+    memory_store = memory_tool.MemoryStore()
+    memory_store.load_from_disk()
+    assistant_text = "我答应你，下周陪你去看展。"
+    result = _review_result(
+        assistant_text,
+        continuity_operations=[_continuity_add("角色已答应下周陪用户去看展", "下周陪你去看展")],
+    )
+    calls = []
+
+    def always_fail(target, content):
+        calls.append((target, content))
+        return {"success": False, "error": "disk unavailable"}
+
+    monkeypatch.setattr(memory_store, "add", always_fail)
+    for attempt in range(3):
+        review = review_turn(
+            profile_dir=profile_dir,
+            turn_id="turn-1",
+            assistant_text=assistant_text,
+            user_message="继续吧",
+            messages=[],
+            provider="openai",
+            model="gpt-test",
+            memory_store=memory_store,
+            call_llm_fn=(lambda **kwargs: _marked_review(result)) if attempt == 0 else (
+                lambda **kwargs: (_ for _ in ()).throw(AssertionError("review should not rerun"))
+            ),
+        )
+
+    store = TurnReviewStore(profile_dir)
+    rows = store.get_memory_operations("turn-1", assistant_sha256(assistant_text))
+    assert review["memory_status"] == "failed"
+    assert rows[0]["status"] == "abandoned"
+    assert rows[0]["attempts"] == 3
+    assert store.list_unresolved() == []
+    assert len(calls) == 3
+
+
 def test_review_turn_persists_continuity_through_durable_ledger_and_memory_store(
     monkeypatch,
     tmp_path,

@@ -283,6 +283,14 @@ class TestMemoryToolDispatcher:
         result = json.loads(memory_tool(action="add", target="invalid", content="x", store=store))
         assert result["success"] is False
 
+    def test_public_continuity_target_is_rejected(self, store):
+        result = json.loads(
+            memory_tool(action="add", target="continuity", content="角色承诺", store=store)
+        )
+        assert result["success"] is False
+        assert "style guard" in result["error"].lower()
+        assert "continuity" not in MEMORY_SCHEMA["parameters"]["properties"]["target"]["enum"]
+
     def test_unknown_action(self, store):
         result = json.loads(memory_tool(action="unknown", store=store))
         assert result["success"] is False
