@@ -776,15 +776,19 @@ def validate_review_result(
 
 
 def _extract_review_payload(raw_output):
-    raw_text = str(raw_output or "")
+    raw_text = str(raw_output or "").strip()
     matches = list(_RESULT_RE.finditer(raw_text))
-    if len(matches) != 1:
-        raise ValueError("missing structured result marker")
-    match = matches[0]
-    if raw_text.strip() != match.group(0):
-        raise ValueError("structured result must be the only non-whitespace content")
+    if matches:
+        if len(matches) != 1 or raw_text != matches[0].group(0):
+            raise ValueError("structured result must be the only non-whitespace content")
+        payload_text = matches[0].group(1)
+    else:
+        payload_text = raw_text
+        fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", payload_text, re.DOTALL | re.IGNORECASE)
+        if fenced:
+            payload_text = fenced.group(1)
     try:
-        parsed = json.loads(match.group(1))
+        parsed = json.loads(payload_text)
     except Exception as exc:
         raise ValueError("invalid structured result json: %s" % exc)
     if not isinstance(parsed, dict):
