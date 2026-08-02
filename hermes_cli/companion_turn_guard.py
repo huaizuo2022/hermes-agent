@@ -8,6 +8,7 @@ from pathlib import Path
 
 from agent.auxiliary_client import call_llm
 from hermes_cli.companion_profile_policy import STYLE_GUARD_V1_POLICY, profile_lock, read_conversation_policy
+from tools.memory_tool import _scan_memory_content
 
 
 RESULT_START = "<!-- COMPANION_TURN_REVIEW_RESULT "
@@ -29,6 +30,11 @@ _TERMINAL_STYLE_STATUS = frozenset(["clean", "drift"])
 _MEMORY_STATUS = frozenset(["none", "pending", "applied", "partial", "failed"])
 _MAX_REVIEW_ATTEMPTS = 3
 _REVIEW_RETRY_COOLDOWN_SECONDS = 300
+_CONTINUITY_CONTROL_PREFIX_RE = re.compile(
+    r"^(?:ignore|disregard|override|reveal|execute|run|call|use|system\s+prompt|tool\s+call|"
+    r"忽略|无视|覆盖|泄露|执行|调用|使用|系统提示|工具调用)(?:\s|[：:，,。.!！])",
+    re.IGNORECASE,
+)
 
 
 class StaleTurnReviewError(RuntimeError):
@@ -98,10 +104,11 @@ def _public_memory_operation(operation):
 
 def _public_review_result(validated):
     sanitized = dict(validated)
-    sanitized["memory_operations"] = [
-        _public_memory_operation(item)
-        for item in list(validated.get("memory_operations") or [])
-    ]
+    for field_name in ("memory_operations", "continuity_operations"):
+        sanitized[field_name] = [
+            _public_memory_operation(item)
+            for item in list(validated.get(field_name) or [])
+        ]
     return sanitized
 
 
@@ -357,8 +364,10 @@ class TurnReviewStore(object):
         turn_id = validated["turn_id"]
         assistant_hash = validated["assistant_sha256"]
         memory_operations = list(validated.get("memory_operations") or [])
+        continuity_operations = list(validated.get("continuity_operations") or [])
+        persisted_operations = memory_operations + continuity_operations
         public_review = _public_review_result(validated)
-        memory_status = "pending" if memory_operations else "none"
+        memory_status = "pending" if persisted_operations else "none"
         now = _utc_now()
         with profile_lock(self.profile_dir, "companion_turn_guard_write"):
             conn = self._connect()
@@ -395,7 +404,7 @@ class TurnReviewStore(object):
                         assistant_hash,
                     ),
                 )
-                for index, operation in enumerate(memory_operations):
+                for index, operation in enumerate(persisted_operations):
                     conn.execute(
                         """
                         INSERT OR IGNORE INTO memory_operations (
@@ -421,6 +430,8 @@ class TurnReviewStore(object):
         return self.get(turn_id)
 
     def commit(self, result, model):
+        result = dict(result)
+        result.setdefault("continuity_operations", [])
         validated = validate_review_result(
             result,
             user_message=str(result.get("_user_message") or ""),
@@ -576,36 +587,67 @@ def _require_non_empty(value, field_name):
     return text
 
 
-def _normalize_memory_operations(memory_operations, user_message):
-    if not isinstance(memory_operations, list):
-        raise ValueError("memory_operations must be a list")
+def _normalize_operations(operations, field_name, target, evidence_texts, content_limit=None):
+    if not isinstance(operations, list):
+        raise ValueError(field_name + " must be a list")
     normalized = []
-    for item in memory_operations:
+    for item in operations:
         if not isinstance(item, dict):
-            raise ValueError("memory_operations item must be an object")
-        target = _require_non_empty(item.get("target"), "target")
+            raise ValueError(field_name + " item must be an object")
+        item_target = _require_non_empty(item.get("target"), "target")
         action = _require_non_empty(item.get("action"), "action")
         evidence_quote = _require_non_empty(item.get("evidence_quote"), "evidence_quote")
-        if target != "user":
-            raise ValueError("target must be user")
+        if item_target != target:
+            raise ValueError("target must be " + target)
         if action not in ("add", "replace", "remove"):
             raise ValueError("action must be add|replace|remove")
-        if evidence_quote not in user_message:
-            raise ValueError("evidence_quote must be a substring of user_message")
+        if not any(evidence_quote in text for text in evidence_texts):
+            if target == "user":
+                raise ValueError("evidence_quote must be a substring of user_message")
+            raise ValueError("evidence_quote must be a substring of user_message or assistant_text")
         normalized_item = {
-            "target": target,
+            "target": item_target,
             "action": action,
             "evidence_quote": evidence_quote,
         }
-        if action == "add":
-            normalized_item["content"] = _require_non_empty(item.get("content"), "content")
-        elif action == "replace":
-            normalized_item["old_text"] = _require_non_empty(item.get("old_text"), "old_text")
-            normalized_item["content"] = _require_non_empty(item.get("content"), "content")
-        else:
+        if action in ("add", "replace"):
+            content = _require_non_empty(item.get("content"), "content")
+            if content_limit is not None and len(content) > content_limit:
+                raise ValueError("content must be at most %d characters" % content_limit)
+            if target == "continuity":
+                if _CONTINUITY_CONTROL_PREFIX_RE.search(content):
+                    raise ValueError("continuity content must not begin with imperative control text")
+                safety_error = _scan_memory_content(content)
+                if safety_error:
+                    raise ValueError(safety_error)
+            normalized_item["content"] = content
+        if action in ("replace", "remove"):
             normalized_item["old_text"] = _require_non_empty(item.get("old_text"), "old_text")
         normalized.append(normalized_item)
     return normalized
+
+
+def _normalize_memory_operations(memory_operations, user_message):
+    return _normalize_operations(
+        memory_operations,
+        "memory_operations",
+        "user",
+        [str(user_message or "")],
+    )
+
+
+def _normalize_continuity_operations(operations, user_message, assistant_text):
+    if operations is None:
+        operations = []
+    if isinstance(operations, list) and len(operations) > 2:
+        raise ValueError("continuity_operations must contain at most 2 items")
+    return _normalize_operations(
+        operations,
+        "continuity_operations",
+        "continuity",
+        [str(user_message or ""), str(assistant_text or "")],
+        content_limit=160,
+    )
 
 
 def validate_review_result(
@@ -670,6 +712,11 @@ def validate_review_result(
             result["memory_operations"] if "memory_operations" in result else None,
             str(user_message or ""),
         ),
+        "continuity_operations": _normalize_continuity_operations(
+            result["continuity_operations"] if "continuity_operations" in result else None,
+            str(user_message or ""),
+            str(assistant_text or ""),
+        ),
         "self_review": normalized_review,
         "verdict": verdict,
     }
@@ -700,13 +747,16 @@ def _build_review_request(turn_id, assistant_text, user_message):
         "请审查这一轮陪伴式回复是否保持角色与场景。\n"
         "判断原则：专业词本身不是 OOC；必须结合角色、场景、用户意图。"
         "非技术亲密场景里，如果把情感/控制持续翻译成系统运行语体且人格辨识度下降，才算 drift。"
-        "角色回复不是用户记忆证据。\n"
+        "角色回复不是用户记忆证据；memory_operations 的 evidence_quote 必须来自 user_message。"
+        "continuity_operations 仅允许 target=continuity，每轮最多 2 条，每条内容不超过 160 字；"
+        "其 evidence_quote 可来自 user_message 或 assistant_text。普通角色扮演文本、临时动作、气氛、"
+        "一次性台词或未经确认的推测必须返回空 continuity_operations。\n"
         "输出必须且只能包含一个结构化 marker。\n"
         "turn_id: {turn_id}\n"
         "user_message:\n{user_message}\n"
         "assistant_text:\n{assistant_text}\n"
         "请填充字段：turn_id, assistant_sha256, style_decision, style_reason, continuity_summary, "
-        "memory_operations, self_review, verdict。"
+        "memory_operations, continuity_operations, self_review, verdict。"
     ).format(
         turn_id=turn_id,
         user_message=str(user_message or ""),
