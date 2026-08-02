@@ -778,7 +778,8 @@ def validate_review_result(
 def _extract_review_payload(raw_output):
     if not isinstance(raw_output, str):
         try:
-            raw_output = raw_output.choices[0].message.content
+            message = raw_output.choices[0].message
+            raw_output = message.content or getattr(message, "reasoning_content", None)
         except (AttributeError, TypeError, IndexError):
             pass
     raw_text = str(raw_output or "").strip()
