@@ -27,6 +27,7 @@ def test_log_companion_prompt_diagnostics_emits_breakdown(caplog):
         soul_text="# Identity\nhello\n## Evolved Persona\n更克制，也更警惕。\n## Notes\nkeep distance",
         memory_text="memory block",
         user_profile_text="user block",
+        continuity_text="continuity block",
         session_stats={
             "message_count": 12,
             "input_tokens": 3456,

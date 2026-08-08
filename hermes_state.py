@@ -2032,6 +2032,28 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def update_message_content(
+        self,
+        session_id: str,
+        platform_message_id: str,
+        content: str,
+    ) -> bool:
+        """Update a single message's content by platform_message_id.
+
+        Returns True if a row was updated, False if no message matched.
+        Backs the PUT /sessions/{id}/messages/{mid} companion edit endpoint.
+        """
+        stored_content = self._encode_content(content)
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET content = ? WHERE session_id = ? AND platform_message_id = ?",
+                (stored_content, session_id, platform_message_id),
+            )
+            return cursor.rowcount > 0
+
+        return self._execute_write(_do)
+
     def replace_messages(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Atomically replace every message for a session.
 
