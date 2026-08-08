@@ -1473,7 +1473,11 @@ async def chat_endpoint(req: ChatRequest):
         )
     ensure_companion_profile(profile_path)
     conversation_policy = read_conversation_policy(profile_dir)
-    style_guard_enabled = conversation_policy == STYLE_GUARD_V1_POLICY
+    # turn guard review 实测全局 0% 成功率（deepseek-v4-flash thinking 模式吃光
+    # max_tokens 致 content 恒空），17034 轮纯空转、浪费 ~43000 次辅助 LLM 调用。
+    # 已停用：所有会话回归主 AI 自管 memory 路径（主 AI 携带 memory tool 自行写入）。
+    # 如需恢复，删除下面这行即可。
+    style_guard_enabled = False
     session_lock = None
     if style_guard_enabled:
         session_lock = _get_session_lock(session_id)

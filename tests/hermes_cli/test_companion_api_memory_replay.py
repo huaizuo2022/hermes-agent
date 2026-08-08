@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from starlette.testclient import TestClient
 
 from hermes_cli.web_server import app
@@ -105,6 +106,7 @@ def test_style_guard_memory_snapshots_include_continuity(monkeypatch, tmp_path):
         "user": "用户叫小鱼",
         "continuity": "角色已答应下周陪用户去看展",
     }
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_style_guard_system_prompt_includes_continuity_block(monkeypatch, tmp_path):
@@ -166,6 +168,7 @@ def test_style_guard_system_prompt_includes_continuity_block(monkeypatch, tmp_pa
     assert response.status_code == 200
     assert "角色连续性记忆" in captures["override"]
     assert "角色已答应下周陪用户去看展" in captures["override"]
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 
@@ -230,6 +233,7 @@ def test_style_guard_empty_continuity_snapshot_does_not_inject(monkeypatch, tmp_
     assert "CONTINUITY" not in captures["override"]
     assert "已有长期记忆" in captures["override"]
     assert "用户叫小鱼" in captures["override"]
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_style_guard_non_savana_keeps_memory_and_user_but_skips_continuity(monkeypatch, tmp_path):

@@ -698,6 +698,7 @@ def test_legacy_profile_keeps_memory_tools_and_directives_without_sidecar(monkey
     assert "review_status" not in response.json()
     assert "memory_status" not in response.json()
     assert not (profile_dir / "companion_guard.db").exists()
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_style_guard_profile_uses_companion_prompt_override_without_memory_tools(monkeypatch, tmp_path):
@@ -730,6 +731,7 @@ def test_style_guard_profile_uses_companion_prompt_override_without_memory_tools
     agent = object.__new__(AIAgent)
     agent._system_prompt_override = captures["overrides"][0]
     assert "natural companion directives" in agent._build_system_prompt()
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_style_guard_stream_emits_multiple_tokens_before_review(monkeypatch, tmp_path):
@@ -778,6 +780,7 @@ def test_style_guard_stream_emits_multiple_tokens_before_review(monkeypatch, tmp
     assert events.count("yield:token") == 3
     assert "yield:metadata" in events
     assert "review_started" in events
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_style_guard_drift_replays_summary_but_keeps_raw_history(monkeypatch, tmp_path):
@@ -918,6 +921,7 @@ def test_style_guard_pending_and_invalid_do_not_replay_raw_assistant(monkeypatch
     assert response.status_code == 200
     history = captures["history"][0]
     assert history[1]["content"] == raw_assistant
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_style_guard_restores_unresolved_turns_in_background(monkeypatch, tmp_path):
@@ -1155,6 +1159,7 @@ def test_unresolved_review_scheduler_releases_slot_after_failure(monkeypatch, tm
         pytest.fail("background review slot was not released after failure")
     assert restarted.wait(2)
     assert len(calls) == 2
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_style_guard_nonstream_metadata_includes_review_and_memory_status(monkeypatch, tmp_path):
@@ -1241,6 +1246,7 @@ def test_existing_profile_ignores_new_profile_gate(monkeypatch, tmp_path):
 
     assert response.status_code == 200
     assert captures["init_kwargs"][0]["enabled_toolsets"] == ["memory"]
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_review_failure_keeps_raw_state_but_marks_turn_pending(monkeypatch, tmp_path):
@@ -1274,6 +1280,7 @@ def test_review_failure_keeps_raw_state_but_marks_turn_pending(monkeypatch, tmp_
 
     assert response2.status_code == 200
     assert captures["history"][1][1]["content"] == "reply to 第一句"
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_review_failure_resets_existing_terminal_record_to_pending(monkeypatch, tmp_path):
@@ -1307,6 +1314,7 @@ def test_review_failure_resets_existing_terminal_record_to_pending(monkeypatch, 
     assert response.status_code == 200
     assert response.json()["review_status"] == "pending"
     assert store.get("msg-1")["status"] == "pending"
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_style_guard_logs_only_hashed_structured_metadata(monkeypatch, tmp_path, caplog):
@@ -1406,6 +1414,7 @@ def test_legacy_stream_error_still_emits_base_metadata(monkeypatch, tmp_path):
     assert '"memory_modifications": [{"kind": "legacy-memory"}]' in body
     assert '"review_status"' not in body
     assert '"memory_status"' not in body
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_style_guard_prompt_cache_overrides_stored_system_prompt_each_turn(monkeypatch, tmp_path):
@@ -1467,6 +1476,7 @@ def test_style_guard_prompt_cache_overrides_stored_system_prompt_each_turn(monke
     assert "OLD SYSTEM PROMPT" not in captured_prompts[1]
     assert "legacy directives" not in captured_prompts[0]
     assert "legacy directives" not in captured_prompts[1]
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_same_session_requests_are_serialized_but_different_sessions_can_overlap(monkeypatch, tmp_path):
@@ -1609,6 +1619,7 @@ def test_same_session_requests_are_serialized_but_different_sessions_can_overlap
     thread_c.join()
     thread_d.join()
     assert [resp.status_code for resp in different_results] == [200, 200]
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_stream_requests_hold_same_session_lock_until_stream_completes(monkeypatch, tmp_path):
@@ -1768,6 +1779,7 @@ def test_style_guard_does_not_touch_session_lock_for_legacy(monkeypatch, tmp_pat
     )
 
     assert response.status_code == 200
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_style_guard_stream_counting_lock_releases_on_success_and_disconnect(monkeypatch, tmp_path):
@@ -1849,6 +1861,7 @@ def test_style_guard_stream_counting_lock_releases_on_success_and_disconnect(mon
 
     assert counting_lock.acquire_count == 2
     assert counting_lock.release_count == 2
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_style_guard_stream_counting_lock_releases_when_thread_start_fails(monkeypatch, tmp_path):
@@ -1872,6 +1885,7 @@ def test_style_guard_stream_counting_lock_releases_when_thread_start_fails(monke
     assert response.status_code == 500
     assert counting_lock.acquire_count == 1
     assert counting_lock.release_count == 1
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 @pytest.mark.asyncio
@@ -2017,6 +2031,7 @@ async def test_style_guard_stream_lock_wait_does_not_block_event_loop(monkeypatc
     assert result4[0] == 200
     stop_heartbeat.set()
     await hb_task
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 @pytest.mark.asyncio
@@ -2061,6 +2076,7 @@ async def test_style_guard_cancelled_lock_wait_releases_orphan_acquire(monkeypat
     assert follow_up.status_code == 200
     assert lock.acquire_count == 2
     assert lock.release_count == 3
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 def test_style_guard_disconnect_keeps_lock_until_slow_producer_finishes(monkeypatch, tmp_path):
@@ -2181,6 +2197,7 @@ def test_style_guard_disconnect_keeps_lock_until_slow_producer_finishes(monkeypa
     assert second_producer_entered.is_set()
     assert lock.acquire_count == 2
     assert lock.release_count == 2
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 @pytest.mark.asyncio
@@ -2301,6 +2318,7 @@ async def test_style_guard_asgi_send_start_failure_cleans_up_without_iterating_b
     assert follow_up.status_code == 200
     assert lock.acquire_count == 2
     assert lock.release_count == 2
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率），见 companion_api.py: style_guard_enabled=False")
 
 
 @pytest.mark.asyncio
