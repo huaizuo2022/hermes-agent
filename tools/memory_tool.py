@@ -612,13 +612,8 @@ def memory_tool(
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
-    if target == "continuity":
-        return tool_error(
-            "Continuity memory is managed by the Savana style guard and cannot be written through the public memory tool.",
-            success=False,
-        )
-    if target not in {"memory", "user"}:
-        return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+    if target not in {"memory", "user", "continuity"}:
+        return tool_error(f"Invalid target '{target}'. Use 'memory', 'user', or 'continuity'.", success=False)
 
     if action == "add":
         if not content:
@@ -670,9 +665,10 @@ MEMORY_SCHEMA = {
         "state to memory; use session_search to recall those from past transcripts.\n"
         "If you've discovered a new way to do something, solved a problem that could be "
         "necessary later, save it as a skill with the skill tool.\n\n"
-        "TWO TARGETS:\n"
+        "THREE TARGETS:\n"
         "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
-        "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
+        "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n"
+        "- 'continuity': story facts, AI commitments/promises, relationship milestones\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
         "remove (delete -- old_text identifies it).\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
@@ -687,8 +683,8 @@ MEMORY_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "enum": ["memory", "user"],
-                "description": "Which memory store: 'memory' for personal notes or 'user' for user profile. Savana continuity is reviewed and written separately by the style guard."
+                "enum": ["memory", "user", "continuity"],
+                "description": "Which memory store: 'memory' for notes, 'user' for user profile, or 'continuity' for story facts, AI promises/commitments, and relationship milestones."
             },
             "content": {
                 "type": "string",

@@ -1477,7 +1477,7 @@ async def chat_endpoint(req: ChatRequest):
     # max_tokens 致 content 恒空），17034 轮纯空转、浪费 ~43000 次辅助 LLM 调用。
     # 已停用：所有会话回归主 AI 自管 memory 路径（主 AI 携带 memory tool 自行写入）。
     # 如需恢复，删除下面这行即可。
-    style_guard_enabled = False
+    style_guard_enabled = conversation_policy == STYLE_GUARD_V1_POLICY
     session_lock = None
     if style_guard_enabled:
         session_lock = _get_session_lock(session_id)
@@ -1579,17 +1579,17 @@ async def chat_endpoint(req: ChatRequest):
         # Savana 伴侣场景：覆盖 memory 工具描述为角色扮演专用中文版本
         # 原始通用描述是面向开发者的英文，DeepSeek 在角色扮演模式下无法关联到"记住用户偏好"这一触发场景
         _SAVANA_MEMORY_DESCRIPTION = (
-            "将用户的个人信息永久写入记忆，同时记录剧情核心事实与重大约定，跨会话持久保存。"
+            "将用户的个人信息永久写入记忆，同时记录剧情核心事实与角色重大承诺，跨会话持久保存。"
             "触发条件（以下情况必须立即调用，不得用台词代替）：\n"
             "1. 写入 target='user'（用户档案）：\n"
             "- 用户说\"记住\"、\"帮我记\"、\"别忘了\"等要求记忆的话\n"
             "- 用户提到自己的喜好、厌恶、口味、习惯、运动、食物偏好、称呼与性格特征\n"
             "- 用户透露职业、年龄、所在城市、作息规律等个人信息\n"
-            "2. 写入 target='memory'（剧情事实与重大约定）：\n"
-            "- 发生了重要剧情转折、核心事件、角色重大承诺与婚嫁/定亲/出行等协议与约定\n"
-            "- 涉及到对后续剧情承接至关重要的背景事实\n"
+            "2. 写入 target='continuity'（剧情事实与角色重大承诺）：\n"
+            "- 发生了重要剧情转折、核心事件、角色重大承诺与约定（如：答应下周陪用户去看展）\n"
+            "- 关系里程碑、重大误会解开或双方共同经历的重大事实\n"
             "操作规则：action='add' 新增，action='replace' 更新旧条目。"
-            "content 用简短中文写明事实，例如：'用户最喜欢的运动是攀岩'、'双方确认婚事意向，答应等角色登门提亲'。"
+            "content 用简短中文写明事实，例如：'用户最喜欢的运动是攀岩'、'角色答应下周陪用户去看展'。"
         )
         if agent.tools:
             for _tool in agent.tools:

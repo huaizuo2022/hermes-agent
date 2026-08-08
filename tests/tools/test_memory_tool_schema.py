@@ -42,7 +42,7 @@ def test_memory_schema_is_well_formed():
     assert params["required"] == ["action", "target"]
     # Nested ``enum`` on property values is fine — only top-level is forbidden.
     assert params["properties"]["action"]["enum"] == ["add", "replace", "remove"]
-    assert params["properties"]["target"]["enum"] == ["memory", "user"]
+    assert params["properties"]["target"]["enum"] == ["memory", "user", "continuity"]
 
 
 def test_memory_schema_is_json_serializable():
