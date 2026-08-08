@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from starlette.testclient import TestClient
 
 from hermes_cli.companion_turn_guard import review_turn as real_review_turn
@@ -130,6 +131,7 @@ def _patch_profile_env(monkeypatch, tmp_path, profile_name):
     return hermes_home
 
 
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率）；continuity 现由主 AI 直接写（memory_tool 解封 target=continuity），不再由 review 写。见 companion_api.py: style_guard_enabled=False")
 def test_companion_continuity_memory_persists_and_replays_across_requests(monkeypatch, tmp_path):
     from tools import memory_tool
 
@@ -192,6 +194,7 @@ def test_companion_continuity_memory_persists_and_replays_across_requests(monkey
     assert CONTINUITY_FACT in captures["overrides"][1]
 
 
+@pytest.mark.skip(reason="turn guard review 已停用（实测全局 0% 成功率）；continuity 现由主 AI 直接写（memory_tool 解封 target=continuity），不再由 review 写。见 companion_api.py: style_guard_enabled=False")
 def test_companion_user_memory_behavior_remains_user_only(monkeypatch, tmp_path):
     profile_dir = _patch_profile_env(monkeypatch, tmp_path, "user-profile")
     memories_dir = profile_dir / "memories"
@@ -226,3 +229,24 @@ def test_companion_user_memory_behavior_remains_user_only(monkeypatch, tmp_path)
     assert "用户喜欢深夜调试" in captures["overrides"][0]
     assert CONTINUITY_FACT in captures["overrides"][0]
     assert captures["tool_descriptions"][0].startswith(MEMORY_TOOL_DESCRIPTION)
+
+
+def test_style_guard_enabled_remains_hardcoded_false():
+    """防回归：companion_api.py 的 chat_endpoint 必须保持 style_guard_enabled = False。
+
+    turn guard review 实测全局 0% 成功率（deepseek-v4-flash thinking 吃光 max_tokens
+    致 content 恒空），17034 轮纯空转、浪费 ~43000 次辅助 LLM 调用。已永久停用，
+    continuity 改由主 AI 直接写（memory_tool 解封 target=continuity）。
+
+    此测试直接读源码断言，确保 style_guard_enabled 不被改回动态判断——否则会对
+    ~10% 的 style_guard_v1 profile 重新启用 0% 成功率的 review 空转。
+    修复方式：保持 `style_guard_enabled = False`（硬编码）。
+    """
+    import inspect
+    import hermes_cli.companion_api as companion_api
+
+    src = inspect.getsource(companion_api.chat_endpoint)
+    assert "style_guard_enabled = False" in src, (
+        "style_guard_enabled 必须硬编码为 False。若此测试失败，说明有人重新启用了 "
+        "turn guard review（0% 成功率、~43000 次/周期空转）。修复：改回 style_guard_enabled = False"
+    )
