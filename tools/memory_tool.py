@@ -274,6 +274,42 @@ class MemoryStore:
             return self.continuity_char_limit
         return self.memory_char_limit
 
+    @staticmethod
+    def _bigrams(text):
+        """字 bigram 集合，用于中文/混合文本的轻量相似度。"""
+        cleaned = re.sub(r"\s+", "", str(text or ""))
+        if len(cleaned) < 2:
+            return {cleaned} if cleaned else set()
+        return {cleaned[i:i + 2] for i in range(len(cleaned) - 1)}
+
+    def _find_similar(self, target, content):
+        """返回与 content 重复/近义的已有条目 (idx, entry, score)，无则 None。
+
+        判定（保守，避免误合并相近但不同的不同事实）：
+        1. 子串包含：去标点空白后，一条是另一条的子串
+           → 抓「不吃香菜」vs「用户不吃香菜，点菜时绝不能放香菜」这类同一事实的多版本
+        2. 近乎相同：bigram Jaccard >= 0.9 → 抓几乎一字不差的近义条目
+        注意：bigram 单独用 0.7 阈值会误伤「server A runs nginx」vs「server B runs nginx」
+        （Jaccard 0.87 但 A/B 是不同事实），故子串为主、bigram 仅兜底近乎完全相同。
+        """
+        entries = self._entries_for(target)
+        if not entries:
+            return None
+        strip_re = re.compile("[\\s，。、！？；：.,!?;:'\"（）()]")
+        cleaned_content = strip_re.sub("", content)
+        cg = self._bigrams(content)
+        for idx, entry in enumerate(entries):
+            cleaned_entry = strip_re.sub("", entry)
+            if cleaned_content and cleaned_entry:
+                if cleaned_content in cleaned_entry or cleaned_entry in cleaned_content:
+                    return (idx, entry, 1.0)
+            eg = self._bigrams(entry)
+            if cg and eg:
+                score = len(cg & eg) / len(cg | eg)
+                if score >= 0.9:
+                    return (idx, entry, score)
+        return None
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
@@ -300,6 +336,31 @@ class MemoryStore:
             # Reject exact duplicates
             if content in entries:
                 return self._success_response(target, "Entry already exists (no duplicate added).")
+
+            # 模糊去重：同一事实被写成近义条目时（如「不吃香菜」vs「用户不吃香菜，点菜时绝不能放香菜」，
+            # 或「两人在X初遇」vs「两人在X第一次见面」），自动合并——保留更完整的版本，避免
+            # USER.md / CONTINUITY.md 积累近义重复。user 与 continuity 都受益。
+            similar = self._find_similar(target, content)
+            if similar is not None:
+                idx, old_entry, score = similar
+                if len(content) >= len(old_entry):
+                    # 新至少和旧一样完整 → 用新覆盖旧
+                    test_entries = entries.copy()
+                    test_entries[idx] = content
+                    if len(ENTRY_DELIMITER.join(test_entries)) <= self._char_limit(target):
+                        entries[idx] = content
+                        self._set_entries(target, entries)
+                        self.save_to_disk(target)
+                        self.modifications.append({
+                            "action": "replace",
+                            "target": target,
+                            "old_text": old_entry,
+                            "content": content,
+                        })
+                        return self._success_response(target, "已更新相似条目，未重复新增。")
+                else:
+                    # 旧更完整 → 保留旧，丢弃这次冗余的新增
+                    return self._success_response(target, "已有更完整的相同条目，未重复新增。")
 
             # Calculate what the new total would be
             new_entries = entries + [content]
