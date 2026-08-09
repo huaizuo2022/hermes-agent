@@ -160,6 +160,31 @@ class TestMemoryStoreAdd:
         assert result["success"] is False
         assert "Blocked" in result["error"]
 
+    def test_ephemeral_emotion_rejected(self, store):
+        """临时情绪（时间词+情绪词同时出现）不应跨会话持久化。"""
+        result = store.add("user", "今天因画画被甲方折腾而烦躁难受")
+        assert result["success"] is False
+        assert "临时情绪" in result["error"]
+
+    def test_ephemeral_not_overblocking(self, store):
+        """非临时情绪（单独时间词、或持久事实）不应被误拦。"""
+        assert store.add("user", "用户今天过生日")["success"] is True
+        assert store.add("user", "最近在学日语")["success"] is True
+        assert store.add("continuity", "今天和角色正式确定了恋爱关系")["success"] is True
+
+    def test_minor_word_diff_merged(self, store):
+        """增删少量字的近义条目应自动合并（防止同事实多版本累积）。"""
+        store.add("user", "用户养了一只可爱的橘猫叫橘子")
+        result = store.add("user", "用户养了只可爱的橘猫叫橘子")  # 少一个"一"字
+        assert len(store.user_entries) == 1, f"应合并为1条，实际 {len(store.user_entries)}"
+        assert result["success"] is True
+
+    def test_entity_replacement_not_merged(self, store):
+        """实体替换（A vs B）是不同事实，不应误合并。"""
+        store.add("memory", "server A runs nginx")
+        store.add("memory", "server B runs nginx")
+        assert len(store.memory_entries) == 2, "A/B 是不同事实，应保持 2 条"
+
 
 class TestMemoryStoreReplace:
     def test_replace_entry(self, store):

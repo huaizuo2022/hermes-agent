@@ -105,6 +105,24 @@ def _scan_memory_content(content: str) -> Optional[str]:
     return None
 
 
+# 临时情绪检测：这类内容是当下状态（如"今天好累""现在好烦躁"），不该跨会话持久化——
+# 下次会话用户情绪早已变化，把过期情绪注入 system prompt 会误导角色持续安抚已不存在的情绪。
+# 规则：同时含时间词与（负面临时）情绪词 → 拦截。保守，宁可漏拦少错杀。
+_EPHEMERAL_TIME_WORDS = ("今天", "刚才", "现在", "这会儿", "此刻", "刚刚", "这两天", "今儿")
+_EPHEMERAL_EMOTION_WORDS = ("难受", "烦躁", "好累", "很累", "心烦", "郁闷", "难过", "不开心",
+                            "生气", "崩溃", "疲惫", "烦人", "好烦", "心里难受", "emo")
+
+
+def _is_ephemeral_content(content: str) -> Optional[str]:
+    """检测临时情绪。返回拒绝理由或 None。"""
+    has_time = any(w in content for w in _EPHEMERAL_TIME_WORDS)
+    has_emo = any(w in content for w in _EPHEMERAL_EMOTION_WORDS)
+    if has_time and has_emo:
+        return ("检测为临时情绪（同时含时间词与情绪词）。临时状态留在对话历史即可，"
+                "不应跨会话持久化——下次会话用户情绪已变，注入过期情绪会误导角色。")
+    return None
+
+
 def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
     """Build the error dict returned when external drift is detected.
 
@@ -286,27 +304,30 @@ class MemoryStore:
         """返回与 content 重复/近义的已有条目 (idx, entry, score)，无则 None。
 
         判定（保守，避免误合并相近但不同的不同事实）：
-        1. 子串包含：去标点空白后，一条是另一条的子串
-           → 抓「不吃香菜」vs「用户不吃香菜，点菜时绝不能放香菜」这类同一事实的多版本
-        2. 近乎相同：bigram Jaccard >= 0.9 → 抓几乎一字不差的近义条目
-        注意：bigram 单独用 0.7 阈值会误伤「server A runs nginx」vs「server B runs nginx」
-        （Jaccard 0.87 但 A/B 是不同事实），故子串为主、bigram 仅兜底近乎完全相同。
+        1. 子串包含：去标点空白后一条是另一条的子串
+           → 抓「不吃香菜」⊂「用户不吃香菜，点菜时绝不能放香菜」这类同事实多版本
+        2. 单字集合 Jaccard >= 0.85：抓字面高度重合的同义改写
+
+        为何用单字集合而非 bigram：对「实体替换」（server A vs B）和「小修饰词差异」
+        （今天因画画[工作]被甲方... vs 今天因画画被甲方...）区分度更好——bigram 下两者
+        都挤在 0.76-0.87 难分离，单字集合把后者抬到 ~0.88（可合并）、前者压到 ~0.82（不合并）。
         """
         entries = self._entries_for(target)
         if not entries:
             return None
         strip_re = re.compile("[\\s，。、！？；：.,!?;:'\"（）()]")
         cleaned_content = strip_re.sub("", content)
-        cg = self._bigrams(content)
+        if not cleaned_content:
+            return None
+        cset = set(cleaned_content)
         for idx, entry in enumerate(entries):
             cleaned_entry = strip_re.sub("", entry)
-            if cleaned_content and cleaned_entry:
-                if cleaned_content in cleaned_entry or cleaned_entry in cleaned_content:
-                    return (idx, entry, 1.0)
-            eg = self._bigrams(entry)
-            if cg and eg:
-                score = len(cg & eg) / len(cg | eg)
-                if score >= 0.9:
+            if cleaned_entry and (cleaned_content in cleaned_entry or cleaned_entry in cleaned_content):
+                return (idx, entry, 1.0)
+            eset = set(cleaned_entry) if cleaned_entry else set()
+            if cset and eset:
+                score = len(cset & eset) / len(cset | eset)
+                if score >= 0.85:
                     return (idx, entry, score)
         return None
 
@@ -320,6 +341,11 @@ class MemoryStore:
         scan_error = _scan_memory_content(content)
         if scan_error:
             return {"success": False, "error": scan_error}
+
+        # 拦截临时情绪（"今天好累""现在好烦躁"这类当下状态不应持久化）
+        ephemeral_error = _is_ephemeral_content(content)
+        if ephemeral_error:
+            return {"success": False, "error": ephemeral_error}
 
         with self._file_lock(self._path_for(target)):
             # Re-read from disk under lock to pick up writes from other sessions.
