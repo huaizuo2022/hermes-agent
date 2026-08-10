@@ -49,6 +49,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MEMORY_CHAR_LIMIT = 2200
+DEFAULT_USER_CHAR_LIMIT = 1375
+DEFAULT_CONTINUITY_CHAR_LIMIT = 6000
+
 # Where memory files live — resolved dynamically so profile overrides
 # (HERMES_HOME env var changes) are always respected.  The old module-level
 # constant was cached at import time and could go stale if a profile switch
@@ -68,8 +72,11 @@ ENTRY_DELIMITER = "\n§\n"
 _MEMORY_THREAT_PATTERNS = [
     # Prompt injection
     (r'ignore\s+(previous|all|above|prior)\s+instructions', "prompt_injection"),
+    (r'忽略(?:之前|以上|上文|所有|全部|一切|当前)*(?:的)?(?:指令|命令|要求)', "prompt_injection_cn"),
     (r'you\s+are\s+now\s+', "role_hijack"),
+    (r'你现在是.*?(?:没有限制|无限制).*(?:AI|助手)?', "role_hijack_cn"),
     (r'do\s+not\s+tell\s+the\s+user', "deception_hide"),
+    (r'不要告诉用户.*?(?:系统|提示|指令|规则|秘密|密码|token|密钥)', "deception_hide_cn"),
     (r'system\s+prompt\s+override', "sys_prompt_override"),
     (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
     (r'act\s+as\s+(if|though)\s+you\s+(have\s+no|don\'t\s+have)\s+(restrictions|limits|rules)', "bypass_restrictions"),
@@ -81,6 +88,7 @@ _MEMORY_THREAT_PATTERNS = [
     (r'authorized_keys', "ssh_backdoor"),
     (r'\$HOME/\.ssh|\~/\.ssh', "ssh_access"),
     (r'\$HOME/\.hermes/\.env|\~/\.hermes/\.env', "hermes_env"),
+    (r'(?:我的|用户的)?(?:密码|口令|密钥|验证码|token|api[_ ]?key)\s*(?:是|=|为|:|：)', "secret_literal_cn"),
 ]
 
 # Subset of invisible chars for injection detection
@@ -121,6 +129,14 @@ def _is_ephemeral_content(content: str) -> Optional[str]:
         return ("检测为临时情绪（同时含时间词与情绪词）。临时状态留在对话历史即可，"
                 "不应跨会话持久化——下次会话用户情绪已变，注入过期情绪会误导角色。")
     return None
+
+
+def _validate_memory_content(content: str) -> Optional[str]:
+    """Run all content guards before persisting memory."""
+    scan_error = _scan_memory_content(content)
+    if scan_error:
+        return scan_error
+    return _is_ephemeral_content(content)
 
 
 def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
@@ -164,7 +180,12 @@ class MemoryStore:
         persisted to disk. Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, continuity_char_limit: int = 4000):
+    def __init__(
+        self,
+        memory_char_limit: int = DEFAULT_MEMORY_CHAR_LIMIT,
+        user_char_limit: int = DEFAULT_USER_CHAR_LIMIT,
+        continuity_char_limit: int = DEFAULT_CONTINUITY_CHAR_LIMIT,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.continuity_entries: List[str] = []
@@ -174,6 +195,16 @@ class MemoryStore:
         self.modifications: List[Dict[str, Any]] = []
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": "", "continuity": ""}
+
+    @classmethod
+    def from_config(cls, mem_config: Optional[Dict[str, Any]] = None) -> "MemoryStore":
+        """Construct a store from resolved memory config values."""
+        mem_config = mem_config or {}
+        return cls(
+            memory_char_limit=int(mem_config.get("memory_char_limit", DEFAULT_MEMORY_CHAR_LIMIT)),
+            user_char_limit=int(mem_config.get("user_char_limit", DEFAULT_USER_CHAR_LIMIT)),
+            continuity_char_limit=int(mem_config.get("continuity_char_limit", DEFAULT_CONTINUITY_CHAR_LIMIT)),
+        )
 
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
@@ -337,15 +368,9 @@ class MemoryStore:
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
 
-        # Scan for injection/exfiltration before accepting
-        scan_error = _scan_memory_content(content)
-        if scan_error:
-            return {"success": False, "error": scan_error}
-
-        # 拦截临时情绪（"今天好累""现在好烦躁"这类当下状态不应持久化）
-        ephemeral_error = _is_ephemeral_content(content)
-        if ephemeral_error:
-            return {"success": False, "error": ephemeral_error}
+        validation_error = _validate_memory_content(content)
+        if validation_error:
+            return {"success": False, "error": validation_error}
 
         with self._file_lock(self._path_for(target)):
             # Re-read from disk under lock to pick up writes from other sessions.
@@ -425,10 +450,9 @@ class MemoryStore:
         if not new_content:
             return {"success": False, "error": "new_content cannot be empty. Use 'remove' to delete entries."}
 
-        # Scan replacement content for injection/exfiltration
-        scan_error = _scan_memory_content(new_content)
-        if scan_error:
-            return {"success": False, "error": scan_error}
+        validation_error = _validate_memory_content(new_content)
+        if validation_error:
+            return {"success": False, "error": validation_error}
 
         with self._file_lock(self._path_for(target)):
             bak = self._reload_target(target)
@@ -803,7 +827,4 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
-
 

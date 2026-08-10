@@ -1816,9 +1816,9 @@ async def sync_memory(session_id: str, req: MemorySyncRequest):
     token = set_hermes_home_override(profile_dir)
     try:
         from tools.memory_tool import MemoryStore, memory_tool
-        store = MemoryStore()
+        store = MemoryStore.from_config(load_config().get("memory", {}))
         store.load_from_disk()
-        
+
         result_str = memory_tool(
             action=req.action,
             target=req.target,

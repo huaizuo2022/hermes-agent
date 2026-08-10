@@ -67,6 +67,39 @@ def test_memory_sync_initializes_guarded_policy(monkeypatch, tmp_path):
     assert read_conversation_policy(profile_dir) == STYLE_GUARD_V1_POLICY
 
 
+def test_memory_sync_uses_continuity_limit_from_config(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "profiles" / "savana_user_char"
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.get_profile_path",
+        lambda session_id: str(profile_dir),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.companion_api.load_config",
+        lambda: {
+            "memory": {
+                "memory_enabled": True,
+                "user_profile_enabled": True,
+                "memory_char_limit": 2200,
+                "user_char_limit": 1375,
+                "continuity_char_limit": 6000,
+            }
+        },
+    )
+
+    response = TestClient(app).post(
+        "/companion/v1/sessions/savana_user_char/memories",
+        json={
+            "action": "add",
+            "target": "continuity",
+            "content": "x" * 5000,
+        },
+    )
+
+    assert response.status_code == 200
+    continuity_path = profile_dir / "memories" / "CONTINUITY.md"
+    assert continuity_path.read_text(encoding="utf-8") == "x" * 5000
+
+
 def test_weixin_start_initializes_guarded_policy_before_soul(monkeypatch, tmp_path):
     profile_dir = tmp_path / "profiles" / "savana_user_char"
     observed = []

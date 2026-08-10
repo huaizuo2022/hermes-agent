@@ -1111,7 +1111,7 @@ class TestBuildSystemPrompt:
             agent._user_profile_enabled = True
             prompt = agent._build_system_prompt()
 
-        assert "角色和故事的长期事实、承诺、关系变化" in prompt
+        assert "跨会话记忆（重要规则）" in prompt
         assert "CONTINUITY (story facts and commitments)" in prompt
         assert "角色已答应下周陪用户去看展" in prompt
 
