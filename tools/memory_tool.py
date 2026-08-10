@@ -118,7 +118,7 @@ def _scan_memory_content(content: str) -> Optional[str]:
 # 规则：同时含时间词与（负面临时）情绪词 → 拦截。保守，宁可漏拦少错杀。
 _EPHEMERAL_TIME_WORDS = ("今天", "刚才", "现在", "这会儿", "此刻", "刚刚", "这两天", "今儿")
 _EPHEMERAL_EMOTION_WORDS = ("难受", "烦躁", "好累", "很累", "心烦", "郁闷", "难过", "不开心",
-                            "生气", "崩溃", "疲惫", "烦人", "好烦", "心里难受", "emo")
+                            "生气", "崩溃", "疲惫", "烦人", "好烦", "有点烦", "心里难受", "emo")
 
 
 def _is_ephemeral_content(content: str) -> Optional[str]:
@@ -827,4 +827,3 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-

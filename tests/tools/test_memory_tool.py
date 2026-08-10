@@ -184,6 +184,12 @@ class TestMemoryStoreAdd:
         assert result["success"] is False
         assert "临时情绪" in result["error"]
 
+    def test_current_minor_annoyance_rejected(self, store):
+        """线上回归：现在有点烦是临时状态，不能写入 USER.md。"""
+        result = store.add("user", "用户现在有点烦，这是临时情绪")
+        assert result["success"] is False
+        assert "临时情绪" in result["error"]
+
     def test_ephemeral_not_overblocking(self, store):
         """非临时情绪（单独时间词、或持久事实）不应被误拦。"""
         assert store.add("user", "用户今天过生日")["success"] is True
