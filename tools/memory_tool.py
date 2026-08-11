@@ -121,6 +121,13 @@ _EPHEMERAL_EMOTION_WORDS = ("难受", "烦躁", "好累", "很累", "心烦", "�
                             "生气", "崩溃", "疲惫", "烦人", "好烦", "有点烦", "心里难受", "emo")
 
 
+_META_MEMORY_REJECTION_PATTERNS = (
+    r"(?:不算|不是|不作为|不应作为|不能作为|无需作为|不需要作为).{0,8}(?:长期|持久|跨会话)?记忆",
+    r"(?:不算|不是|不作为|不应作为|不能作为|无需作为|不需要作为).{0,8}(?:长期|持久|跨会话)?(?:保存|记录)",
+    r"(?:临时情绪|临时状态|一次性闲聊|一次性注入|注入内容|控制指令|危险指令).{0,24}(?:不算|不作为|不应作为|不能作为|无需作为|不需要作为)",
+)
+
+
 def _is_ephemeral_content(content: str) -> Optional[str]:
     """检测临时情绪。返回拒绝理由或 None。"""
     has_time = any(w in content for w in _EPHEMERAL_TIME_WORDS)
@@ -131,11 +138,25 @@ def _is_ephemeral_content(content: str) -> Optional[str]:
     return None
 
 
+def _is_meta_rejection_memory(content: str) -> Optional[str]:
+    """Reject memories that only describe why unsafe/temporary content was not saved."""
+    for pattern in _META_MEMORY_REJECTION_PATTERNS:
+        if re.search(pattern, content, re.IGNORECASE):
+            return (
+                "检测为拒绝理由元记忆。不要把“这不算长期记忆/不作为长期记忆保存”"
+                "这类安全判断写入长期记忆；只需拒绝原始内容即可。"
+            )
+    return None
+
+
 def _validate_memory_content(content: str) -> Optional[str]:
     """Run all content guards before persisting memory."""
     scan_error = _scan_memory_content(content)
     if scan_error:
         return scan_error
+    meta_error = _is_meta_rejection_memory(content)
+    if meta_error:
+        return meta_error
     return _is_ephemeral_content(content)
 
 
