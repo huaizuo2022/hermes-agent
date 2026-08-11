@@ -439,17 +439,12 @@ class MemoryStore:
             new_total = len(ENTRY_DELIMITER.join(new_entries))
 
             if new_total > limit:
-                current = self._char_count(target)
-                return {
-                    "success": False,
-                    "error": (
-                        f"Memory at {current:,}/{limit:,} chars. "
-                        f"Adding this entry ({len(content)} chars) would exceed the limit. "
-                        f"Replace or remove existing entries first."
-                    ),
-                    "current_entries": entries,
-                    "usage": f"{current:,}/{limit:,}",
-                }
+                return self._limit_exceeded_response(
+                    target,
+                    action="add",
+                    attempted_chars=len(content),
+                    projected_chars=new_total,
+                )
 
             entries.append(content)
             self._set_entries(target, entries)
@@ -507,13 +502,12 @@ class MemoryStore:
             new_total = len(ENTRY_DELIMITER.join(test_entries))
 
             if new_total > limit:
-                return {
-                    "success": False,
-                    "error": (
-                        f"Replacement would put memory at {new_total:,}/{limit:,} chars. "
-                        f"Shorten the new content or remove other entries first."
-                    ),
-                }
+                return self._limit_exceeded_response(
+                    target,
+                    action="replace",
+                    attempted_chars=len(new_content),
+                    projected_chars=new_total,
+                )
 
             entries[idx] = new_content
             self._set_entries(target, entries)
@@ -599,6 +593,56 @@ class MemoryStore:
         if message:
             resp["message"] = message
         return resp
+
+    def _limit_exceeded_response(
+        self,
+        target: str,
+        *,
+        action: str,
+        attempted_chars: int,
+        projected_chars: int,
+    ) -> Dict[str, Any]:
+        current = self._char_count(target)
+        limit = self._char_limit(target)
+        remaining = max(0, limit - current)
+        if action == "add":
+            next_action = (
+                "Do not retry the same add call unchanged. First use memory(action='replace') "
+                "to merge/update an obsolete overlapping entry, or memory(action='remove') to "
+                "free space; otherwise skip this memory for the turn or summarize it shorter."
+            )
+            error = (
+                f"Memory at {current:,}/{limit:,} chars. "
+                f"Adding this entry ({attempted_chars} chars) would exceed the limit. "
+                "Replace or remove existing entries first; do not retry this add unchanged."
+            )
+        else:
+            next_action = (
+                "Do not retry the same replace call unchanged. Shorten the replacement, "
+                "replace a broader existing entry with a compact summary, or remove obsolete "
+                "entries before trying again."
+            )
+            error = (
+                f"Replacement would put memory at {projected_chars:,}/{limit:,} chars "
+                "and exceed the limit. Shorten the new content or remove other entries first; "
+                "do not retry this replace unchanged."
+            )
+
+        return {
+            "success": False,
+            "code": "memory_limit_exceeded",
+            "retryable": False,
+            "target": target,
+            "error": error,
+            "next_action": next_action,
+            "current_entries": self._entries_for(target),
+            "usage": f"{current:,}/{limit:,}",
+            "current_chars": current,
+            "limit_chars": limit,
+            "remaining_chars": remaining,
+            "attempted_entry_chars": attempted_chars,
+            "projected_chars": projected_chars,
+        }
 
     def _render_block(self, target: str, entries: List[str]) -> str:
         """Render a system prompt block with header and usage indicator."""
@@ -803,6 +847,9 @@ MEMORY_SCHEMA = {
         "- 'continuity': story facts, AI commitments/promises, relationship milestones\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
         "remove (delete -- old_text identifies it).\n\n"
+        "If a memory call returns code=memory_limit_exceeded or retryable=false, "
+        "do not retry the same add/replace unchanged. Use replace to merge or compact "
+        "an existing entry, use remove for obsolete entries, or skip saving that fact.\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
     ),
     "parameters": {

@@ -26,6 +26,14 @@ class TestMemorySchema:
         assert "temporary task state" in description
         assert ">80%" not in description
 
+    def test_limit_failure_guidance_tells_model_not_to_retry_unchanged(self):
+        description = MEMORY_SCHEMA["description"]
+        assert "memory_limit_exceeded" in description
+        assert "retryable=false" in description
+        assert "do not retry" in description.lower()
+        assert "replace" in description
+        assert "remove" in description
+
 
 # =========================================================================
 # Security scanning
@@ -158,6 +166,24 @@ class TestMemoryStoreAdd:
         result = store.add("memory", "this will exceed the limit")
         assert result["success"] is False
         assert "exceed" in result["error"].lower()
+
+    def test_add_limit_refusal_is_non_retryable_and_actionable(self, store):
+        """超限不是瞬时失败；工具结果必须引导模型换策略，避免原样重试触发 loop guard。"""
+        store.add("user", "x" * 290)
+
+        result = store.add("user", "用户喜欢下雨天窝在窗边听爵士乐")
+
+        assert result["success"] is False
+        assert result["code"] == "memory_limit_exceeded"
+        assert result["retryable"] is False
+        assert result["target"] == "user"
+        assert result["current_chars"] == 290
+        assert result["limit_chars"] == 300
+        assert result["attempted_entry_chars"] == len("用户喜欢下雨天窝在窗边听爵士乐")
+        assert result["remaining_chars"] == 10
+        assert "Do not retry the same add call" in result["next_action"]
+        assert "replace" in result["next_action"]
+        assert "remove" in result["next_action"]
 
     def test_continuity_limit_rejected_without_writing(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
