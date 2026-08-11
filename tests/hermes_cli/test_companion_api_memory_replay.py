@@ -87,6 +87,13 @@ def test_style_guard_keeps_memory_tool_enabled_and_uses_savana_description(monke
     assert captured["enabled_toolsets"] == ["memory"]
     assert "将用户的个人信息永久写入记忆" in captured["tool_description"]
     assert "用户说\"记住\"" in captured["tool_description"]
+    assert "即使用户没有说\"记住\"" in captured["tool_description"]
+    assert "稳定偏好/厌恶/避雷" in captured["tool_description"]
+    assert "用户明确的未来计划、日程或重要事件" in captured["tool_description"]
+    assert "用户不吃香菜" in captured["tool_description"]
+    assert "用户喜欢茉莉花茶" in captured["tool_description"]
+    assert "用户下周五要去苏州参加陶艺课" in captured["tool_description"]
+    assert "用户自己的计划写入 target='user'" in captured["tool_description"]
 
 
 def test_style_guard_memory_snapshots_include_continuity(monkeypatch, tmp_path):

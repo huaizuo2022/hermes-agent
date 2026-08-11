@@ -1115,6 +1115,17 @@ class TestBuildSystemPrompt:
         assert "CONTINUITY (story facts and commitments)" in prompt
         assert "角色已答应下周陪用户去看展" in prompt
 
+    def test_savana_prompt_treats_stable_preferences_and_user_plans_as_memory(self):
+        from agent.prompt_builder import SAVANA_MEMORY_GUIDANCE
+
+        assert "即使用户没有说'记住'" in SAVANA_MEMORY_GUIDANCE
+        assert "稳定偏好/厌恶/避雷" in SAVANA_MEMORY_GUIDANCE
+        assert "用户明确的未来计划/日程/重要事件 → target='user'" in SAVANA_MEMORY_GUIDANCE
+        assert "用户不吃香菜" in SAVANA_MEMORY_GUIDANCE
+        assert "用户喜欢茉莉花茶" in SAVANA_MEMORY_GUIDANCE
+        assert "用户下周五要去苏州参加陶艺课" in SAVANA_MEMORY_GUIDANCE
+        assert "角色承诺/约定仍然写 continuity" in SAVANA_MEMORY_GUIDANCE
+
     def test_savana_prompt_skips_empty_continuity_snapshot(self, monkeypatch, tmp_path):
         from tools.memory_tool import MemoryStore
 
@@ -5563,7 +5574,10 @@ class TestMemoryNudgeCounterPersistence:
 
     def test_counters_initialized_in_init(self):
         """Counters must exist on the agent after __init__."""
-        with patch("run_agent.get_tool_definitions", return_value=[]):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("agent.agent_init.query_ollama_num_ctx", return_value=None),
+        ):
             a = AIAgent(
                 model="test", api_key="test-key", base_url="http://localhost:1234/v1",
                 provider="openrouter", skip_context_files=True, skip_memory=True,
