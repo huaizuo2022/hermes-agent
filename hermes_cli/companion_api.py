@@ -1360,6 +1360,16 @@ def sync_soul_file(profile_dir: str, profile_data: Dict[str, Any]) -> None:
         _sync_soul_file_unlocked(profile_dir, profile_data)
 
 
+_HTML_BREAK_PATTERN = re.compile(r'(?i)<br\s*/?>|</br>|</?p\s*>')
+
+
+def _clean_soul_field(val: Any) -> str:
+    if val is None:
+        return ""
+    text = str(val).strip()
+    return _HTML_BREAK_PATTERN.sub('\n', text)
+
+
 def _sync_soul_file_unlocked(profile_dir: str, profile_data: Dict[str, Any]) -> None:
     soul_path = os.path.join(profile_dir, "SOUL.md")
     evolved_persona = extract_evolved_persona(soul_path)
@@ -1375,18 +1385,19 @@ def _sync_soul_file_unlocked(profile_dir: str, profile_data: Dict[str, Any]) -> 
         speaking_style = ", ".join(speaking_style)
     elif isinstance(speaking_style, dict):
         speaking_style = ", ".join("{}: {}".format(k, v) for k, v in speaking_style.items())
+    speaking_style = _clean_soul_field(speaking_style)
         
-    personality = str(profile_data.get("personality", "")).strip()
-    background = str(profile_data.get("background", "")).strip()
+    personality = _clean_soul_field(profile_data.get("personality", ""))
+    background = _clean_soul_field(profile_data.get("background", ""))
     
     # 新增扩展字段处理
     behavior_tags = profile_data.get("behavior_tags") or ""
     if isinstance(behavior_tags, list):
         behavior_tags = ", ".join(behavior_tags)
-    behavior_tags = str(behavior_tags).strip()
+    behavior_tags = _clean_soul_field(behavior_tags)
     
-    appearance_details = str(profile_data.get("appearance_details") or "").strip()
-    initial_scenario = str(profile_data.get("initial_scenario") or "").strip()
+    appearance_details = _clean_soul_field(profile_data.get("appearance_details") or "")
+    initial_scenario = _clean_soul_field(profile_data.get("initial_scenario") or "")
     
     sample_dialogues = profile_data.get("sample_dialogues") or []
     dialogue_text = ""
@@ -1397,8 +1408,8 @@ def _sync_soul_file_unlocked(profile_dir: str, profile_data: Dict[str, Any]) -> 
                 user_val = item.get("user") or item.get("user_input")
                 char_val = item.get("character") or item.get("character_response")
                 if user_val and char_val:
-                    dialogue_lines.append("User: {}".format(user_val))
-                    dialogue_lines.append("{}: {}".format(name, char_val))
+                    dialogue_lines.append("User: {}".format(_clean_soul_field(user_val)))
+                    dialogue_lines.append("{}: {}".format(name, _clean_soul_field(char_val)))
                     dialogue_lines.append("")
         dialogue_text = "\n".join(dialogue_lines).strip()
 
@@ -1683,7 +1694,7 @@ async def chat_endpoint(req: ChatRequest):
                         stream_callback=stream_callback,
                         platform_message_id=req.message_id,
                     )
-                    final_reply = result.get("final_response", "")
+                    final_reply = _HTML_BREAK_PATTERN.sub('\n', result.get("final_response", ""))
                     q.put(("final", final_reply))
 
                     if style_guard_enabled:
@@ -1768,7 +1779,7 @@ async def chat_endpoint(req: ChatRequest):
                 conversation_history=conversation_history,
                 platform_message_id=req.message_id,
             )
-            reply = result.get("final_response", "")
+            reply = _HTML_BREAK_PATTERN.sub('\n', result.get("final_response", ""))
             review_metadata = _review_companion_turn(
                 style_guard_enabled=style_guard_enabled,
                 profile_dir=profile_dir,
