@@ -301,6 +301,20 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS companion_memory_projections (
+    session_id TEXT NOT NULL,
+    target TEXT NOT NULL,
+    protocol_version INTEGER NOT NULL,
+    projection_id TEXT NOT NULL,
+    memory_version INTEGER NOT NULL,
+    snapshot_checksum TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    rendered_checksum TEXT,
+    applied_at TEXT NOT NULL,
+    materialized_at TEXT,
+    PRIMARY KEY (session_id, target)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
@@ -1283,6 +1297,117 @@ class SessionDB:
         def _do(conn):
             conn.execute(sql, params)
         self._execute_write(_do)
+
+    def get_companion_memory_projection(
+        self,
+        *,
+        session_id: str,
+        target: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the projection row for one (session_id, target) pair."""
+        row = self._conn.execute(
+            """
+            SELECT session_id, target, protocol_version, projection_id,
+                   memory_version, snapshot_checksum, snapshot_json,
+                   rendered_checksum, applied_at, materialized_at
+            FROM companion_memory_projections
+            WHERE session_id = ? AND target = ?
+            """,
+            (session_id, target),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row) if isinstance(row, sqlite3.Row) else {
+            "session_id": row[0],
+            "target": row[1],
+            "protocol_version": row[2],
+            "projection_id": row[3],
+            "memory_version": row[4],
+            "snapshot_checksum": row[5],
+            "snapshot_json": row[6],
+            "rendered_checksum": row[7],
+            "applied_at": row[8],
+            "materialized_at": row[9],
+        }
+
+    def upsert_companion_memory_projection(
+        self,
+        *,
+        session_id: str,
+        target: str,
+        protocol_version: int,
+        projection_id: str,
+        memory_version: int,
+        snapshot_checksum: str,
+        snapshot_json: str,
+        rendered_checksum: Optional[str],
+        applied_at: str,
+        materialized_at: Optional[str],
+    ) -> Dict[str, Any]:
+        """Insert or replace one projection row keyed by (session_id, target)."""
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO companion_memory_projections (
+                    session_id,
+                    target,
+                    protocol_version,
+                    projection_id,
+                    memory_version,
+                    snapshot_checksum,
+                    snapshot_json,
+                    rendered_checksum,
+                    applied_at,
+                    materialized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, target) DO UPDATE SET
+                    protocol_version = excluded.protocol_version,
+                    projection_id = excluded.projection_id,
+                    memory_version = excluded.memory_version,
+                    snapshot_checksum = excluded.snapshot_checksum,
+                    snapshot_json = excluded.snapshot_json,
+                    rendered_checksum = excluded.rendered_checksum,
+                    applied_at = excluded.applied_at,
+                    materialized_at = excluded.materialized_at
+                """,
+                (
+                    session_id,
+                    target,
+                    protocol_version,
+                    projection_id,
+                    memory_version,
+                    snapshot_checksum,
+                    snapshot_json,
+                    rendered_checksum,
+                    applied_at,
+                    materialized_at,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT session_id, target, protocol_version, projection_id,
+                       memory_version, snapshot_checksum, snapshot_json,
+                       rendered_checksum, applied_at, materialized_at
+                FROM companion_memory_projections
+                WHERE session_id = ? AND target = ?
+                """,
+                (session_id, target),
+            ).fetchone()
+            return dict(row) if isinstance(row, sqlite3.Row) else {
+                "session_id": row[0],
+                "target": row[1],
+                "protocol_version": row[2],
+                "projection_id": row[3],
+                "memory_version": row[4],
+                "snapshot_checksum": row[5],
+                "snapshot_json": row[6],
+                "rendered_checksum": row[7],
+                "applied_at": row[8],
+                "materialized_at": row[9],
+            }
+
+        return self._execute_write(_do)
 
     def ensure_session(
         self,
