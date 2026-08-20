@@ -4,16 +4,19 @@ import json
 import logging
 import os
 import queue
+import re
+import sqlite3
 import shutil
 import threading
 import time
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Generator, List, Optional, Tuple
 
 import anyio
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette._utils import collapse_excgroups
@@ -32,6 +35,15 @@ from hermes_cli.companion_turn_guard import (
     assistant_sha256,
     build_guarded_history,
     review_turn,
+)
+from tools.memory_tool import (
+    PROJECTION_PROTOCOL_VERSION,
+    PROJECTION_RENDERED_CHAR_LIMIT_MAX,
+    PROJECTION_TARGET_CONTINUITY,
+    build_projection_session_id,
+    materialize_continuity_projection,
+    projection_sha256_hex,
+    render_continuity_projection_text,
 )
 
 router = APIRouter(prefix="/companion/v1")
@@ -116,6 +128,208 @@ class MemorySyncRequest(BaseModel):
     action: str
     content: Optional[str] = None
     old_text: Optional[str] = None
+
+
+class ContinuityProjectionBudget(BaseModel):
+    rendered_char_limit: int
+    omitted_count: int
+    omitted_kinds: List[str]
+
+    class Config:
+        extra = "forbid"
+
+
+class ContinuityProjectionEntry(BaseModel):
+    memory_id: str
+    story_kind: str
+    story_state: str
+    content: str
+    content_hash: str
+    importance: int
+    event_time: Optional[str] = None
+    scope_kind: str
+    scope_id: Optional[str] = None
+
+    class Config:
+        extra = "forbid"
+
+
+class ContinuityProjectionRequest(BaseModel):
+    protocol_version: int
+    projection_id: str
+    target: str
+    user_id: str
+    character_id: str
+    memory_version: int
+    snapshot_checksum: str
+    generated_at: str
+    budget: ContinuityProjectionBudget
+    entries: List[ContinuityProjectionEntry]
+
+    class Config:
+        extra = "forbid"
+
+
+_PROJECTION_STORY_KINDS = {
+    "commitment",
+    "agreement",
+    "relationship_milestone",
+    "shared_event",
+    "unresolved_thread",
+    "gift_or_secret",
+}
+_PROJECTION_STORY_STATES = {"active", "completed", "cancelled"}
+_PROJECTION_SCOPE_KINDS = {"pair", "story_branch"}
+
+
+def _projection_error(status_code: int, status: str, error_code: str, retryable: bool = False) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": status,
+            "error_code": error_code,
+            "retryable": bool(retryable),
+        },
+    )
+
+
+def _validate_projection_uuid(value: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-fA-F-]{36}", str(value or "")))
+
+
+def _validate_projection_checksum(value: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{64}", str(value or "")))
+
+
+def _canonical_projection_checksum(payload: Dict[str, Any]) -> str:
+    checksum_document = {
+        "protocol_version": payload["protocol_version"],
+        "target": payload["target"],
+        "user_id": payload["user_id"],
+        "character_id": payload["character_id"],
+        "budget": payload["budget"],
+        "entries": payload["entries"],
+    }
+    return projection_sha256_hex(
+        json.dumps(
+            checksum_document,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+def _parse_projection_timestamp(value: str) -> datetime:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("invalid_continuity_snapshot")
+    normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError("invalid_continuity_snapshot") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("invalid_continuity_snapshot")
+    return parsed
+
+
+def _is_sqlite_busy_error(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    lowered = str(exc).lower()
+    return "database is locked" in lowered or "database is busy" in lowered or "locked" in lowered
+
+
+def _normalize_projection_payload(req: ContinuityProjectionRequest) -> Dict[str, Any]:
+    payload = req.model_dump()
+    if int(payload["protocol_version"]) != PROJECTION_PROTOCOL_VERSION:
+        raise ValueError("unsupported_projection_protocol")
+    if str(payload["target"]) != PROJECTION_TARGET_CONTINUITY:
+        raise ValueError("invalid_continuity_snapshot")
+    if not _validate_projection_uuid(payload["projection_id"]):
+        raise ValueError("invalid_continuity_snapshot")
+    if not str(payload["user_id"]).strip() or not str(payload["character_id"]).strip():
+        raise ValueError("invalid_continuity_snapshot")
+    if int(payload["memory_version"]) < 0:
+        raise ValueError("invalid_continuity_snapshot")
+    if not _validate_projection_checksum(payload["snapshot_checksum"]):
+        raise ValueError("projection_snapshot_checksum_mismatch")
+    _parse_projection_timestamp(str(payload["generated_at"]))
+
+    budget = payload["budget"]
+    rendered_limit = int(budget["rendered_char_limit"])
+    if rendered_limit < 1 or rendered_limit > PROJECTION_RENDERED_CHAR_LIMIT_MAX:
+        raise ValueError("projection_budget_exceeded")
+    if int(budget["omitted_count"]) < 0:
+        raise ValueError("invalid_continuity_snapshot")
+    if not isinstance(budget["omitted_kinds"], list):
+        raise ValueError("invalid_continuity_snapshot")
+
+    normalized_entries: List[Dict[str, Any]] = []
+    seen_memory_ids: set[str] = set()
+    seen_fact_tuples: set[Tuple[str, str, str, str, Optional[str]]] = set()
+    for raw_entry in payload["entries"]:
+        entry = dict(raw_entry)
+        if not _validate_projection_uuid(entry["memory_id"]):
+            raise ValueError("invalid_continuity_snapshot")
+        if entry["story_kind"] not in _PROJECTION_STORY_KINDS:
+            raise ValueError("invalid_continuity_snapshot")
+        if entry["story_state"] not in _PROJECTION_STORY_STATES:
+            raise ValueError("invalid_continuity_snapshot")
+        content = str(entry["content"]).strip()
+        if (
+            not content
+            or len(content) > 160
+            or "\r" in content
+            or "\n" in content
+            or "\n§\n" in content
+        ):
+            raise ValueError("invalid_continuity_snapshot")
+        if not _validate_projection_checksum(entry["content_hash"]):
+            raise ValueError("projection_content_hash_mismatch")
+        if projection_sha256_hex(content) != entry["content_hash"]:
+            raise ValueError("projection_content_hash_mismatch")
+        importance = int(entry["importance"])
+        if importance < 1 or importance > 10:
+            raise ValueError("invalid_continuity_snapshot")
+        if entry["scope_kind"] not in _PROJECTION_SCOPE_KINDS:
+            raise ValueError("invalid_continuity_snapshot")
+        scope_id = entry.get("scope_id")
+        if entry["scope_kind"] == "story_branch" and not str(scope_id or "").strip():
+            raise ValueError("invalid_continuity_snapshot")
+
+        if entry["memory_id"] in seen_memory_ids:
+            raise ValueError("invalid_continuity_snapshot")
+        seen_memory_ids.add(entry["memory_id"])
+        fact_key = (
+            entry["story_kind"],
+            entry["story_state"],
+            content,
+            entry["scope_kind"],
+            scope_id,
+        )
+        if fact_key in seen_fact_tuples:
+            raise ValueError("invalid_continuity_snapshot")
+        seen_fact_tuples.add(fact_key)
+
+        entry["content"] = content
+        entry["importance"] = importance
+        normalized_entries.append(entry)
+
+    payload["budget"]["rendered_char_limit"] = rendered_limit
+    payload["budget"]["omitted_count"] = int(payload["budget"]["omitted_count"])
+    payload["entries"] = normalized_entries
+
+    rendered_text = render_continuity_projection_text(payload["entries"])
+    if len(rendered_text) > rendered_limit:
+        raise ValueError("projection_budget_exceeded")
+
+    actual_checksum = _canonical_projection_checksum(payload)
+    if actual_checksum != payload["snapshot_checksum"]:
+        raise ValueError("projection_snapshot_checksum_mismatch")
+
+    return payload
 
 
 class WeixinQrStartRequest(BaseModel):
@@ -1814,6 +2028,169 @@ async def chat_endpoint(req: ChatRequest):
                 agent.close()
             except Exception:
                 logger.exception("Failed to close AIAgent after companion chat")
+        reset_hermes_home_override(token)
+
+@router.put("/sessions/{session_id}/memory-projections/continuity")
+async def put_continuity_projection(
+    session_id: str,
+    req: ContinuityProjectionRequest,
+    x_projection_id: str = Header(..., alias="X-Projection-Id"),
+    x_projection_protocol: str = Header(..., alias="X-Projection-Protocol"),
+):
+    expected_session_id = build_projection_session_id(req.user_id, req.character_id)
+    if session_id != expected_session_id:
+        return _projection_error(
+            422,
+            "invalid_continuity_snapshot",
+            "projection_identity_mismatch",
+        )
+    if str(x_projection_id) != str(req.projection_id):
+        return _projection_error(422, "invalid_continuity_snapshot", "invalid_continuity_snapshot")
+    if str(x_projection_protocol) != str(req.protocol_version):
+        return _projection_error(422, "invalid_continuity_snapshot", "unsupported_projection_protocol")
+
+    try:
+        payload = _normalize_projection_payload(req)
+    except ValueError as exc:
+        error_code = str(exc)
+        if error_code == "unsupported_projection_protocol":
+            return _projection_error(422, "invalid_continuity_snapshot", error_code)
+        return _projection_error(422, "invalid_continuity_snapshot", error_code)
+
+    profile_dir = Path(get_profile_path(session_id))
+    ensure_companion_profile(profile_dir)
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import SessionDB
+
+    token = set_hermes_home_override(str(profile_dir))
+    try:
+        with profile_lock(profile_dir, "continuity_projection"):
+            session_db = SessionDB(db_path=profile_dir / "state.db")
+            try:
+                current = session_db.get_companion_memory_projection(
+                    session_id=session_id,
+                    target=PROJECTION_TARGET_CONTINUITY,
+                )
+                current_version = int((current or {}).get("memory_version") or -1)
+                current_checksum = str((current or {}).get("snapshot_checksum") or "")
+
+                if current and int(req.memory_version) < current_version:
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "status": "projection_stale_version",
+                            "received_memory_version": int(req.memory_version),
+                            "current_memory_version": current_version,
+                            "current_snapshot_checksum": current_checksum,
+                            "retryable": False,
+                        },
+                    )
+
+                if current and int(req.memory_version) == current_version:
+                    if req.snapshot_checksum != current_checksum:
+                        return JSONResponse(
+                            status_code=409,
+                            content={
+                                "status": "projection_checksum_conflict",
+                                "memory_version": current_version,
+                                "received_snapshot_checksum": str(req.snapshot_checksum),
+                                "current_snapshot_checksum": current_checksum,
+                                "retryable": False,
+                            },
+                        )
+
+                    materialized = materialize_continuity_projection(
+                        profile_dir=profile_dir,
+                        projection_row=current,
+                        session_db=session_db,
+                    )
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "status": "already_applied",
+                            "session_id": session_id,
+                            "target": PROJECTION_TARGET_CONTINUITY,
+                            "projection_id": current["projection_id"],
+                            "memory_version": current_version,
+                            "snapshot_checksum": current_checksum,
+                            "entry_count": len(payload["entries"]),
+                            "rendered_checksum": materialized["rendered_checksum"],
+                            "materialized": True,
+                        },
+                    )
+
+                snapshot_json = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                applied_at = datetime.now(timezone.utc).isoformat()
+                projection_row = session_db.upsert_companion_memory_projection(
+                    session_id=session_id,
+                    target=PROJECTION_TARGET_CONTINUITY,
+                    protocol_version=int(payload["protocol_version"]),
+                    projection_id=str(payload["projection_id"]),
+                    memory_version=int(payload["memory_version"]),
+                    snapshot_checksum=str(payload["snapshot_checksum"]),
+                    snapshot_json=snapshot_json,
+                    rendered_checksum=None,
+                    applied_at=applied_at,
+                    materialized_at=None,
+                )
+                materialized = materialize_continuity_projection(
+                    profile_dir=profile_dir,
+                    projection_row=projection_row,
+                    session_db=session_db,
+                )
+                updated = session_db.get_companion_memory_projection(
+                    session_id=session_id,
+                    target=PROJECTION_TARGET_CONTINUITY,
+                ) or projection_row
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "status": "applied",
+                        "session_id": session_id,
+                        "target": PROJECTION_TARGET_CONTINUITY,
+                        "projection_id": updated["projection_id"],
+                        "memory_version": updated["memory_version"],
+                        "snapshot_checksum": updated["snapshot_checksum"],
+                        "entry_count": len(payload["entries"]),
+                        "rendered_checksum": materialized["rendered_checksum"],
+                        "materialized": True,
+                    },
+                )
+            finally:
+                session_db.close()
+    except HTTPException:
+        raise
+    except sqlite3.OperationalError as exc:
+        if _is_sqlite_busy_error(exc):
+            logger.warning("SQLite busy while applying continuity projection for %s", session_id)
+            return _projection_error(
+                503,
+                "projection_apply_failed",
+                "projection_sqlite_busy",
+                retryable=True,
+            )
+        logger.exception("SQLite operational failure while applying continuity projection for %s", session_id)
+        return _projection_error(
+            500,
+            "projection_apply_failed",
+            "projection_file_materialization_failed",
+            retryable=True,
+        )
+    except Exception:
+        logger.exception("Failed to apply continuity projection for %s", session_id)
+        return _projection_error(
+            500,
+            "projection_apply_failed",
+            "projection_file_materialization_failed",
+            retryable=True,
+        )
+    finally:
         reset_hermes_home_override(token)
 
 @router.delete("/sessions/{session_id}")

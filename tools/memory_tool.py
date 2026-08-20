@@ -23,13 +23,16 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import hashlib
 import json
 import logging
 import os
 import re
+import sqlite3
 import tempfile
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
@@ -52,6 +55,24 @@ logger = logging.getLogger(__name__)
 DEFAULT_MEMORY_CHAR_LIMIT = 2200
 DEFAULT_USER_CHAR_LIMIT = 1375
 DEFAULT_CONTINUITY_CHAR_LIMIT = 6000
+CONTINUITY_ENTRY_DELIMITER = "\n§\n"
+PROJECTION_TARGET_CONTINUITY = "continuity"
+PROJECTION_PROTOCOL_VERSION = 1
+PROJECTION_RENDERED_CHAR_LIMIT_MAX = 6000
+_PROJECTION_KIND_LABELS = {
+    "commitment": "承诺",
+    "agreement": "约定",
+    "relationship_milestone": "关系里程碑",
+    "shared_event": "共同经历",
+    "unresolved_thread": "未完剧情",
+    "gift_or_secret": "礼物或秘密",
+}
+_PROJECTION_STATE_LABELS = {
+    "active": "进行中",
+    "completed": "已完成",
+    "cancelled": "已取消",
+}
+_PROJECTION_SCOPE_KINDS = {"pair", "story_branch"}
 
 # Where memory files live — resolved dynamically so profile overrides
 # (HERMES_HOME env var changes) are always respected.  The old module-level
@@ -62,6 +83,187 @@ def get_memory_dir() -> Path:
     return get_hermes_home() / "memories"
 
 ENTRY_DELIMITER = "\n§\n"
+
+
+def projection_sha256_hex(value: str | bytes) -> str:
+    data = value.encode("utf-8") if isinstance(value, str) else value
+    return hashlib.sha256(data).hexdigest()
+
+
+def build_projection_session_id(user_id: Any, character_id: Any) -> str:
+    return "savana_{0}_{1}".format(str(user_id).lower(), str(character_id).lower())
+
+
+def render_continuity_projection_text(entries: List[Dict[str, Any]] | tuple[Dict[str, Any], ...]) -> str:
+    rendered_entries: List[str] = []
+    for entry in entries or []:
+        story_kind = str((entry or {}).get("story_kind") or "")
+        story_state = str((entry or {}).get("story_state") or "")
+        content = str((entry or {}).get("content") or "")
+        kind_label = _PROJECTION_KIND_LABELS.get(story_kind)
+        state_label = _PROJECTION_STATE_LABELS.get(story_state)
+        if not kind_label or not state_label:
+            raise ValueError("invalid_continuity_snapshot")
+        rendered_entries.append("[{0}·{1}] {2}".format(kind_label, state_label, content))
+    return CONTINUITY_ENTRY_DELIMITER.join(rendered_entries)
+
+
+def _stable_projection_json(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _coerce_projection_payload(snapshot_json: str | Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(snapshot_json, dict):
+        payload = dict(snapshot_json)
+    else:
+        payload = json.loads(str(snapshot_json))
+    if not isinstance(payload, dict):
+        raise ValueError("invalid_continuity_snapshot")
+    entries = payload.get("entries")
+    if entries is None:
+        payload["entries"] = []
+    elif not isinstance(entries, list):
+        raise ValueError("invalid_continuity_snapshot")
+    return payload
+
+
+def _read_projection_row_from_db(
+    db_path: Path,
+    *,
+    session_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if not db_path.exists():
+        return None
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        if session_id:
+            row = conn.execute(
+                """
+                SELECT session_id, target, protocol_version, projection_id, memory_version,
+                       snapshot_checksum, snapshot_json, rendered_checksum,
+                       applied_at, materialized_at
+                FROM companion_memory_projections
+                WHERE session_id = ? AND target = ?
+                """,
+                (session_id, PROJECTION_TARGET_CONTINUITY),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT session_id, target, protocol_version, projection_id, memory_version,
+                       snapshot_checksum, snapshot_json, rendered_checksum,
+                       applied_at, materialized_at
+                FROM companion_memory_projections
+                WHERE target = ?
+                ORDER BY memory_version DESC, applied_at DESC
+                LIMIT 1
+                """,
+                (PROJECTION_TARGET_CONTINUITY,),
+            ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def materialize_continuity_projection(
+    *,
+    profile_dir: Path,
+    projection_row: Dict[str, Any],
+    session_db: Any | None = None,
+) -> Dict[str, Any]:
+    payload = _coerce_projection_payload(projection_row.get("snapshot_json") or {})
+    rendered_text = render_continuity_projection_text(payload.get("entries") or [])
+    rendered_checksum = projection_sha256_hex(rendered_text)
+    continuity_path = Path(profile_dir) / "memories" / "CONTINUITY.md"
+    continuity_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with MemoryStore._file_lock(continuity_path):
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(continuity_path.parent),
+            suffix=".tmp",
+            prefix=".continuity_projection_",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(rendered_text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            atomic_replace(tmp_path, continuity_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    materialized_at = datetime.now(timezone.utc).isoformat()
+    close_db = session_db is None
+    if session_db is None:
+        from hermes_state import SessionDB
+
+        session_db = SessionDB(db_path=Path(profile_dir) / "state.db")
+    try:
+        session_db.upsert_companion_memory_projection(
+            session_id=str(projection_row["session_id"]),
+            target=str(projection_row["target"]),
+            protocol_version=int(projection_row["protocol_version"]),
+            projection_id=str(projection_row["projection_id"]),
+            memory_version=int(projection_row["memory_version"]),
+            snapshot_checksum=str(projection_row["snapshot_checksum"]),
+            snapshot_json=str(projection_row["snapshot_json"]),
+            rendered_checksum=rendered_checksum,
+            applied_at=str(projection_row["applied_at"]),
+            materialized_at=materialized_at,
+        )
+    finally:
+        if close_db:
+            session_db.close()
+
+    return {
+        "rendered_text": rendered_text,
+        "rendered_checksum": rendered_checksum,
+        "materialized_at": materialized_at,
+    }
+
+
+def repair_continuity_from_projection(
+    profile_dir: Path,
+    *,
+    session_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    profile_dir = Path(profile_dir)
+    projection_row = _read_projection_row_from_db(
+        profile_dir / "state.db",
+        session_id=session_id,
+    )
+    if projection_row is None:
+        return None
+
+    payload = _coerce_projection_payload(projection_row.get("snapshot_json") or {})
+    rendered_text = render_continuity_projection_text(payload.get("entries") or [])
+    rendered_checksum = projection_sha256_hex(rendered_text)
+    continuity_path = profile_dir / "memories" / "CONTINUITY.md"
+    current_text = ""
+    if continuity_path.exists():
+        try:
+            current_text = continuity_path.read_text(encoding="utf-8")
+        except OSError:
+            current_text = ""
+
+    if (
+        continuity_path.exists()
+        and current_text == rendered_text
+        and str(projection_row.get("rendered_checksum") or "") == rendered_checksum
+        and projection_row.get("materialized_at")
+    ):
+        return {
+            "rendered_text": rendered_text,
+            "rendered_checksum": rendered_checksum,
+            "materialized_at": projection_row.get("materialized_at"),
+        }
+
+    return materialize_continuity_projection(
+        profile_dir=profile_dir,
+        projection_row=projection_row,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +433,10 @@ class MemoryStore:
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            repair_continuity_from_projection(mem_dir.parent)
+        except Exception:
+            logger.exception("Failed to reconcile CONTINUITY.md from projection snapshot")
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")

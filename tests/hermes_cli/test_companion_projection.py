@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from pathlib import Path
 
 import pytest
+from starlette.testclient import TestClient
 
 from hermes_state import SessionDB
+from hermes_cli.web_server import app
 from tests.hermes_cli.story_projection_fixtures import (
     DEFAULT_APPLIED_AT,
     PROJECTION_PROTOCOL_VERSION,
@@ -26,6 +30,73 @@ def _projection_columns(db_path: Path) -> dict[str, dict[str, int | str | None]]
             "pk": row[5],
         }
         for row in rows
+    }
+
+
+def _sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _projection_payload(
+    *,
+    user_id: str = "5a7ba070-8650-4f95-af38-3673f7bc5f18",
+    character_id: str = "57ffc9e5-9b4a-48bb-b597-fbdfdd47f9ee",
+    projection_id: str = "784b9d19-1ce8-4d43-a366-60f4aa5b67c1",
+    memory_version: int = 42,
+    content: str = "角色答应在11月7日给用户准备低糖生日蛋糕",
+) -> dict[str, object]:
+    entries = [
+        {
+            "memory_id": "4a52c78f-d07b-55e1-b1fd-5073bffb9e3e",
+            "story_kind": "commitment",
+            "story_state": "active",
+            "content": content,
+            "content_hash": _sha256_hex(content),
+            "importance": 9,
+            "event_time": "11月7日",
+            "scope_kind": "pair",
+            "scope_id": None,
+        }
+    ]
+    payload = {
+        "protocol_version": 1,
+        "projection_id": projection_id,
+        "target": "continuity",
+        "user_id": user_id,
+        "character_id": character_id,
+        "memory_version": memory_version,
+        "snapshot_checksum": "",
+        "generated_at": "2026-08-20T14:03:12.123456+08:00",
+        "budget": {
+            "rendered_char_limit": 4000,
+            "omitted_count": 0,
+            "omitted_kinds": [],
+        },
+        "entries": entries,
+    }
+    checksum_document = {
+        "protocol_version": payload["protocol_version"],
+        "target": payload["target"],
+        "user_id": payload["user_id"],
+        "character_id": payload["character_id"],
+        "budget": payload["budget"],
+        "entries": payload["entries"],
+    }
+    payload["snapshot_checksum"] = hashlib.sha256(
+        json.dumps(
+            checksum_document,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return payload
+
+
+def _projection_headers(payload: dict[str, object]) -> dict[str, str]:
+    return {
+        "X-Projection-Id": str(payload["projection_id"]),
+        "X-Projection-Protocol": str(payload["protocol_version"]),
     }
 
 
@@ -228,3 +299,413 @@ class TestCompanionProjectionStateApi:
         assert projection["memory_version"] == 2
         assert projection["snapshot_checksum"] == "replacement-snapshot-checksum"
         assert projection["materialized_at"] is None
+
+
+class TestContinuityProjectionRendering:
+    def test_renders_all_story_kinds_with_chinese_labels_and_hides_scope_metadata(self):
+        payload = _projection_payload()
+        payload["entries"] = [
+            {
+                "memory_id": "11111111-1111-1111-1111-111111111111",
+                "story_kind": "relationship_milestone",
+                "story_state": "active",
+                "content": "两人已经正式确认恋人关系",
+                "content_hash": _sha256_hex("两人已经正式确认恋人关系"),
+                "importance": 10,
+                "event_time": None,
+                "scope_kind": "pair",
+                "scope_id": None,
+            },
+            {
+                "memory_id": "22222222-2222-2222-2222-222222222222",
+                "story_kind": "commitment",
+                "story_state": "active",
+                "content": "角色答应在11月7日准备低糖生日蛋糕",
+                "content_hash": _sha256_hex("角色答应在11月7日准备低糖生日蛋糕"),
+                "importance": 9,
+                "event_time": "11月7日",
+                "scope_kind": "pair",
+                "scope_id": None,
+            },
+            {
+                "memory_id": "33333333-3333-3333-3333-333333333333",
+                "story_kind": "agreement",
+                "story_state": "cancelled",
+                "content": "原定周六一起去看展的约定已取消",
+                "content_hash": _sha256_hex("原定周六一起去看展的约定已取消"),
+                "importance": 8,
+                "event_time": None,
+                "scope_kind": "story_branch",
+                "scope_id": "branch-secret",
+            },
+            {
+                "memory_id": "44444444-4444-4444-4444-444444444444",
+                "story_kind": "unresolved_thread",
+                "story_state": "active",
+                "content": "下周继续调查旧车站线索",
+                "content_hash": _sha256_hex("下周继续调查旧车站线索"),
+                "importance": 8,
+                "event_time": None,
+                "scope_kind": "story_branch",
+                "scope_id": "branch-secret",
+            },
+            {
+                "memory_id": "55555555-5555-5555-5555-555555555555",
+                "story_kind": "shared_event",
+                "story_state": "completed",
+                "content": "两人已经找回遗失的相册",
+                "content_hash": _sha256_hex("两人已经找回遗失的相册"),
+                "importance": 7,
+                "event_time": None,
+                "scope_kind": "pair",
+                "scope_id": None,
+            },
+            {
+                "memory_id": "66666666-6666-6666-6666-666666666666",
+                "story_kind": "gift_or_secret",
+                "story_state": "active",
+                "content": "角色把旧怀表交给用户保管",
+                "content_hash": _sha256_hex("角色把旧怀表交给用户保管"),
+                "importance": 7,
+                "event_time": None,
+                "scope_kind": "pair",
+                "scope_id": None,
+            },
+        ]
+        payload["budget"]["rendered_char_limit"] = 6000
+        payload["snapshot_checksum"] = _sha256_hex(
+            json.dumps(
+                {
+                    "protocol_version": payload["protocol_version"],
+                    "target": payload["target"],
+                    "user_id": payload["user_id"],
+                    "character_id": payload["character_id"],
+                    "budget": payload["budget"],
+                    "entries": payload["entries"],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+
+        from tools.memory_tool import render_continuity_projection_text
+
+        rendered = render_continuity_projection_text(payload["entries"])
+
+        assert rendered.split("\n§\n") == [
+            "[关系里程碑·进行中] 两人已经正式确认恋人关系",
+            "[承诺·进行中] 角色答应在11月7日准备低糖生日蛋糕",
+            "[约定·已取消] 原定周六一起去看展的约定已取消",
+            "[未完剧情·进行中] 下周继续调查旧车站线索",
+            "[共同经历·已完成] 两人已经找回遗失的相册",
+            "[礼物或秘密·进行中] 角色把旧怀表交给用户保管",
+        ]
+        assert "branch-secret" not in rendered
+        assert "scope_kind" not in rendered
+        assert "importance" not in rendered
+
+    def test_put_projection_rejects_budget_above_6000_without_echoing_content(self, tmp_path, monkeypatch):
+        payload = _projection_payload(content="绝对不能回显的超长剧情")
+        session_id = "savana_{0}_{1}".format(payload["user_id"], payload["character_id"])
+        create_story_projection_fixture(
+            tmp_path,
+            monkeypatch,
+            profile_name=session_id,
+            session_id=session_id,
+        )
+        payload["budget"]["rendered_char_limit"] = 6001
+        payload["snapshot_checksum"] = _sha256_hex(
+            json.dumps(
+                {
+                    "protocol_version": payload["protocol_version"],
+                    "target": payload["target"],
+                    "user_id": payload["user_id"],
+                    "character_id": payload["character_id"],
+                    "budget": payload["budget"],
+                    "entries": payload["entries"],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+
+        response = TestClient(app).put(
+            f"/companion/v1/sessions/{session_id}/memory-projections/continuity",
+            json=payload,
+            headers=_projection_headers(payload),
+        )
+
+        assert response.status_code == 422
+        assert response.json()["error_code"] == "projection_budget_exceeded"
+        assert "绝对不能回显的超长剧情" not in response.text
+
+
+class TestCompanionProjectionEndpoint:
+    def test_put_projection_applies_snapshot_and_persists_watermark(self, tmp_path, monkeypatch):
+        payload = _projection_payload()
+        session_id = "savana_{0}_{1}".format(payload["user_id"], payload["character_id"])
+        fixture = create_story_projection_fixture(
+            tmp_path,
+            monkeypatch,
+            profile_name=session_id,
+            session_id=session_id,
+            continuity_text="旧剧情",
+            projection_id="old-projection-id",
+            memory_version=5,
+        )
+
+        response = TestClient(app).put(
+            f"/companion/v1/sessions/{session_id}/memory-projections/continuity",
+            json=payload,
+            headers=_projection_headers(payload),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "applied"
+        assert fixture.continuity_path.read_text(encoding="utf-8") == (
+            "[承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕"
+        )
+
+        row = fixture.read_projection_row()
+        assert row["projection_id"] == payload["projection_id"]
+        assert row["memory_version"] == payload["memory_version"]
+        assert row["snapshot_checksum"] == payload["snapshot_checksum"]
+        assert row["materialized_at"]
+
+    def test_put_projection_rejects_identity_mismatch_without_touching_profile(self, tmp_path, monkeypatch):
+        payload = _projection_payload()
+        session_id = "savana_other_user_other_character"
+        fixture = create_story_projection_fixture(
+            tmp_path,
+            monkeypatch,
+            profile_name=session_id,
+            session_id=session_id,
+            continuity_text="原始剧情",
+            projection_id="fixture-projection-id",
+            memory_version=7,
+        )
+
+        response = TestClient(app).put(
+            f"/companion/v1/sessions/{session_id}/memory-projections/continuity",
+            json=payload,
+            headers=_projection_headers(payload),
+        )
+
+        assert response.status_code == 422
+        assert response.json()["error_code"] == "projection_identity_mismatch"
+        assert fixture.continuity_path.read_text(encoding="utf-8") == "原始剧情"
+        row = fixture.read_projection_row()
+        assert row["projection_id"] == "fixture-projection-id"
+        assert row["memory_version"] == 7
+
+    def test_put_projection_repairs_missing_file_on_same_version_retry(self, tmp_path, monkeypatch):
+        payload = _projection_payload()
+        session_id = "savana_{0}_{1}".format(payload["user_id"], payload["character_id"])
+        fixture = create_story_projection_fixture(
+            tmp_path,
+            monkeypatch,
+            profile_name=session_id,
+            session_id=session_id,
+            continuity_text="[承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕",
+            projection_id=str(payload["projection_id"]),
+            memory_version=int(payload["memory_version"]),
+            snapshot_payload={
+                "protocol_version": payload["protocol_version"],
+                "target": payload["target"],
+                "user_id": payload["user_id"],
+                "character_id": payload["character_id"],
+                "budget": payload["budget"],
+                "entries": payload["entries"],
+            },
+        )
+        fixture.continuity_path.unlink()
+
+        response = TestClient(app).put(
+            f"/companion/v1/sessions/{session_id}/memory-projections/continuity",
+            json=payload,
+            headers=_projection_headers(payload),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "already_applied"
+        assert fixture.continuity_path.read_text(encoding="utf-8") == (
+            "[承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕"
+        )
+
+    def test_put_projection_repairs_drifted_file_on_same_version_retry(self, tmp_path, monkeypatch):
+        payload = _projection_payload()
+        session_id = "savana_{0}_{1}".format(payload["user_id"], payload["character_id"])
+        fixture = create_story_projection_fixture(
+            tmp_path,
+            monkeypatch,
+            profile_name=session_id,
+            session_id=session_id,
+            continuity_text="[承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕",
+            projection_id=str(payload["projection_id"]),
+            memory_version=int(payload["memory_version"]),
+            snapshot_payload={
+                "protocol_version": payload["protocol_version"],
+                "target": payload["target"],
+                "user_id": payload["user_id"],
+                "character_id": payload["character_id"],
+                "budget": payload["budget"],
+                "entries": payload["entries"],
+            },
+        )
+        fixture.continuity_path.write_text("被手工改坏的剧情内容", encoding="utf-8")
+
+        response = TestClient(app).put(
+            f"/companion/v1/sessions/{session_id}/memory-projections/continuity",
+            json=payload,
+            headers=_projection_headers(payload),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "already_applied"
+        assert fixture.continuity_path.read_text(encoding="utf-8") == (
+            "[承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕"
+        )
+
+    def test_put_projection_rejects_invalid_generated_at_without_echoing_content(self, tmp_path, monkeypatch):
+        payload = _projection_payload(content="绝对不能在报错里回显的剧情")
+        session_id = "savana_{0}_{1}".format(payload["user_id"], payload["character_id"])
+        create_story_projection_fixture(
+            tmp_path,
+            monkeypatch,
+            profile_name=session_id,
+            session_id=session_id,
+        )
+        payload["generated_at"] = "not-a-timestamp"
+        payload["snapshot_checksum"] = _sha256_hex(
+            json.dumps(
+                {
+                    "protocol_version": payload["protocol_version"],
+                    "target": payload["target"],
+                    "user_id": payload["user_id"],
+                    "character_id": payload["character_id"],
+                    "budget": payload["budget"],
+                    "entries": payload["entries"],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+
+        response = TestClient(app).put(
+            f"/companion/v1/sessions/{session_id}/memory-projections/continuity",
+            json=payload,
+            headers=_projection_headers(payload),
+        )
+
+        assert response.status_code == 422
+        assert response.json()["error_code"] == "invalid_continuity_snapshot"
+        assert "绝对不能在报错里回显的剧情" not in response.text
+
+    def test_put_projection_returns_retryable_503_for_sqlite_busy(self, tmp_path, monkeypatch):
+        payload = _projection_payload()
+        session_id = "savana_{0}_{1}".format(payload["user_id"], payload["character_id"])
+        create_story_projection_fixture(
+            tmp_path,
+            monkeypatch,
+            profile_name=session_id,
+            session_id=session_id,
+            continuity_text="旧剧情",
+            projection_id="old-projection-id",
+            memory_version=1,
+        )
+
+        class BusySessionDB:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def get_companion_memory_projection(self, *args, **kwargs):
+                return None
+
+            def close(self):
+                return None
+
+            def upsert_companion_memory_projection(self, *args, **kwargs):
+                raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr("hermes_state.SessionDB", BusySessionDB)
+
+        response = TestClient(app).put(
+            f"/companion/v1/sessions/{session_id}/memory-projections/continuity",
+            json=payload,
+            headers=_projection_headers(payload),
+        )
+
+        assert response.status_code == 503
+        assert response.json() == {
+            "status": "projection_apply_failed",
+            "error_code": "projection_sqlite_busy",
+            "retryable": True,
+        }
+
+    def test_load_from_disk_repairs_missing_continuity_from_projection_snapshot(self, tmp_path, monkeypatch):
+        from tools.memory_tool import MemoryStore
+
+        payload = _projection_payload()
+        session_id = "savana_{0}_{1}".format(payload["user_id"], payload["character_id"])
+        fixture = create_story_projection_fixture(
+            tmp_path,
+            monkeypatch,
+            profile_name=session_id,
+            session_id=session_id,
+            continuity_text="",
+            projection_id=str(payload["projection_id"]),
+            memory_version=int(payload["memory_version"]),
+            materialized_at=None,
+            snapshot_payload={
+                "protocol_version": payload["protocol_version"],
+                "target": payload["target"],
+                "user_id": payload["user_id"],
+                "character_id": payload["character_id"],
+                "budget": payload["budget"],
+                "entries": payload["entries"],
+            },
+        )
+        fixture.continuity_path.unlink()
+
+        store = MemoryStore()
+        store.load_from_disk()
+
+        continuity_text = fixture.continuity_path.read_text(encoding="utf-8")
+        assert continuity_text == "[承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕"
+        assert store.format_for_system_prompt("continuity")
+        assert "角色答应在11月7日给用户准备低糖生日蛋糕" in store.format_for_system_prompt("continuity")
+
+    def test_load_from_disk_repairs_drifted_continuity_from_projection_snapshot(self, tmp_path, monkeypatch):
+        from tools.memory_tool import MemoryStore
+
+        payload = _projection_payload()
+        session_id = "savana_{0}_{1}".format(payload["user_id"], payload["character_id"])
+        fixture = create_story_projection_fixture(
+            tmp_path,
+            monkeypatch,
+            profile_name=session_id,
+            session_id=session_id,
+            continuity_text="完全错误的旧文件内容",
+            projection_id=str(payload["projection_id"]),
+            memory_version=int(payload["memory_version"]),
+            materialized_at=DEFAULT_APPLIED_AT,
+            snapshot_payload={
+                "protocol_version": payload["protocol_version"],
+                "target": payload["target"],
+                "user_id": payload["user_id"],
+                "character_id": payload["character_id"],
+                "budget": payload["budget"],
+                "entries": payload["entries"],
+            },
+        )
+        fixture.continuity_path.write_text("被外部漂移污染的文件", encoding="utf-8")
+
+        store = MemoryStore()
+        store.load_from_disk()
+
+        continuity_text = fixture.continuity_path.read_text(encoding="utf-8")
+        assert continuity_text == "[承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕"
+        assert store.format_for_system_prompt("continuity")
