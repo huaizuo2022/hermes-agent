@@ -48,6 +48,24 @@ from tools.memory_tool import (
 
 router = APIRouter(prefix="/companion/v1")
 logger = logging.getLogger(__name__)
+
+# OpenAI 兼容网关若配置成裸域名（缺 /v1），chat/completions 会打到网关的
+# HTML 首页：HTTP 200 + text/html，流式迭代 0 chunk，表现为"空响应重试耗尽"。
+# 对 chat_completions 模式、http(s) 且 URL path 为空或仅 "/" 的裸域名补 /v1；
+# 带已有路径的配置（如 ark 的 /api/v3、wenwen 的 /v1beta）原样保留。
+def _normalize_openai_compat_base_url(base_url: str) -> str:
+    from urllib.parse import urlsplit, urlunsplit
+
+    raw = (base_url or "").strip()
+    if not raw:
+        return raw
+    parts = urlsplit(raw)
+    if parts.scheme not in ("http", "https"):
+        return raw
+    if parts.path.strip("/"):
+        return raw
+    return urlunsplit((parts.scheme, parts.netloc, "/v1", "", ""))
+
 _SESSION_LOCKS = {}
 _SESSION_LOCKS_GUARD = threading.Lock()
 _UNRESOLVED_REVIEW_TASKS = {}
@@ -1774,7 +1792,9 @@ async def chat_endpoint(req: ChatRequest):
 
         # 动态解析模型及 API 配置
         api_key = req.api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        base_url = req.api_base or os.environ.get("DEEPSEEK_API_BASE") or "https://api.deepseek.com"
+        base_url = _normalize_openai_compat_base_url(
+            req.api_base or os.environ.get("DEEPSEEK_API_BASE") or "https://api.deepseek.com"
+        )
         provider = req.provider or "deepseek"
         model = req.model or "deepseek-v4-flash"
         effective_directives = ""
