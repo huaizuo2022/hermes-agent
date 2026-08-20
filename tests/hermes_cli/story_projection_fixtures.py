@@ -10,7 +10,8 @@ from typing import Any, Mapping
 from hermes_state import SessionDB
 
 
-PROJECTION_PROTOCOL_VERSION = 1
+LEGACY_PROJECTION_PROTOCOL_VERSION = 1
+PROJECTION_PROTOCOL_VERSION = 2
 DEFAULT_APPLIED_AT = "2026-08-20T00:00:00Z"
 DEFAULT_SESSION_ID = "savana_user_char"
 DEFAULT_PROFILE_NAME = "story-projection"
@@ -43,6 +44,7 @@ def _default_snapshot_payload(
                     "memory_id": "fixture-memory-1",
                     "story_kind": "commitment",
                     "story_state": "active",
+                    "fact_subject": "character",
                     "content": continuity_text,
                     "content_hash": _sha256_hex(continuity_text),
                     "importance": 10,

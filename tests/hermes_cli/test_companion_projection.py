@@ -44,12 +44,17 @@ def _projection_payload(
     projection_id: str = "784b9d19-1ce8-4d43-a366-60f4aa5b67c1",
     memory_version: int = 42,
     content: str = "角色答应在11月7日给用户准备低糖生日蛋糕",
+    protocol_version: int = 2,
+    fact_subject: str = "character",
+    story_state: str = "active",
+    story_kind: str = "commitment",
 ) -> dict[str, object]:
     entries = [
         {
             "memory_id": "4a52c78f-d07b-55e1-b1fd-5073bffb9e3e",
-            "story_kind": "commitment",
-            "story_state": "active",
+            "story_kind": story_kind,
+            "story_state": story_state,
+            "fact_subject": fact_subject,
             "content": content,
             "content_hash": _sha256_hex(content),
             "importance": 9,
@@ -59,7 +64,7 @@ def _projection_payload(
         }
     ]
     payload = {
-        "protocol_version": 1,
+        "protocol_version": protocol_version,
         "projection_id": projection_id,
         "target": "continuity",
         "user_id": user_id,
@@ -82,6 +87,9 @@ def _projection_payload(
         "budget": payload["budget"],
         "entries": payload["entries"],
     }
+    if protocol_version == 1:
+        payload["entries"][0].pop("fact_subject", None)
+        checksum_document["entries"] = payload["entries"]
     payload["snapshot_checksum"] = hashlib.sha256(
         json.dumps(
             checksum_document,
@@ -91,6 +99,83 @@ def _projection_payload(
         ).encode("utf-8")
     ).hexdigest()
     return payload
+
+
+def test_projection_v2_renders_subject_and_pending_state():
+    payload = _projection_payload(
+        content="用户提议周日和角色一起去看展",
+        fact_subject="user",
+        story_state="pending_confirmation",
+        story_kind="agreement",
+    )
+
+    from hermes_cli.companion_api import _normalize_projection_payload, ContinuityProjectionRequest
+    from tools.memory_tool import render_continuity_projection_text
+
+    normalized = _normalize_projection_payload(ContinuityProjectionRequest(**payload))
+    assert render_continuity_projection_text(normalized["entries"]) == (
+        "[用户提议·待确认] 用户提议周日和角色一起去看展"
+    )
+
+
+def test_projection_receiver_keeps_v1_compatibility():
+    payload = _projection_payload(protocol_version=1)
+
+    from hermes_cli.companion_api import _normalize_projection_payload, ContinuityProjectionRequest
+    from tools.memory_tool import render_continuity_projection_text
+
+    normalized = _normalize_projection_payload(ContinuityProjectionRequest(**payload))
+    assert "fact_subject" not in normalized["entries"][0]
+    assert render_continuity_projection_text(normalized["entries"]).startswith("[承诺·进行中]")
+
+
+@pytest.mark.parametrize(
+    ("story_kind", "story_state", "fact_subject"),
+    [
+        ("agreement", "pending_confirmation", "mutual"),
+        ("agreement", "completed", "user"),
+        ("relationship_milestone", "active", "character"),
+    ],
+)
+def test_projection_v2_rejects_invalid_subject_state_combinations(
+    story_kind: str,
+    story_state: str,
+    fact_subject: str,
+):
+    from hermes_cli.companion_api import _normalize_projection_payload, ContinuityProjectionRequest
+
+    payload = _projection_payload(
+        story_kind=story_kind,
+        story_state=story_state,
+        fact_subject=fact_subject,
+    )
+
+    with pytest.raises(ValueError, match="invalid_continuity_snapshot"):
+        _normalize_projection_payload(ContinuityProjectionRequest(**payload))
+
+
+def test_chat_request_accepts_readonly_mode_only():
+    from pydantic import ValidationError
+    from hermes_cli.companion_api import ChatRequest
+
+    request = ChatRequest(
+        user_id="user",
+        character_id="character",
+        message_id="message",
+        user_message="probe",
+        character_profile={},
+        memory_write_mode="readonly",
+    )
+    assert request.memory_write_mode == "readonly"
+    with pytest.raises(ValidationError):
+        ChatRequest(
+            user_id="user",
+            character_id="character",
+            message_id="message",
+            user_message="probe",
+            character_profile={},
+            memory_write_mode="off",
+        )
 
 
 def _projection_headers(payload: dict[str, object]) -> dict[str, str]:
@@ -309,6 +394,7 @@ class TestContinuityProjectionRendering:
                 "memory_id": "11111111-1111-1111-1111-111111111111",
                 "story_kind": "relationship_milestone",
                 "story_state": "active",
+                "fact_subject": "mutual",
                 "content": "两人已经正式确认恋人关系",
                 "content_hash": _sha256_hex("两人已经正式确认恋人关系"),
                 "importance": 10,
@@ -320,6 +406,7 @@ class TestContinuityProjectionRendering:
                 "memory_id": "22222222-2222-2222-2222-222222222222",
                 "story_kind": "commitment",
                 "story_state": "active",
+                "fact_subject": "character",
                 "content": "角色答应在11月7日准备低糖生日蛋糕",
                 "content_hash": _sha256_hex("角色答应在11月7日准备低糖生日蛋糕"),
                 "importance": 9,
@@ -331,6 +418,7 @@ class TestContinuityProjectionRendering:
                 "memory_id": "33333333-3333-3333-3333-333333333333",
                 "story_kind": "agreement",
                 "story_state": "cancelled",
+                "fact_subject": "mutual",
                 "content": "原定周六一起去看展的约定已取消",
                 "content_hash": _sha256_hex("原定周六一起去看展的约定已取消"),
                 "importance": 8,
@@ -342,6 +430,7 @@ class TestContinuityProjectionRendering:
                 "memory_id": "44444444-4444-4444-4444-444444444444",
                 "story_kind": "unresolved_thread",
                 "story_state": "active",
+                "fact_subject": "mutual",
                 "content": "下周继续调查旧车站线索",
                 "content_hash": _sha256_hex("下周继续调查旧车站线索"),
                 "importance": 8,
@@ -353,6 +442,7 @@ class TestContinuityProjectionRendering:
                 "memory_id": "55555555-5555-5555-5555-555555555555",
                 "story_kind": "shared_event",
                 "story_state": "completed",
+                "fact_subject": "mutual",
                 "content": "两人已经找回遗失的相册",
                 "content_hash": _sha256_hex("两人已经找回遗失的相册"),
                 "importance": 7,
@@ -364,6 +454,7 @@ class TestContinuityProjectionRendering:
                 "memory_id": "66666666-6666-6666-6666-666666666666",
                 "story_kind": "gift_or_secret",
                 "story_state": "active",
+                "fact_subject": "mutual",
                 "content": "角色把旧怀表交给用户保管",
                 "content_hash": _sha256_hex("角色把旧怀表交给用户保管"),
                 "importance": 7,
@@ -394,12 +485,12 @@ class TestContinuityProjectionRendering:
         rendered = render_continuity_projection_text(payload["entries"])
 
         assert rendered.split("\n§\n") == [
-            "[关系里程碑·进行中] 两人已经正式确认恋人关系",
-            "[承诺·进行中] 角色答应在11月7日准备低糖生日蛋糕",
-            "[约定·已取消] 原定周六一起去看展的约定已取消",
-            "[未完剧情·进行中] 下周继续调查旧车站线索",
-            "[共同经历·已完成] 两人已经找回遗失的相册",
-            "[礼物或秘密·进行中] 角色把旧怀表交给用户保管",
+            "[双方关系里程碑·进行中] 两人已经正式确认恋人关系",
+            "[角色承诺·进行中] 角色答应在11月7日准备低糖生日蛋糕",
+            "[双方约定·已取消] 原定周六一起去看展的约定已取消",
+            "[双方未完剧情·进行中] 下周继续调查旧车站线索",
+            "[双方共同经历·已完成] 两人已经找回遗失的相册",
+            "[双方礼物或秘密·进行中] 角色把旧怀表交给用户保管",
         ]
         assert "branch-secret" not in rendered
         assert "scope_kind" not in rendered
@@ -465,7 +556,7 @@ class TestCompanionProjectionEndpoint:
         assert response.status_code == 200
         assert response.json()["status"] == "applied"
         assert fixture.continuity_path.read_text(encoding="utf-8") == (
-            "[承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕"
+            "[角色承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕"
         )
 
         row = fixture.read_projection_row()
@@ -508,7 +599,7 @@ class TestCompanionProjectionEndpoint:
             monkeypatch,
             profile_name=session_id,
             session_id=session_id,
-            continuity_text="[承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕",
+            continuity_text="[角色承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕",
             projection_id=str(payload["projection_id"]),
             memory_version=int(payload["memory_version"]),
             snapshot_payload={
@@ -531,7 +622,7 @@ class TestCompanionProjectionEndpoint:
         assert response.status_code == 200
         assert response.json()["status"] == "already_applied"
         assert fixture.continuity_path.read_text(encoding="utf-8") == (
-            "[承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕"
+            "[角色承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕"
         )
 
     def test_put_projection_repairs_drifted_file_on_same_version_retry(self, tmp_path, monkeypatch):
@@ -542,7 +633,7 @@ class TestCompanionProjectionEndpoint:
             monkeypatch,
             profile_name=session_id,
             session_id=session_id,
-            continuity_text="[承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕",
+            continuity_text="[角色承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕",
             projection_id=str(payload["projection_id"]),
             memory_version=int(payload["memory_version"]),
             snapshot_payload={
@@ -565,7 +656,7 @@ class TestCompanionProjectionEndpoint:
         assert response.status_code == 200
         assert response.json()["status"] == "already_applied"
         assert fixture.continuity_path.read_text(encoding="utf-8") == (
-            "[承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕"
+            "[角色承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕"
         )
 
     def test_put_projection_rejects_invalid_generated_at_without_echoing_content(self, tmp_path, monkeypatch):
@@ -674,7 +765,7 @@ class TestCompanionProjectionEndpoint:
         store.load_from_disk()
 
         continuity_text = fixture.continuity_path.read_text(encoding="utf-8")
-        assert continuity_text == "[承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕"
+        assert continuity_text == "[角色承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕"
         assert store.format_for_system_prompt("continuity")
         assert "角色答应在11月7日给用户准备低糖生日蛋糕" in store.format_for_system_prompt("continuity")
 
@@ -707,5 +798,5 @@ class TestCompanionProjectionEndpoint:
         store.load_from_disk()
 
         continuity_text = fixture.continuity_path.read_text(encoding="utf-8")
-        assert continuity_text == "[承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕"
+        assert continuity_text == "[角色承诺·进行中] 角色答应在11月7日给用户准备低糖生日蛋糕"
         assert store.format_for_system_prompt("continuity")

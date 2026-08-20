@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Generator, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Generator, List, Literal, Optional, Tuple
 
 import anyio
 import httpx
@@ -122,6 +122,7 @@ class ChatRequest(BaseModel):
     companion_directives: Optional[str] = None
     request_overrides: Optional[Dict[str, Any]] = None
     reasoning_config: Optional[Dict[str, Any]] = None
+    memory_write_mode: Optional[Literal["readonly"]] = None
 
 class MemorySyncRequest(BaseModel):
     target: str
@@ -143,6 +144,7 @@ class ContinuityProjectionEntry(BaseModel):
     memory_id: str
     story_kind: str
     story_state: str
+    fact_subject: Optional[str] = None
     content: str
     content_hash: str
     importance: int
@@ -178,7 +180,7 @@ _PROJECTION_STORY_KINDS = {
     "unresolved_thread",
     "gift_or_secret",
 }
-_PROJECTION_STORY_STATES = {"active", "completed", "cancelled"}
+_PROJECTION_STORY_STATES = {"pending_confirmation", "active", "completed", "cancelled"}
 _PROJECTION_SCOPE_KINDS = {"pair", "story_branch"}
 
 
@@ -243,7 +245,8 @@ def _is_sqlite_busy_error(exc: BaseException) -> bool:
 
 def _normalize_projection_payload(req: ContinuityProjectionRequest) -> Dict[str, Any]:
     payload = req.model_dump()
-    if int(payload["protocol_version"]) != PROJECTION_PROTOCOL_VERSION:
+    protocol_version = int(payload["protocol_version"])
+    if protocol_version not in (1, PROJECTION_PROTOCOL_VERSION):
         raise ValueError("unsupported_projection_protocol")
     if str(payload["target"]) != PROJECTION_TARGET_CONTINUITY:
         raise ValueError("invalid_continuity_snapshot")
@@ -268,7 +271,7 @@ def _normalize_projection_payload(req: ContinuityProjectionRequest) -> Dict[str,
 
     normalized_entries: List[Dict[str, Any]] = []
     seen_memory_ids: set[str] = set()
-    seen_fact_tuples: set[Tuple[str, str, str, str, Optional[str]]] = set()
+    seen_fact_tuples: set[Tuple[str, str, str, str, str, Optional[str]]] = set()
     for raw_entry in payload["entries"]:
         entry = dict(raw_entry)
         if not _validate_projection_uuid(entry["memory_id"]):
@@ -276,6 +279,22 @@ def _normalize_projection_payload(req: ContinuityProjectionRequest) -> Dict[str,
         if entry["story_kind"] not in _PROJECTION_STORY_KINDS:
             raise ValueError("invalid_continuity_snapshot")
         if entry["story_state"] not in _PROJECTION_STORY_STATES:
+            raise ValueError("invalid_continuity_snapshot")
+        fact_subject = str(entry.get("fact_subject") or "").strip().lower()
+        if not fact_subject and protocol_version == 1:
+            fact_subject = "character" if entry["story_kind"] == "commitment" else "mutual"
+        if fact_subject not in {"user", "character", "mutual"}:
+            raise ValueError("invalid_continuity_snapshot")
+        if protocol_version == 1 and entry["story_state"] == "pending_confirmation":
+            raise ValueError("invalid_continuity_snapshot")
+        if entry["story_state"] == "pending_confirmation" and entry["story_kind"] != "agreement":
+            raise ValueError("invalid_continuity_snapshot")
+        if entry["story_kind"] == "agreement":
+            if entry["story_state"] == "pending_confirmation" and fact_subject == "mutual":
+                raise ValueError("invalid_continuity_snapshot")
+            if entry["story_state"] != "pending_confirmation" and fact_subject != "mutual":
+                raise ValueError("invalid_continuity_snapshot")
+        if entry["story_kind"] == "relationship_milestone" and fact_subject != "mutual":
             raise ValueError("invalid_continuity_snapshot")
         content = str(entry["content"]).strip()
         if (
@@ -305,6 +324,7 @@ def _normalize_projection_payload(req: ContinuityProjectionRequest) -> Dict[str,
         fact_key = (
             entry["story_kind"],
             entry["story_state"],
+            fact_subject,
             content,
             entry["scope_kind"],
             scope_id,
@@ -314,6 +334,10 @@ def _normalize_projection_payload(req: ContinuityProjectionRequest) -> Dict[str,
         seen_fact_tuples.add(fact_key)
 
         entry["content"] = content
+        if protocol_version >= PROJECTION_PROTOCOL_VERSION:
+            entry["fact_subject"] = fact_subject
+        else:
+            entry.pop("fact_subject", None)
         entry["importance"] = importance
         normalized_entries.append(entry)
 
@@ -1755,7 +1779,8 @@ async def chat_endpoint(req: ChatRequest):
         model = req.model or "deepseek-v4-flash"
         effective_directives = ""
         diagnostics_directives = req.companion_directives or ""
-        enabled_toolsets = ["memory"]
+        memory_read_only = req.memory_write_mode == "readonly"
+        enabled_toolsets = [] if memory_read_only else ["memory"]
         if not style_guard_enabled:
             effective_directives = req.directives
             diagnostics_directives = req.directives
@@ -1880,8 +1905,8 @@ async def chat_endpoint(req: ChatRequest):
             producer_done = threading.Event()
 
             def _build_stream_metadata():
-                modifications = review_metadata.get("memory_modifications", [])
-                if not style_guard_enabled and not modifications:
+                modifications = [] if memory_read_only else review_metadata.get("memory_modifications", [])
+                if not memory_read_only and not style_guard_enabled and not modifications:
                     memory_store = getattr(agent, "_memory_store", None)
                     if memory_store is not None and hasattr(memory_store, "modifications"):
                         modifications = memory_store.modifications
@@ -1889,6 +1914,7 @@ async def chat_endpoint(req: ChatRequest):
                     "session_id": session_id,
                     "status": "completed",
                     "memory_modifications": modifications,
+                    "memory_write_mode": "readonly" if memory_read_only else "readwrite",
                 }
                 if style_guard_enabled:
                     metadata["review_status"] = review_metadata.get("review_status")
@@ -1911,7 +1937,7 @@ async def chat_endpoint(req: ChatRequest):
                     final_reply = _HTML_BREAK_PATTERN.sub('\n', result.get("final_response", ""))
                     q.put(("final", final_reply))
 
-                    if style_guard_enabled:
+                    if style_guard_enabled and not memory_read_only:
                         _bg_mem_store = getattr(agent, "_memory_store", None)
                         threading.Thread(
                             target=_review_companion_turn,
@@ -1994,23 +2020,28 @@ async def chat_endpoint(req: ChatRequest):
                 platform_message_id=req.message_id,
             )
             reply = _HTML_BREAK_PATTERN.sub('\n', result.get("final_response", ""))
-            review_metadata = _review_companion_turn(
-                style_guard_enabled=style_guard_enabled,
-                profile_dir=profile_dir,
-                turn_id=req.message_id,
-                assistant_text=reply,
-                user_message=req.user_message,
-                raw_history=raw_history,
-                provider=provider,
-                model=model,
-                base_url=base_url,
-                api_key=api_key,
-                memory_store=getattr(agent, "_memory_store", None),
+            review_metadata = (
+                {"memory_modifications": []}
+                if memory_read_only
+                else _review_companion_turn(
+                    style_guard_enabled=style_guard_enabled,
+                    profile_dir=profile_dir,
+                    turn_id=req.message_id,
+                    assistant_text=reply,
+                    user_message=req.user_message,
+                    raw_history=raw_history,
+                    provider=provider,
+                    model=model,
+                    base_url=base_url,
+                    api_key=api_key,
+                    memory_store=getattr(agent, "_memory_store", None),
+                )
             )
             payload = {
                 "reply": reply,
                 "session_id": session_id,
                 "memory_modifications": review_metadata.get("memory_modifications", []),
+                "memory_write_mode": "readonly" if memory_read_only else "readwrite",
             }
             if style_guard_enabled:
                 payload["review_status"] = review_metadata.get("review_status")

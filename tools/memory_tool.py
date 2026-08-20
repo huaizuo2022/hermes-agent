@@ -57,7 +57,8 @@ DEFAULT_USER_CHAR_LIMIT = 1375
 DEFAULT_CONTINUITY_CHAR_LIMIT = 6000
 CONTINUITY_ENTRY_DELIMITER = "\n§\n"
 PROJECTION_TARGET_CONTINUITY = "continuity"
-PROJECTION_PROTOCOL_VERSION = 1
+LEGACY_PROJECTION_PROTOCOL_VERSION = 1
+PROJECTION_PROTOCOL_VERSION = 2
 PROJECTION_RENDERED_CHAR_LIMIT_MAX = 6000
 _PROJECTION_KIND_LABELS = {
     "commitment": "承诺",
@@ -68,6 +69,7 @@ _PROJECTION_KIND_LABELS = {
     "gift_or_secret": "礼物或秘密",
 }
 _PROJECTION_STATE_LABELS = {
+    "pending_confirmation": "待确认",
     "active": "进行中",
     "completed": "已完成",
     "cancelled": "已取消",
@@ -100,10 +102,23 @@ def render_continuity_projection_text(entries: List[Dict[str, Any]] | tuple[Dict
         story_kind = str((entry or {}).get("story_kind") or "")
         story_state = str((entry or {}).get("story_state") or "")
         content = str((entry or {}).get("content") or "")
+        fact_subject = str((entry or {}).get("fact_subject") or "")
         kind_label = _PROJECTION_KIND_LABELS.get(story_kind)
         state_label = _PROJECTION_STATE_LABELS.get(story_state)
         if not kind_label or not state_label:
             raise ValueError("invalid_continuity_snapshot")
+        if fact_subject:
+            subject_label = {"user": "用户", "character": "角色", "mutual": "双方"}.get(fact_subject)
+            if not subject_label:
+                raise ValueError("invalid_continuity_snapshot")
+            if story_kind == "commitment":
+                kind_label = subject_label + "承诺"
+            elif story_kind == "agreement" and story_state == "pending_confirmation":
+                kind_label = subject_label + "提议"
+            elif story_kind == "agreement":
+                kind_label = "双方约定"
+            else:
+                kind_label = subject_label + kind_label
         rendered_entries.append("[{0}·{1}] {2}".format(kind_label, state_label, content))
     return CONTINUITY_ENTRY_DELIMITER.join(rendered_entries)
 
