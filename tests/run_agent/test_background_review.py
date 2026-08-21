@@ -241,3 +241,60 @@ def test_background_review_fork_skips_external_memory_plugins(monkeypatch):
         "the fork leaks harness prompts into the user's real memory "
         "namespace via on_turn_start / prefetch_all / sync_all."
     )
+
+
+def test_background_review_thread_inherits_hermes_home_override(monkeypatch):
+    """The review thread must re-apply the parent's hermes home override.
+
+    threading.Thread does not inherit contextvars.  Companion API requests
+    scope the profile dir via the hermes home ContextVar override; before the
+    fix the review thread wrote MEMORY.md / CONTINUITY.md into the GLOBAL
+    ~/.hermes/memories, cross-contaminating every session's continuity
+    (server incident 2026-08-21: global CONTINUITY.md saturated at 6000/6000
+    with ~90 cross-character storylines while per-profile files stayed empty).
+    """
+    from hermes_constants import get_hermes_home, get_hermes_home_override, set_hermes_home_override
+
+    seen_homes = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            seen_homes["init"] = str(get_hermes_home())
+
+        def run_conversation(self, **kwargs):
+            seen_homes["run"] = str(get_hermes_home())
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+
+    token = set_hermes_home_override("/tmp/bg-review-profile-home")
+    try:
+        AIAgent._spawn_background_review(
+            agent,
+            messages_snapshot=[{"role": "user", "content": "hello"}],
+            review_memory=True,
+        )
+    finally:
+        import threading
+        from hermes_constants import reset_hermes_home_override
+        # Parent resets its override while the "thread" (ImmediateThread runs
+        # synchronously) would in the real world still be running.
+        reset_hermes_home_override(token)
+        assert threading.current_thread() is threading.main_thread()
+
+    assert seen_homes.get("init") == "/tmp/bg-review-profile-home", (
+        "Background review thread must see the parent's hermes home override "
+        f"(got {seen_homes.get('init')!r})"
+    )
+    assert seen_homes.get("run") == "/tmp/bg-review-profile-home"
+    assert get_hermes_home_override() is None, (
+        "Review thread must reset its override token when done"
+    )

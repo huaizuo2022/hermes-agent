@@ -577,8 +577,21 @@ def spawn_background_review_thread(
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
+    # threading.Thread does NOT inherit the parent's contextvars.  Companion
+    # API requests scope state (profile dir) via the hermes home ContextVar
+    # override, so without this the review thread writes MEMORY.md /
+    # CONTINUITY.md into the GLOBAL ~/.hermes/memories instead of the
+    # profile's, cross-contaminating every session's continuity (#18963).
+    from hermes_constants import get_hermes_home_override, set_hermes_home_override, reset_hermes_home_override
+    parent_home = get_hermes_home_override()
+
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        token = set_hermes_home_override(parent_home) if parent_home else None
+        try:
+            _run_review_in_thread(agent, messages_snapshot, prompt)
+        finally:
+            if token is not None:
+                reset_hermes_home_override(token)
 
     return _target, prompt
 
