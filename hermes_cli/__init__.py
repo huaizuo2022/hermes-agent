@@ -14,6 +14,8 @@ Provides subcommands for:
 import os
 import sys
 
+from hermes_cli import sqlite_upgrade  # noqa: F401  (aliases sqlite3 -> pysqlite3 when newer)
+
 __version__ = "0.14.0"
 __release_date__ = "2026.5.16"
 
