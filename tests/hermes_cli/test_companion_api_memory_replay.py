@@ -96,6 +96,69 @@ def test_style_guard_keeps_memory_tool_enabled_and_uses_savana_description(monke
     assert "用户自己的计划写入 target='user'" in captured["tool_description"]
 
 
+def test_readonly_companion_chat_preserves_memory_files_and_compaction_checkpoint(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+            self.session_db = kwargs["session_db"]
+            self.session_id = kwargs["session_id"]
+            self._memory_store = None
+            self._memory_enabled = True
+            self._memory_nudge_interval = 9
+            self.tools = []
+            self.suppress_status_output = False
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.base_url = kwargs["base_url"]
+            self.ephemeral_system_prompt = kwargs.get("ephemeral_system_prompt")
+
+        def run_conversation(self, user_message, **kwargs):
+            captured["memory_nudge_interval"] = self._memory_nudge_interval
+            return {"final_response": "[[MEMORY_UNKNOWN]]"}
+
+        def close(self):
+            pass
+
+    profile_dir = tmp_path / "profile"
+    memories_dir = profile_dir / "memories"
+    memories_dir.mkdir(parents=True)
+    user_path = memories_dir / "USER.md"
+    continuity_path = memories_dir / "CONTINUITY.md"
+    checkpoint_path = profile_dir / "companion_checkpoint.json"
+    user_path.write_text("用户叫阿棠", encoding="utf-8")
+    continuity_path.write_text("双方下周继续调查旧车站", encoding="utf-8")
+    checkpoint_path.write_text('{"cutoff": 3}', encoding="utf-8")
+
+    monkeypatch.setattr("hermes_cli.companion_api.get_profile_path", lambda _sid: str(profile_dir))
+    monkeypatch.setattr(
+        "hermes_cli.companion_api._compact_companion_history_for_prompt",
+        lambda history, checkpoint: (history, {"cutoff": 4}),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.companion_api._write_companion_checkpoint",
+        lambda *_args, **_kwargs: pytest.fail("readonly probe must not write checkpoint"),
+    )
+
+    import run_agent
+
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    payload = _payload("msg-readonly", "我从来没告诉过你宠物名字。")
+    payload["memory_write_mode"] = "readonly"
+
+    response = TestClient(app).post("/companion/v1/chat", json=payload)
+
+    assert response.status_code == 200
+    assert captured["enabled_toolsets"] == []
+    assert captured["memory_nudge_interval"] == 0
+    assert response.json()["memory_write_mode"] == "readonly"
+    assert response.json()["memory_modifications"] == []
+    assert user_path.read_text(encoding="utf-8") == "用户叫阿棠"
+    assert continuity_path.read_text(encoding="utf-8") == "双方下周继续调查旧车站"
+    assert checkpoint_path.read_text(encoding="utf-8") == '{"cutoff": 3}'
+
+
 def test_style_guard_memory_snapshots_include_continuity(monkeypatch, tmp_path):
     from hermes_cli import companion_api
 

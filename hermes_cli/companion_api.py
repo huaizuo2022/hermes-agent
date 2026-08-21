@@ -1759,6 +1759,7 @@ async def chat_endpoint(req: ChatRequest):
     
     try:
         sync_soul_file(profile_dir, req.character_profile)
+        memory_read_only = req.memory_write_mode == "readonly"
 
         # 2. 导入与运行 AIAgent
         from hermes_state import SessionDB
@@ -1787,7 +1788,7 @@ async def chat_endpoint(req: ChatRequest):
             raw_history,
             checkpoint=compaction_checkpoint,
         )
-        if new_compaction_checkpoint is not compaction_checkpoint:
+        if not memory_read_only and new_compaction_checkpoint is not compaction_checkpoint:
             _write_companion_checkpoint(profile_dir, new_compaction_checkpoint)
 
         # 动态解析模型及 API 配置
@@ -1799,7 +1800,6 @@ async def chat_endpoint(req: ChatRequest):
         model = req.model or "deepseek-v4-flash"
         effective_directives = ""
         diagnostics_directives = req.companion_directives or ""
-        memory_read_only = req.memory_write_mode == "readonly"
         enabled_toolsets = [] if memory_read_only else ["memory"]
         if not style_guard_enabled:
             effective_directives = req.directives
@@ -1824,6 +1824,8 @@ async def chat_endpoint(req: ChatRequest):
             reasoning_config=req.reasoning_config,
         )
         agent.suppress_status_output = True
+        if memory_read_only:
+            agent._memory_nudge_interval = 0
         if style_guard_enabled:
             # Offload unresolved turn reviews to a background task so pending turn audits
             # never block the interactive streaming chat response (prevents 45s multi-turn lag).
