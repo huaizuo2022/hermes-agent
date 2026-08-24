@@ -81,10 +81,12 @@ _COMPANION_EARLY_SUMMARY_CONTENT_CHARS = 500
 # DeepSeek 前缀缓存友好的追加式压缩预算（成本驱动，非窗口驱动）。
 # 2026-08 复盘：按 1M 窗口 60% 定的 600K 预算等于没有上限，重度会话
 # 历史膨胀到 60 万 token/轮（实测单会话累计 cache_read 上亿），必须收紧。
-# 32K ≈ 最近 50-100 轮原文；超出即重锚定一次（该轮前缀 miss ~32K 按 1x
-# 计费，之后 N 轮恢复命中）。长期事实由 memory（USER/CONTINUITY.md）承接，
+# 12K ≈ 最近 20-40 轮原文：下限由 _COMPANION_HISTORY_RECENT_USER_TURNS=20 决定，
+# 超预算即重锚定（该轮 miss ~12K 按 1x 计费，之后恢复前缀命中）。
+# 不取更大窗口：陈旧原文（旧关系阶段互动模式）会稀释注意力、与当前
+# relationship_stage 冲突时拉偏角色状态；长期事实由 memory 承接，
 # prompt 只保留承接当前剧情所需的短期上下文。
-_COMPANION_PROMPT_TOKEN_BUDGET = 32000
+_COMPANION_PROMPT_TOKEN_BUDGET = 12000
 
 # 重锚定时累积式摘要的总字符上限：旧摘要 + 新压缩段采样合并后超限，
 # 从头部裁剪（最老信息先淘汰，最新剧情优先保留）。
