@@ -78,13 +78,19 @@ _COMPANION_HISTORY_RECENT_USER_TURNS = 20
 _COMPANION_EARLY_SUMMARY_EDGE_MESSAGES = 8
 _COMPANION_EARLY_SUMMARY_CONTENT_CHARS = 500
 
-# DeepSeek 前缀缓存友好的追加式压缩预算。
-# deepseek-v4-flash 上下文窗口为 1M tokens（agent/model_metadata.py），
-# 预算取 60%：扣除 system prompt 与预留输出后仍有充足余量。
-# history 采用"追加式增长 + 持久化检查点"：一旦在某切点压成固定摘要，
-# 之后只在末尾追加新轮次、前缀逐字节稳定，DeepSeek 前缀缓存可一路命中到
-# history 末尾；仅当追加段 token 估算超过本预算时才做一次"重锚定"压缩。
-_COMPANION_PROMPT_TOKEN_BUDGET = 600000
+# DeepSeek 前缀缓存友好的追加式压缩预算（成本驱动，非窗口驱动）。
+# 2026-08 复盘：按 1M 窗口 60% 定的 600K 预算等于没有上限，重度会话
+# 历史膨胀到 60 万 token/轮（实测单会话累计 cache_read 上亿），必须收紧。
+# 32K ≈ 最近 50-100 轮原文；超出即重锚定一次（该轮前缀 miss ~32K 按 1x
+# 计费，之后 N 轮恢复命中）。长期事实由 memory（USER/CONTINUITY.md）承接，
+# prompt 只保留承接当前剧情所需的短期上下文。
+_COMPANION_PROMPT_TOKEN_BUDGET = 32000
+
+# 重锚定时累积式摘要的总字符上限：旧摘要 + 新压缩段采样合并后超限，
+# 从头部裁剪（最老信息先淘汰，最新剧情优先保留）。
+# 冻结进 checkpoint 后前缀逐字节稳定，6000 字符 ≈ 3K token 常驻缓存前缀，
+# 按 cache 命中 1/10 计价，单轮边际成本可忽略。
+_COMPANION_SUMMARY_CHAR_LIMIT = 6000
 
 # checkpoint 文件名（落在每个 companion 会话独立的 profile_dir 下）。
 _COMPANION_CHECKPOINT_FILENAME = "companion_checkpoint.json"
@@ -717,11 +723,15 @@ def _truncate_text_for_summary(value: Any, limit: int = _COMPANION_EARLY_SUMMARY
     return text[:limit].rstrip() + "..."
 
 
-def _summarize_early_companion_history(omitted: List[Dict[str, Any]]) -> str:
+def _summarize_early_companion_history(
+    omitted: List[Dict[str, Any]],
+    prior_summary: str = "",
+) -> str:
     omitted = list(omitted or [])
     omitted_count = len(omitted)
     omitted_user_turns = _count_user_turns(omitted)
-    if not omitted_count:
+    prior_body = _strip_summary_header(prior_summary)
+    if not omitted_count and not prior_body:
         return ""
 
     # 如果省略的消息较少（<= 16 条），直接完整放入摘要；
@@ -735,13 +745,18 @@ def _summarize_early_companion_history(omitted: List[Dict[str, Any]]) -> str:
         middle_notice = {"role": "system", "content": "...(中间省略了 {0} 条对话)...".format(omitted_count - 12)}
         sample_messages = head + [middle_notice] + tail
 
-    lines = [
-        "【早期对话摘要（自动压缩，仅用于承接事实）】",
-        "此前省略了 {0} 条历史消息，其中用户轮次 {1} 个。".format(
-            omitted_count,
-            omitted_user_turns,
-        ),
-    ]
+    header = "【早期对话摘要（自动压缩，仅用于承接事实）】"
+    lines = [header]
+    if prior_body:
+        lines.append("—— 更早剧情（前次压缩保留）——")
+        lines.append(prior_body)
+    if omitted_count:
+        lines.append(
+            "—— 本次压缩：省略 {0} 条历史消息，其中用户轮次 {1} 个 ——".format(
+                omitted_count,
+                omitted_user_turns,
+            ),
+        )
     for msg in sample_messages:
         if not isinstance(msg, dict):
             continue
@@ -753,7 +768,23 @@ def _summarize_early_companion_history(omitted: List[Dict[str, Any]]) -> str:
         if not content:
             continue
         lines.append("- {0}: {1}".format(role, content))
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    # 累积超限：保留标题行，正文从头部裁剪（最老信息先淘汰，最新剧情优先保留）。
+    if len(text) > _COMPANION_SUMMARY_CHAR_LIMIT:
+        body_budget = _COMPANION_SUMMARY_CHAR_LIMIT - len(header) - 1
+        text = header + "\n" + text[-body_budget:]
+    return text
+
+
+def _strip_summary_header(summary: str) -> str:
+    """去掉旧摘要的标题行，返回正文（用于重锚定时合并进新摘要）。"""
+    text = str(summary or "").strip()
+    if not text:
+        return ""
+    lines = text.split("\n")
+    if lines and lines[0].startswith("【早期对话摘要"):
+        lines = lines[1:]
+    return "\n".join(lines).strip()
 
 
 def _estimate_messages_tokens(messages: List[Dict[str, Any]]) -> int:
@@ -833,9 +864,12 @@ def _resolve_checkpoint_cut_index(
 def _build_compaction_checkpoint(
     messages: List[Dict[str, Any]],
     recent_user_turns: int,
+    prior_summary: str = "",
 ) -> Optional[Dict[str, Any]]:
     """在"保留最近 recent_user_turns 个用户轮次"的切点处构建固定摘要检查点。
 
+    prior_summary 为上一代 checkpoint 的摘要正文：重锚定时合并保留（累积式），
+    避免旧摘要整体丢弃导致中期剧情"失忆"。
     返回 None 表示无需压缩（轮次未超阈值或切点为 0）。
     """
     total = len(messages)
@@ -855,7 +889,7 @@ def _build_compaction_checkpoint(
         return None
 
     omitted = messages[:recent_start]
-    summary = _summarize_early_companion_history(omitted)
+    summary = _summarize_early_companion_history(omitted, prior_summary=prior_summary)
     if not summary:
         return None
 
@@ -926,7 +960,15 @@ def _compact_companion_history_for_prompt(
         return messages, checkpoint
 
     # 分支 3：首次压缩或重锚定 —— 在新切点构建固定摘要检查点。
-    new_checkpoint = _build_compaction_checkpoint(messages, recent_user_turns)
+    # 重锚定时把旧摘要正文带入新摘要（累积式），避免旧剧情事实被整体丢弃。
+    prior_summary = ""
+    if checkpoint:
+        prior_summary = _strip_summary_header(str(checkpoint.get("summary_text") or ""))
+    new_checkpoint = _build_compaction_checkpoint(
+        messages,
+        recent_user_turns,
+        prior_summary=prior_summary,
+    )
     if not new_checkpoint:
         return messages, checkpoint
 

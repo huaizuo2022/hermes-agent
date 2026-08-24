@@ -543,7 +543,7 @@ def test_companion_prompt_history_first_reanchor_builds_checkpoint():
     omitted_count = 2 * 2
     assert compacted[0]["role"] == "user"
     assert "早期对话摘要" in compacted[0]["content"]
-    assert "此前省略了 {} 条历史消息，其中用户轮次 2 个".format(omitted_count) in compacted[0]["content"]
+    assert "本次压缩：省略 {} 条历史消息，其中用户轮次 2 个".format(omitted_count) in compacted[0]["content"]
     assert compacted[1] == {"role": "assistant", "content": "收到，我会基于这份早期摘要承接当前对话。"}
     # 摘要占 1 个 user + 1 个 assistant，加上最近窗口 recent_turns 个 user 轮
     assert len([msg for msg in compacted if msg.get("role") == "user"]) == recent_turns + 1
@@ -625,3 +625,67 @@ def test_companion_prompt_history_under_recent_window_is_unchanged():
     )
     assert compacted == history
     assert checkpoint is None
+
+
+def test_companion_prompt_history_reanchor_preserves_prior_summary():
+    """重锚定时旧摘要正文必须合并进新摘要（累积式），防止中期剧情失忆。"""
+    from hermes_cli import companion_api
+
+    recent_turns = companion_api._COMPANION_HISTORY_RECENT_USER_TURNS
+    history = _build_turns(recent_turns + 2)
+
+    _, checkpoint = companion_api._compact_companion_history_for_prompt(
+        history, checkpoint=None
+    )
+    assert checkpoint is not None
+    # 给旧摘要注入一个可辨识的旧事实
+    old_fact = "- user: 两人在梧桐树下确认了恋人关系"
+    checkpoint["summary_text"] = checkpoint["summary_text"] + "\n" + old_fact
+
+    # 追加大量内容触发重锚定
+    big = list(history)
+    for turn in range(recent_turns + 3, recent_turns + 40):
+        big.append({"role": "user", "content": "用户第{}轮".format(turn) + "y" * 400, "message_id": "msg-{}".format(turn)})
+        big.append({"role": "assistant", "content": "助手第{}轮".format(turn) + "y" * 400})
+
+    compacted, checkpoint2 = companion_api._compact_companion_history_for_prompt(
+        big, checkpoint=checkpoint, max_prompt_tokens=100
+    )
+
+    assert checkpoint2 is not checkpoint
+    assert "梧桐树下确认了恋人关系" in checkpoint2["summary_text"]
+    assert "更早剧情（前次压缩保留）" in checkpoint2["summary_text"]
+    # 新摘要同样注入到渲染后的 history 首条
+    assert "梧桐树下确认了恋人关系" in compacted[0]["content"]
+
+
+def test_companion_summary_char_limit_trims_oldest_first():
+    """累积摘要超上限时从头部裁剪：最老信息先淘汰，最新采样保留。"""
+    from hermes_cli import companion_api
+
+    limit = companion_api._COMPANION_SUMMARY_CHAR_LIMIT
+    old_summary = "【早期对话摘要（自动压缩，仅用于承接事实）】\n" + "\n".join(
+        "- user: 古老事实{} {}".format(i, "x" * 200) for i in range(60)
+    )
+    assert len(old_summary) > limit
+
+    messages = [
+        {"role": "user", "content": "最新关键剧情", "message_id": "m1"},
+        {"role": "assistant", "content": "最新回复"},
+    ]
+    summary = companion_api._summarize_early_companion_history(
+        messages, prior_summary=old_summary
+    )
+
+    assert len(summary) <= limit
+    # 头部被裁（最老事实消失），尾部最新内容保留
+    assert "古老事实0" not in summary
+    assert "最新关键剧情" in summary
+    assert summary.startswith("【早期对话摘要")
+
+
+def test_companion_prompt_token_budget_stays_cost_bounded():
+    """防回归：预算必须保持成本驱动的紧值（≤ 64K），不允许回到窗口驱动。"""
+    from hermes_cli import companion_api
+
+    assert companion_api._COMPANION_PROMPT_TOKEN_BUDGET <= 64000
